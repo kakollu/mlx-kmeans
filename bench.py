@@ -11,7 +11,10 @@ Trust checks per result:
     excluded from the fastest-public pick.
   - if ours ever sees an empty cluster, libraries legitimately diverge (each re-seeds differently): the config
     is flagged as not comparable.
-  - 1-minute load average is recorded before each timing; > 4 is flagged.
+  - CPU used by other processes is sampled before each timing (the 1-minute load average also counts the benchmark's
+    own threads); > 400% (four busy cores; idle background is ~230%) is flagged.
+  - the report compares ours (latest run) against each public library's best valid time ever recorded for that
+    config, so a slow or failed public run (e.g. under the GPU memory cap) can never inflate our ratio.
 
 Each run appends one JSON line per implementation to benchmarks/results.jsonl; BENCHMARKS.md is regenerated.
 
@@ -181,6 +184,13 @@ def machine():
     return f"{chip}, {mem} GB, macOS {platform.mac_ver()[0]}"
 
 
+def other_cpu_percent():
+    """%CPU used by processes other than this one (sum over `ps`)."""
+    out = subprocess.run(["ps", "-Ao", "pid=,pcpu="], capture_output=True, text=True).stdout.split("\n")
+    me = os.getpid()
+    return sum(float(c) for p, c in (line.split() for line in out if line.strip()) if int(p) != me)
+
+
 def bench(name, cfg, only, seed=0):
     X, parts = load(cfg, seed)
     rows, dims, k = X.shape[0], X.shape[1], cfg["k"]
@@ -204,22 +214,24 @@ def bench(name, cfg, only, seed=0):
         try:
             run = make(X, parts, C0)
             run(1)  # warm-up
-            times, loads = [], []
+            times, loads, others = [], [], []
             for _ in range(REPEATS):
                 loads.append(os.getloadavg()[0])
+                others.append(other_cpu_percent())
                 t = time.perf_counter()
                 C = run(ITERS)
                 times.append((time.perf_counter() - t) / (ITERS + EXTRA_PASSES.get(impl, 0)))
             inertia = km.assign_mlx(parts, np.ascontiguousarray(C, dtype=np.float32))[2]
             rec.update(sec_per_pass=float(np.median(times)), min_s=min(times), max_s=max(times),
-                       load1=max(loads), inertia=inertia)
+                       load1=max(loads), other_cpu=max(others), inertia=inertia)
             if impl == OURS:
                 ours_inertia, ours_empty = inertia, run.saw_empty
                 rec["saw_empty_cluster"] = ours_empty
             else:
                 rec["inertia_rel_vs_ours"] = (inertia - ours_inertia) / ours_inertia
                 rec["valid"] = abs(rec["inertia_rel_vs_ours"]) <= 1e-4
-            flags = ("  LOAD>4" if rec["load1"] > 4 else "") + ("" if rec.get("valid", True) else "  DIFFERENT WORK")
+            flags = (f"  BUSY: other processes {rec['other_cpu']:.0f}% CPU" if rec["other_cpu"] > 400 else "") + \
+                ("" if rec.get("valid", True) else "  DIFFERENT WORK")
             print(f"{rec['sec_per_pass']:.4f} s/pass (min {rec['min_s']:.4f}, max {rec['max_s']:.4f})"
                   f"  inertia {inertia:.6e}{flags}")
         except Exception as e:
@@ -239,9 +251,12 @@ def bench(name, cfg, only, seed=0):
 def report():
     rows = [json.loads(line) for line in RESULTS.read_text().splitlines()] if RESULTS.exists() else []
     rows = [r for r in rows if r.get("config") in SUITE]  # suite results only; older ad-hoc runs stay in the jsonl
-    latest = {}
+    latest, best_valid = {}, {}
     for r in rows:
-        latest[(r["config"], r["impl"])] = r
+        key = (r["config"], r["impl"])
+        latest[key] = r
+        if r["impl"] != OURS and r.get("valid") and (key not in best_valid or r["sec_per_pass"] < best_valid[key]["sec_per_pass"]):
+            best_valid[key] = r
     out = [
         "# Benchmarks",
         "",
@@ -253,8 +268,9 @@ def report():
         "",
         "**Trust checks:** our pass is verified against float64 by `tests/accuracy.py` (every label, centers, inertia). "
         "A library whose final inertia differs from ours by more than 1e-4 relative did different work and is excluded "
-        "from the comparison. A config where our run hit an empty cluster is flagged not comparable. Load average > 4 "
-        "during timing is flagged.",
+        "from the comparison. A config where our run hit an empty cluster is flagged not comparable. Timings taken while "
+        "other processes used more than four cores are flagged. Ours (latest run) is compared against each public "
+        "library's **best valid time ever recorded** for the config, so slow or failed public runs can't inflate our lead.",
         "",
         f"**Publish target:** ours at least {PUBLISH_TARGET}x faster than the fastest valid public implementation on every config.",
         "",
@@ -267,7 +283,7 @@ def report():
         if not rs:
             continue
         ours = next((r for r in rs if r["impl"] == OURS and "sec_per_pass" in r), None)
-        public = [r for r in rs if r["impl"] != OURS and "sec_per_pass" in r and r.get("valid")]
+        public = [best_valid[(name, i)] for i in IMPLS if (name, i) in best_valid]
         best = min(public, key=lambda r: r["sec_per_pass"]) if public else None
         shape = f"{rs[0]['rows']:,} x {rs[0]['dims']}, k={rs[0]['k']}"
         comparable = all(r.get("config_comparable", True) for r in rs)
@@ -275,9 +291,9 @@ def report():
             ratio = best["sec_per_pass"] / ours["sec_per_pass"]
             mark = "✅" if ratio >= PUBLISH_TARGET else ("🟡" if ratio >= 1 else "❌")
             verdict = f"{mark} {ratio:.1f}x" + ("" if comparable else " (not comparable: empty cluster)")
-            out.append(f"| {name} | {cfg['why']} | {shape} | {ours['sec_per_pass']:.4f} | {best['impl']} | {best['sec_per_pass']:.4f} | {verdict} |")
+            out.append(f"| {name} | {cfg['why']} | {shape} | {ours['sec_per_pass']:.4f} | {best['impl']} ({best['date'][:10]}) | {best['sec_per_pass']:.4f} | {verdict} |")
         details += [f"### {name}: {cfg['why']} ({shape}, {cfg['data']} data)", "",
-                    "| Implementation | Version | s/pass (median) | min–max | vs ours | Inertia vs ours | Load | Commit | Date |",
+                    "| Implementation (latest run) | Version | s/pass (median) | min–max | vs ours | Inertia vs ours | Load / other CPU | Commit | Date |",
                     "|---|---|---|---|---|---|---|---|---|"]
         for r in sorted(rs, key=lambda r: r.get("sec_per_pass", float("inf"))):
             if "sec_per_pass" not in r:
@@ -289,7 +305,7 @@ def report():
             rel = "—" if is_ours else f"{r['inertia_rel_vs_ours']:+.1e}" + ("" if r.get("valid") else " ⚠️ different work")
             commit = f"{r['commit']}{'*' if r['dirty'] else ''}"
             details.append(f"| {r['impl']} | {r['version']} | {r['sec_per_pass']:.4f} | {r['min_s']:.4f}–{r['max_s']:.4f} | {vs} | "
-                           f"{rel} | {r['load1']:.1f} | {commit} | {r['date'][:10]} |")
+                           f"{rel} | {r['load1']:.1f} / {r.get('other_cpu', float('nan')):.0f}% | {commit} | {r['date'][:10]} |")
         details.append("")
     out += ["", "✅ meets target · 🟡 faster but below target · ❌ slower", "", "## Details", ""] + details
     out += ["`*` after a commit = uncommitted changes to kmeans.py/bench.py at run time.", ""]
