@@ -63,3 +63,37 @@ kmeans.py averaged 6.4 passes and kmeans_simple.py 5.9. Compare s/pass, not tota
 - **Incident:** the suite's fast-pytorch-kmeans GIST1M run wired 123 GB of GPU memory and kernel-panicked the machine
   (watchdog). Its safe mode test-allocates up to rows*dims*k*4 bytes; `iogpu.wired_limit_mb` had been raised to
   126000. bench.py now caps PyTorch MPS memory via watermark env vars (verified effective).
+
+## 2026-09-17 — simdgroup tiles: all six configs clear 1.5x
+
+| Config | Ours before tiles | Ours with tiles | Best valid public | Ratio |
+|---|---|---|---|---|
+| geo-trips 10M x 4 k256 | 0.0134 | (rows path) | FAISS 0.0682 | 5.1x |
+| satellite 10M x 12 k32 | 0.0177 | (rows path) | scikit-learn 0.0883 | 5.0x |
+| logs 10M x 32 k256 | 0.0785 | (rows path) | scikit-learn 0.3750 | 4.8x |
+| single-cell 2M x 50 k64 | 0.0118 | (rows path) | scikit-learn 0.0564 | 4.8x |
+| SIFT1M 1M x 128 k1024 | 0.0854 | 0.0562 | scikit-learn 0.1824 | 3.2x |
+| GIST1M 1M x 960 k1024 | 0.6533 | 0.2898 | fast-pytorch-kmeans 0.5115 | 1.8x |
+
+- **Metal simdgroup matrices are IEEE-quality**: dot-product error 1.9x eps at 960 dims (numpy/Accelerate: 1.85x),
+  exact on integers. Apple's Neural Accelerator path (MetalPerformancePrimitives, used by MLX `@` and PyTorch MPS)
+  is ~4x faster again but exact only on integers: ~12000x eps on fractional data, so it cannot be used where labels
+  must be provably exact.
+- **Distance kernel throughput at GIST shape:** direct (x-c)^2 pairs 1.6T terms/s; simdgroup tiles 5.1T; NAX matmul
+  19.6T. float4 vectorisation and a dot-product form did NOT help the direct kernel (memory-bound, not compute-bound).
+- **Triangle-inequality pruning is useless at 960 dims:** 78% of centers survive the |c - c_a| > 2 d_a test, so
+  Elkan-style pruning cannot replace exact distances there.
+- **Public libraries are label-accurate on real data:** scikit-learn, FAISS and fast-pytorch-kmeans each had 0 wrong
+  labels vs float64 (float32 tolerance) on SIFT and GIST, despite the approximate matmul paths. The differentiator is
+  that ours is provably exact, not that theirs is wrong in practice.
+- **Multiple libraries in one process crash** (native, no traceback) when sklearn + faiss + torch are mixed; run each
+  in its own process.
+
+### Open: comparisons that still need to be made
+1. **FAISS as people actually use it** — default `max_points_per_centroid=256` trains on a subsample (262k of 1M rows
+   at k=1024). Disabled in bench.py for equal work, but the decision-relevant comparison is quality vs wall clock:
+   time to reach a given inertia, ours on all data vs FAISS on its sample, both to convergence.
+2. **ANN end-to-end** — build an IVF index from our centroids vs FAISS-trained centroids on SIFT1M (ground truth
+   ships with the dataset) and compare recall@10 and search time at equal build cost.
+3. **FAISS Metal** — `faiss.get_compile_options()` reports `MAC_METAL` in this 1.15.1 wheel; find out whether that
+   exposes a GPU path on this machine before making any claim about FAISS here.
