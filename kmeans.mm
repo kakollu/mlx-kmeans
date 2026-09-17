@@ -314,7 +314,8 @@ int main(int argc, char **argv) {
         else if (f == "--check") a.check = true;
         else { fprintf(stderr, "usage: kmeans [--rows N] [--dims D] [--k K] [--max-iter N] [--tol T] [--seed S] [--backend gpu|cpu] [--check]\n"); return 1; }
     }
-    if (a.k > 1024 || a.dims > 64) { fprintf(stderr, "--k must be <= 1024 and --dims <= 64\n"); return 1; }
+    // the GPU kernels index slices of 100M rows with uint32 and use 4096-row blocks; kmeans.py adapts both
+    if (a.k > 1024 || a.dims > 42) { fprintf(stderr, "--k must be <= 1024 and --dims <= 42 (use kmeans.py for larger)\n"); return 1; }
     if (a.backend != "gpu" && a.backend != "cpu") { fprintf(stderr, "--backend must be gpu or cpu\n"); return 1; }
 
     printf("rows=%llu dims=%d k=%d backend=%s data~%.1f GB\n", a.rows, a.dims, a.k, a.backend.c_str(), a.rows * a.dims * 4 / 1e9);
