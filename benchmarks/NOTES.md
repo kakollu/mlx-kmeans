@@ -46,3 +46,20 @@ kmeans.py averaged 6.4 passes and kmeans_simple.py 5.9. Compare s/pass, not tota
   growing the block size).
 - **Local minima:** with k=16 hidden clusters, k-means++ on a sample rarely reached the ideal error (8/row) in 20
   seeds for either version; restarts (`n_init`) or greedy k-means++ would fix it.
+
+## 2026-09-17 — rounds 1–2 of the performance loop
+
+- **MLX GPU matmul is not IEEE-float32-tight:** error vs float64 ~5,000x eps (Accelerate CPU: 2–10x eps). An
+  expanded-distance hybrid with a provable candidate bound mislabeled up to 66k/100k points. Rejected.
+- **Thread granularity, not branches, made the first kernel slow at large k*dims:** branch-free argmin inside
+  4096-row block threads changed nothing; one GPU thread per row (branch-free argmin) was 9–43x faster.
+- **Compensated (Neumaier) accumulation** on the GPU gives centers within ~1e-13 of float64. MLX Metal kernels do
+  not reassociate floats (probe: Kahan error terms survive).
+- **Rows vs pairs crossover:** per-(row, center) threads win from dims >= 64 (1.0–3.2x); rows path below.
+- **First suite (partial, commit b5eeae0):** geo-trips 4.9x FAISS; satellite 5.0x scikit-learn; logs 3.8x
+  fast-pytorch-kmeans; single-cell 1.35x fast-pytorch-kmeans (below target; scikit-learn/FAISS relocate empty
+  clusters and reach 24% lower inertia there — ours keeps empty centers); SIFT1M 1.13x scikit-learn (below target);
+  GIST1M ours 4.8 s vs scikit-learn 0.94 s (5x slower: per-pair kernel is memory-bound at 960 dims).
+- **Incident:** the suite's fast-pytorch-kmeans GIST1M run wired 123 GB of GPU memory and kernel-panicked the machine
+  (watchdog). Its safe mode test-allocates up to rows*dims*k*4 bytes; `iogpu.wired_limit_mb` had been raised to
+  126000. bench.py now caps PyTorch MPS memory via watermark env vars (verified effective).

@@ -117,7 +117,14 @@ IMPLS = {
     "faiss (CPU)": (faiss_cpu, "faiss"),
     "fast-pytorch-kmeans (MPS GPU)": (fast_pytorch_kmeans_mps, "fast_pytorch_kmeans"),
 }
-# Rough extra memory beyond the data, to skip runs that would swap this shared machine.
+# Memory guards. GPU memory on Apple Silicon is wired RAM: an oversized MPS allocation can't be paged out and can
+# freeze the whole machine (2026-09-17: fast-pytorch-kmeans on GIST1M wired 123 GB -> watchdog kernel panic).
+# fast-pytorch-kmeans sizes its chunks by test-allocating up to rows * dims * k * 4 bytes on the GPU and retrying
+# smaller, so PyTorch's MPS allocator is capped (verified: oversized allocations then fail cleanly and the probe
+# retries smaller). Must be set before torch is imported; the low watermark must not exceed the high one.
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.3")
+os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.25")
+# Steady-state extra memory beyond the data (dense k x rows mask + a GPU copy of the data), to skip runs that swap.
 MEMORY_GB = {"fast-pytorch-kmeans (MPS GPU)": lambda rows, dims, k: rows * k * 4 / 1e9 + rows * dims * 4 / 1e9}
 MAX_EXTRA_GB = 24
 # scikit-learn runs one extra assignment pass after max_iter, so its time is divided by iters + 1 (in its favour).
