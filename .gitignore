@@ -1,0 +1,5 @@
+# build output: rebuild with the clang++ line at the top of kmeans.mm
+kmeans
+__pycache__/
+*.swp
+.DS_Store
