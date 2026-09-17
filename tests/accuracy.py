@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Accuracy suite: every assignment-pass path must match float64 ground truth.
 
-For each case and each path (direct, pairwise):
+For each case and each path (rows, pairs):
   1. Labels: every point's center is optimal in float64, up to float32 resolution:
          d64(x, label) <= d64(x, best) + 8 * eps32 * (|x|^2 + |c|^2)
      (points whose float64 distances to two centers differ by less than that are ties at float32 precision).
@@ -56,7 +56,7 @@ def check(name, X, C, slice_rows=None, dist_bytes=None):
     ref_c, ref_d = reference(X, C)
     X64, C64 = X.astype(np.float64), C.astype(np.float64)
     ok = True
-    for method in ["direct", "pairwise"]:
+    for method in ["rows", "pairs"]:
         sums, counts, inertia, labels = km.assign_mlx(parts, C, method=method, return_labels=True)
         d_lab = ((X64 - C64[labels]) ** 2).sum(1)
         tol = 8 * EPS32 * ((X64 ** 2).sum(1) + (C64[labels] ** 2).sum(1))
@@ -111,6 +111,9 @@ def main():
     X = blobs(rng, 250_003, 16, 16, 5, 1)
     results.append(check("many slices + chunks d16 k100", X, X[rng.choice(len(X), 100, replace=False)],
                          slice_rows=60_001, dist_bytes=4 * 100 * 7_777))
+    # accumulation stress: ~5M points per cluster at |x| ~ 1000, one slice, few large blocks
+    X = (blobs(rng, 20_000_000, 2, 4, 10, 1) + 1000).astype(np.float32)
+    results.append(check("accumulation 20M rows +1000 d2 k4", X, X[rng.choice(len(X), 4, replace=False)]))
     print(f"\n{sum(results)}/{len(results)} cases passed")
     sys.exit(0 if all(results) else 1)
 
