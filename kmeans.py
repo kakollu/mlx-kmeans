@@ -141,15 +141,24 @@ def assign_numpy(parts, C, chunk=2_000_000):
     return sums, counts, inertia
 
 
-# One assignment pass on the GPU in two stages, all distances computed directly as sum((x - c)^2) in float32
-# (never via |x|^2 - 2x.c + |c|^2, which cancels badly; MLX's GPU matmul is also ~5000x eps inexact).
+# One assignment pass on the GPU in two stages. Every label is the center with the smallest float32 distance
+# sum((x - c)^2), lowest index on ties, whichever path runs.
 #
-# 1. Nearest center per row (lowest index on ties), two interchangeable paths:
-#      rows:  one GPU thread per row loops over all centers with a branch-free argmin. Fastest in most shapes.
-#      pairs: one GPU thread per (row, center) pair writes a chunk of distances, then one thread per row takes
-#             the branch-free argmin. Faster at high dims with modest k.
+# 1. Nearest center per row, three interchangeable paths:
+#      rows:  one GPU thread per row loops over all centers with a branch-free argmin, distances computed directly.
+#             Fastest below ~64 dims.
+#      pairs: one GPU thread per (row, center) pair writes a chunk of direct distances, then one thread per row takes
+#             the branch-free argmin. For high dims when the tiles path does not apply.
+#      tiles: Metal simdgroup matrices (8x8 hardware tiles) compute x.c for a chunk of rows -- IEEE-quality, measured
+#             1.9x eps at 960 dims, same as Accelerate -- then one thread per row forms approximate distances
+#             |c|^2 - 2x.c, keeps every center within the provable float32 error bound of the best one, and
+#             recomputes those candidates exactly. ~3x faster than pairs at high dims and still exact. Needs dims and
+#             k to be multiples of 8 (tail rows fall back to the rows kernel).
 #    GPUs run many threads in lockstep; the original design (one thread per 4096-row block, branchy argmin)
 #    was 9-40x slower at large k * dims.
+#    Apple's Neural Accelerator matmul (what MLX's @ operator and PyTorch MPS use) is another ~4x faster than tiles,
+#    but has no float32 error bound: exact on integers, up to ~12000x eps on fractional data. It is only used by the
+#    opt-in fast path (see _NEAREST_FAST), never by the default exact paths.
 # 2. Accumulation of [count, inertia, sums...] per cluster, compensated (Neumaier) summation throughout, so it is
 #    exact to float32 rounding; the host adds sum + compensation in float64. Two interchangeable methods:
 #      blocks: each GPU thread owns a block of rows and writes into its own (k, dims+2) buffer; then one thread
@@ -183,6 +192,44 @@ _ARGMIN_SRC = """
     uint i = thread_position_in_grid.x, di = i * K;
     float best = INFINITY; uint bl = 0;
     for (uint c = 0; c < K; c++) { float s = dist[di + c]; bool lt = s < best; best = select(best, s, lt); bl = select(bl, c, lt); }
+    labels[i] = bl; best_d[i] = best;
+"""
+# One simdgroup (32 threads) per 8x8 tile of x.c; Ct is C transposed (dims x k) so both loads are row-major.
+_DOT_TILES_SRC = """
+    uint sg = thread_position_in_grid.x / 32;
+    uint tiles_c = K / 8;
+    uint rt = sg / tiles_c, ct = sg % tiles_c;
+    uint xrow = (row0[0] + rt * 8) * D, c0 = ct * 8;
+    simdgroup_float8x8 a, b, acc = simdgroup_float8x8(0.0f);
+    for (uint kk = 0; kk < D; kk += 8) {
+        simdgroup_load(a, X + xrow + kk, D);
+        simdgroup_load(b, Ct + kk * K + c0, K);
+        simdgroup_multiply_accumulate(acc, a, b, acc);
+    }
+    simdgroup_store(acc, dot + rt * 8 * K + c0, K);
+"""
+# In float32, |c|^2 - 2 x.c is off by at most E_c = 3 * gamma_D * (|x|^2 + |c|^2), where gamma_D = D*eps/(1-D*eps)
+# bounds the relative error of a D-term dot product and of |c|^2 (Higham), and sum|x_j c_j| <= (|x|^2+|c|^2)/2 leaves
+# slack for the subtraction. So the truly nearest center c* satisfies approx_c* <= amin + E_cmin + E_c*: only centers
+# inside that window can win, and each gets an exact distance.
+_MARGIN_SRC = """
+    uint i = thread_position_in_grid.x, xi = (row0[0] + i) * D, di = i * K;
+    float xsq = 0;
+    for (uint j = 0; j < D; j++) xsq += X[xi + j] * X[xi + j];
+    float amin = INFINITY; uint cmin = 0;
+    for (uint c = 0; c < K; c++) {
+        float a = csq[c] - 2 * dot[di + c];
+        bool lt = a < amin; amin = select(amin, a, lt); cmin = select(cmin, c, lt);
+    }
+    float g3 = 3 * gamma[0];
+    float bound = amin + g3 * (xsq + csq[cmin]);
+    float best = INFINITY; uint bl = 0;
+    for (uint c = 0; c < K; c++) {
+        if (csq[c] - 2 * dot[di + c] > bound + g3 * (xsq + csq[c])) continue;
+        float s = 0;
+        for (uint j = 0; j < D; j++) { float t = X[xi + j] - C[c * D + j]; s += t * t; }
+        bool lt = s < best; best = select(best, s, lt); bl = select(bl, c, lt);
+    }
     labels[i] = bl; best_d[i] = best;
 """
 _ACCUMULATE_SRC = """
@@ -219,7 +266,8 @@ _REDUCE_SRC = """
     total[e] = s; total_comp[e] = c;
 """
 _kernels = {}
-PAIRS_MIN_DIMS = 64                     # use the pairs path when dims >= 64 (measured crossover, benchmarks/NOTES.md)
+PAIRS_MIN_DIMS = 64                     # dims from which the pairs/tiles paths beat the rows path (measured)
+TILE_THREADGROUP = 512                  # threads per threadgroup in the tiles path (measured best)
 DIST_BYTES = 512 << 20                  # largest (rows x k) float32 distance chunk in the pairs path
 ACC_BYTES = 256 << 20                   # budget for per-block accumulation buffers
 ACC_MAX_BLOCKS = 1024                   # GPU threads for accumulation
@@ -238,15 +286,51 @@ def _u32(v):
     return _mx().array([v], dtype=_mx().uint32)
 
 
+def _rows_kernel(x, Cm, r0, m, k, d):
+    mx = _mx()
+    kern = _kernel("kmeans_rows", ["X", "C", "row0"], ["labels", "best_d"], _ROWS_SRC)
+    return kern(inputs=[x, Cm, _u32(r0)], template=[("D", d), ("K", k)], grid=(m, 1, 1), threadgroup=(64, 1, 1),
+                output_shapes=[(m,), (m,)], output_dtypes=[mx.uint32, mx.float32])
+
+
+def _tiles_nearest(x, Cm, n, k, d):
+    mx = _mx()
+    eps = float(np.finfo(np.float32).eps)
+    csq = (Cm * Cm).sum(1)
+    Ct = mx.array(np.ascontiguousarray(np.array(Cm).T))
+    gamma = mx.array([d * eps / (1 - d * eps)], dtype=mx.float32)
+    dot_k = _kernel("kmeans_dot_tiles", ["X", "Ct", "row0"], ["dot"], _DOT_TILES_SRC)
+    margin = _kernel("kmeans_margin", ["X", "C", "csq", "dot", "row0", "gamma"], ["labels", "best_d"], _MARGIN_SRC)
+    chunk = max(8, (DIST_BYTES // (4 * k)) // 8 * 8)
+    whole = n // 8 * 8                       # simdgroup tiles cover whole 8-row tiles; tail rows use the rows kernel
+    labels, best = [], []
+    for r0 in range(0, whole, chunk):
+        m = min(chunk, whole - r0)
+        dot = dot_k(inputs=[x, Ct, _u32(r0)], template=[("D", d), ("K", k)],
+                    grid=((m // 8) * (k // 8) * 32, 1, 1), threadgroup=(TILE_THREADGROUP, 1, 1),
+                    output_shapes=[(m * k,)], output_dtypes=[mx.float32])[0]
+        lab, bst = margin(inputs=[x, Cm, csq, dot, _u32(r0), gamma], template=[("D", d), ("K", k)],
+                          grid=(m, 1, 1), threadgroup=(64, 1, 1),
+                          output_shapes=[(m,), (m,)], output_dtypes=[mx.uint32, mx.float32])
+        mx.eval(lab, bst)                    # bound memory: one dot chunk alive at a time
+        labels.append(lab)
+        best.append(bst)
+    if whole < n:
+        lab, bst = _rows_kernel(x, Cm, whole, n - whole, k, d)
+        labels.append(lab)
+        best.append(bst)
+    return (labels[0], best[0]) if len(labels) == 1 else (mx.concatenate(labels), mx.concatenate(best))
+
+
 def _nearest(x, Cm, method):
     """Nearest center and its distance for every row of one slice -> (labels uint32, best float32)."""
     mx = _mx()
     n, d = x.shape
     k = Cm.shape[0]
+    if method == "tiles":
+        return _tiles_nearest(x, Cm, n, k, d)
     if method == "rows":
-        kern = _kernel("kmeans_rows", ["X", "C", "row0"], ["labels", "best_d"], _ROWS_SRC)
-        return kern(inputs=[x, Cm, _u32(0)], template=[("D", d), ("K", k)], grid=(n, 1, 1), threadgroup=(64, 1, 1),
-                    output_shapes=[(n,), (n,)], output_dtypes=[mx.uint32, mx.float32])
+        return _rows_kernel(x, Cm, 0, n, k, d)
     pairs = _kernel("kmeans_pairs", ["X", "C", "row0"], ["dist"], _PAIRS_SRC)
     argmin = _kernel("kmeans_argmin", ["dist"], ["labels", "best_d"], _ARGMIN_SRC)
     chunk = max(1, DIST_BYTES // (4 * k))
@@ -317,7 +401,10 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
     mx = _mx()
     k, d = C.shape
     if method == "auto":
-        method = "pairs" if d >= PAIRS_MIN_DIMS else "rows"
+        if d < PAIRS_MIN_DIMS:
+            method = "rows"
+        else:
+            method = "tiles" if d % 8 == 0 and k % 8 == 0 else "pairs"
     Cm = mx.array(C)
     tot = np.zeros((k, d + 2), dtype=np.float64)
     nearest = []
