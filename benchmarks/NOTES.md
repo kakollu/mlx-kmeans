@@ -106,12 +106,19 @@ Inertia is always measured by our exact pass over the full data, so the metric i
 
 | Method | Train | Inertia (x best) | recall@10 nprobe 8 |
 |---|---|---|---|
-| ours, all rows, to convergence (34 iters) | 3.39 s | 1.0000 | 84.84% |
-| ours, all rows, 25 iters (FAISS's budget) | 2.88 s | 1.0012 | 84.74% |
-| ours, 262k subsample, to convergence | 2.09 s | 1.0090 | 84.11% |
-| FAISS default (subsample, 25 iters) | 4.90 s | 1.0094 | 84.17% |
-| FAISS all rows, 25 iters | 18.29 s | 1.0009 | 84.45% |
-| scikit-learn all rows, 25 iters | 233.37 s | 1.0000 | 84.80% |
+| ours, all rows, to convergence (36 iters) | 2.48 s | 1.0000 | 84.74% |
+| ours, all rows, 25 iters (FAISS's budget) | 1.83 s | 1.0014 | 84.57% |
+| ours, 262k subsample, to convergence | 1.06 s | 1.0093 | 84.26% |
+| FAISS default (subsample, 25 iters) | 4.81 s | 1.0099 | 84.17% |
+| FAISS all rows, 25 iters | 17.90 s | 1.0014 | 84.45% |
+| scikit-learn all rows, 25 iters | 165.08 s | 1.0004 | 84.83% |
+
+(after the fused k-means++ init, commit 5b55a50; the earlier run with 1.5 s init read 3.39 / 2.88 / 2.09 s for ours)
+
+- **Same quality, 9.8x less time:** ours at 25 iterations and FAISS on all rows land on the same inertia (1.0014x
+  best); ours takes 1.83 s, FAISS 17.90 s.
+- **vs FAISS as configured by default:** 2.6x faster (1.83 s vs 4.81 s) with better inertia and +0.4 pt recall,
+  while using all 1M rows instead of a 262k subsample.
 
 - Ours gives the best clustering and the best recall in the least time: 1.7x faster than FAISS's default while using
   4x more data, 6.3x faster than FAISS on all rows, 69x faster than scikit-learn.
