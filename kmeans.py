@@ -118,13 +118,20 @@ def _mx():
 
 # ---------------------------------------------------------------- init
 
-def kmeans_pp_init(parts, rows, k, rng, sample=200_000):
+def kmeans_pp_init(parts, rows, k, rng, sample=None):
     """k-means++ seeding on a random subsample (full k-means++ over 1B rows is needlessly slow).
+
+    The sample defaults to 20k rows or 20 per center, whichever is larger (capped at 200k). Each of the k rounds
+    re-reads the whole sample, so the cost is k * sample * dims bytes of memory traffic: at k=1024 on GIST1M, a
+    200k-row sample costs 2.2 s and a 20k-row one 0.4 s, with final inertia differing by <0.03% on SIFT1M and GIST1M
+    (on synthetic blobs the run-to-run spread from local minima, 10-30%, dwarfs any difference).
 
     The k sequential rounds run on the GPU with only the chosen row index crossing back each round; doing them in
     NumPy costs ~10 s at k=1024 (and is why scikit-learn's own k-means++ takes minutes on SIFT1M).
     """
     mx = _mx()
+    if sample is None:
+        sample = min(200_000, max(20_000, 20 * k))
     S = mx.array(take_rows(parts, np.sort(rng.choice(rows, size=min(sample, rows), replace=False))))
     m, d = S.shape
     kern = _kernel("kmeans_pp_round", ["S", "d2_in", "center", "seed"], ["d2_out", "key"], _PP_ROUND_SRC, _GEN_HEADER)
