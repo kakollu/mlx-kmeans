@@ -62,6 +62,18 @@ _GEN_SRC = """
     }
 """
 _gen_kernel = None
+# One k-means++ round: distance from every sample row to the newly chosen center, running minimum, and the
+# Gumbel-max sampling key for the next draw - fused so a round costs two kernels instead of ~6 MLX ops.
+_PP_ROUND_SRC = """
+    uint i = thread_position_in_grid.x, xi = i * D, ci = center[0] * D;
+    float s = 0;
+    for (uint j = 0; j < D; j++) { float t = S[xi + j] - S[ci + j]; s += t * t; }
+    float d = min(d2_in[i], s);
+    d2_out[i] = d;
+    ulong h = mix64(seed[0] ^ mix64(i));
+    float u = u01(h);                                   // in (0, 1]
+    key[i] = log(max(d, 1e-30f)) - log(-log(u));        // Gumbel-max: argmax over rows samples in proportion to d
+"""
 
 
 def make_data_mlx(rows, dims, k, seed):
@@ -114,18 +126,19 @@ def kmeans_pp_init(parts, rows, k, rng, sample=200_000):
     """
     mx = _mx()
     S = mx.array(take_rows(parts, np.sort(rng.choice(rows, size=min(sample, rows), replace=False))))
-    picks = [int(rng.integers(S.shape[0]))]
-    d2 = ((S - S[picks[0]]) ** 2).sum(1)
-    for _ in range(1, k):
-        # Pick the next center with probability proportional to d2 via the Gumbel-max trick: argmax(log d2 + G),
-        # G = -log(-log U). A cumulative-sum inverse-CDF is the textbook route but stalls in float32 once the running
-        # sum dwarfs later weights, which biases the choice towards early rows.
-        u = mx.random.uniform(shape=d2.shape, key=mx.random.key(int(rng.integers(2**31))), low=1e-20, high=1.0)
-        nxt = mx.argmax(mx.log(mx.maximum(d2, 1e-30)) - mx.log(-mx.log(u)))
-        mx.eval(nxt)
-        i = int(nxt.item())
-        picks.append(i)
-        d2 = mx.minimum(d2, ((S - S[i]) ** 2).sum(1))
+    m, d = S.shape
+    kern = _kernel("kmeans_pp_round", ["S", "d2_in", "center", "seed"], ["d2_out", "key"], _PP_ROUND_SRC, _GEN_HEADER)
+    picks = [int(rng.integers(m))]
+    d2 = mx.full((m,), mx.inf, dtype=mx.float32)
+    for _ in range(k - 1):
+        # Sampling uses the Gumbel-max trick (argmax of log d2 + Gumbel noise). A cumulative-sum inverse-CDF is the
+        # textbook route but stalls in float32 once the running sum dwarfs later weights, biasing picks to early rows.
+        d2, key = kern(inputs=[S, d2, _u32(picks[-1]), mx.array([int(rng.integers(2**63 - 1))], dtype=mx.uint64)],
+                       template=[("D", d)], grid=(m, 1, 1), threadgroup=(64, 1, 1),
+                       output_shapes=[(m,), (m,)], output_dtypes=[mx.float32, mx.float32])
+        nxt = mx.argmax(key)
+        mx.eval(d2, nxt)
+        picks.append(int(nxt.item()))
     return np.array(S[mx.array(picks)], dtype=np.float32)
 
 
