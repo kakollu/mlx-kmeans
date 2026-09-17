@@ -323,12 +323,17 @@ def main():
     p.add_argument("--suite", action="store_true", help="run every config in SUITE")
     p.add_argument("--config", nargs="*", default=[], choices=list(SUITE), help="run these suite configs")
     p.add_argument("--only", nargs="*", help="substring filter on public implementation names (ours always runs)")
+    p.add_argument("--shape", nargs="*", default=[], metavar="ROWS,DIMS,K",
+                   help="ad-hoc synthetic configs, e.g. 1000000,32,4096 (recorded, but not part of SUITE)")
     p.add_argument("--report", action="store_true", help="only regenerate BENCHMARKS.md")
     a = p.parse_args()
     names = list(SUITE) if a.suite else a.config
     if not a.report:
         for name in names:
             bench(name, SUITE[name], a.only)
+        for shape in a.shape:
+            rows, dims, k = (int(v) for v in shape.split(","))
+            bench(f"sweep-{rows}x{dims}-k{k}", dict(data="synthetic", rows=rows, dims=dims, k=k, why="ad-hoc sweep"), a.only)
     report()
 
 

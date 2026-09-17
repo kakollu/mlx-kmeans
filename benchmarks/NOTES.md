@@ -129,3 +129,35 @@ Inertia is always measured by our exact pass over the full data, so the metric i
 - **FAISS has no GPU path on this machine**: `faiss.get_compile_options()` reports MAC_METAL and `get_num_gpus()`
   returns 1, but `faiss.Kmeans(gpu=True)` fails (GpuResourcesVector missing) and `index_cpu_to_gpu` returns a plain
   CPU Index (same search time as IndexFlatL2). FAISS here is CPU-only unless built from source.
+
+## 2026-09-17 — shape sweep: where we win and where we don't
+
+Ad-hoc synthetic configs via `bench.py --shape ROWS,DIMS,K` (recorded in results.jsonl, not part of SUITE). Ours is
+the latest run; "best valid public" is the fastest library whose inertia matches ours within 1e-4.
+
+| Shape | Ours s/pass | Best valid public | Ratio | Faster but worse quality |
+|---|---|---|---|---|
+| 100,000 x 8, k=8 | 0.0011 | faiss 0.0011 | 1.0x | — |
+| 100,000 x 32, k=64 | 0.0019 | scikit-learn lloyd 0.0019 | 1.0x | — |
+| 200,000 x 960, k=256 | 0.0458 | scikit-learn lloyd 0.1324 | 2.9x | fast-pytorch-kmeans 0.0296s (+3.3% inertia) |
+| 1,000,000 x 4, k=8 | 0.0017 | fast-pytorch-kmeans 0.0041 | 2.5x | — |
+| 1,000,000 x 32, k=64 | 0.0033 | scikit-learn lloyd 0.0143 | 4.3x | — |
+| 1,000,000 x 32, k=4096 | 0.1305 | scikit-learn lloyd 0.3987 | 3.1x | — |
+| 1,000,000 x 128, k=64 | 0.0094 | scikit-learn lloyd 0.0604 | 6.5x | — |
+| 1,000,000 x 128, k=4096 | 0.2137 | scikit-learn lloyd 0.6778 | 3.2x | — |
+| 1,000,000 x 256, k=1024 | 0.0892 | scikit-learn lloyd 0.3479 | 3.9x | — |
+| 5,000,000 x 16, k=8192 | 0.4631 | scikit-learn lloyd 3.6235 | 7.8x | — |
+| 10,000,000 x 8, k=8 | 0.0083 | fast-pytorch-kmeans 0.0577 | 7.0x | — |
+| 10,000,000 x 64, k=1024 | 0.3786 | scikit-learn lloyd 1.2418 | 3.3x | — |
+
+- **Below ~100k rows we only tie**: a pass costs 1-2 ms and GPU dispatch overhead dominates. Use scikit-learn there.
+- **From 1M rows up we are 2.5-7.8x** across dims 4-960 and k 8-8192, at identical inertia.
+- **Largest wins are at extreme k and at many rows with few dims**: 5M x 16 k=8192 is 7.8x (scikit-learn's elkan
+  collapses there: 37 s/pass, 80x ours), 10M x 8 k=8 is 7.0x.
+- **fast-pytorch-kmeans is faster than us in one corner** (200k x 960, k=256: 0.0296 s vs our 0.0458 s) but ends 3.3%
+  worse because it zeroes empty clusters instead of relocating them; it is excluded as different work.
+- **fast-pytorch-kmeans runs out of memory** at k>=1024 with many rows (dense k x rows mask: 16 GB at 1M x k=4096,
+  164 GB at 5M x k=8192), so it is not an option for large-k work on this machine.
+- **FAISS drifts from our inertia at large k and high dims** (+0.3% to +3.3%, and +17.7% at 1M x 128 k=64) because it
+  splits large clusters to fill empty ones. scikit-learn, which relocates to far points like us, matches our inertia
+  exactly on every shape in this sweep.
