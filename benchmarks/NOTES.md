@@ -97,3 +97,28 @@ kmeans.py averaged 6.4 passes and kmeans_simple.py 5.9. Compare s/pass, not tota
    ships with the dataset) and compare recall@10 and search time at equal build cost.
 3. **FAISS Metal** — `faiss.get_compile_options()` reports `MAC_METAL` in this 1.15.1 wheel; find out whether that
    exposes a GPU path on this machine before making any claim about FAISS here.
+
+## 2026-09-17 — end-to-end on SIFT1M (bench_ann.py): quality per second and ANN recall
+
+Per-iteration speed is not the decision-relevant number: FAISS trains an IVF quantizer on a 256-points-per-cluster
+subsample (262k of 1M rows at k=1024) for 25 iterations, and scikit-learn's k-means++ init alone costs minutes.
+Inertia is always measured by our exact pass over the full data, so the metric is identical for every method.
+
+| Method | Train | Inertia (x best) | recall@10 nprobe 8 |
+|---|---|---|---|
+| ours, all rows, to convergence (34 iters) | 3.39 s | 1.0000 | 84.84% |
+| ours, all rows, 25 iters (FAISS's budget) | 2.88 s | 1.0012 | 84.74% |
+| ours, 262k subsample, to convergence | 2.09 s | 1.0090 | 84.11% |
+| FAISS default (subsample, 25 iters) | 4.90 s | 1.0094 | 84.17% |
+| FAISS all rows, 25 iters | 18.29 s | 1.0009 | 84.45% |
+| scikit-learn all rows, 25 iters | 233.37 s | 1.0000 | 84.80% |
+
+- Ours gives the best clustering and the best recall in the least time: 1.7x faster than FAISS's default while using
+  4x more data, 6.3x faster than FAISS on all rows, 69x faster than scikit-learn.
+- IVF index build (0.75 s) and search times are the same for every centroid set, as expected - the centroids only
+  move recall, and the spread is small (84.1-84.8% at nprobe 8).
+- **k-means++ init was the hidden cost**: 18.1 s in NumPy at k=1024 (it dominated a 12 s "12 s total" run). On the GPU
+  it is 1.5 s, and is now the largest single item in a 2.88 s run - the next thing to optimise.
+- **FAISS has no GPU path on this machine**: `faiss.get_compile_options()` reports MAC_METAL and `get_num_gpus()`
+  returns 1, but `faiss.Kmeans(gpu=True)` fails (GpuResourcesVector missing) and `index_cpu_to_gpu` returns a plain
+  CPU Index (same search time as IndexFlatL2). FAISS here is CPU-only unless built from source.
