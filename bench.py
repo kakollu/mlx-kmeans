@@ -9,8 +9,8 @@ Trust checks per result:
   - inertia of the final centers is recomputed the same way for every implementation and compared with ours
     (ours is verified against float64 by tests/accuracy.py); > 1e-4 relative difference = "different work",
     excluded from the fastest-public pick.
-  - if ours ever sees an empty cluster, libraries legitimately diverge (each re-seeds differently): the config
-    is flagged as not comparable.
+  - empty clusters: ours relocates them exactly like scikit-learn (verified in tests/accuracy.py); FAISS splits large
+    clusters instead, so FAISS can legitimately differ on configs where clusters empty (recorded as saw_empty_cluster).
   - CPU used by other processes is sampled before each timing (the 1-minute load average also counts the benchmark's
     own threads); > 400% (four busy cores; idle background is ~230%) is flagged.
   - the report compares ours (latest run) against each public library's best valid time ever recorded for that
@@ -41,6 +41,7 @@ RESULTS = ROOT / "benchmarks" / "results.jsonl"
 REPORT = ROOT / "BENCHMARKS.md"
 OURS = "ours: kmeans.py metal"
 PUBLISH_TARGET = 1.5
+PRE_RELOCATION = {"b5eeae0", "85e45c2", "b27f94b"}  # commits whose runs kept empty centers instead of relocating
 ITERS, REPEATS = 5, 3
 
 # Representative problems (see google_chat.txt): shapes people actually cluster.
@@ -66,13 +67,10 @@ SUITE = {
 def ours_metal(X, parts, C0):
     def run(iters):
         C = C0.copy()
-        empty = False
+        run.saw_empty = False
         for _ in range(iters):
-            sums, counts, _ = km.assign_mlx(parts, C)
-            has = counts > 0
-            empty |= not has.all()
-            C[has] = (sums[has] / counts[has, None]).astype(np.float32)
-        run.saw_empty = empty
+            C, _, n_empty = km.lloyd_step(parts, C)
+            run.saw_empty |= n_empty > 0
         return C
     return run
 
@@ -238,8 +236,6 @@ def bench(name, cfg, only, seed=0):
             rec.update(error=f"{type(e).__name__}: {str(e)[:200]}")
             print("FAILED", rec["error"])
         results.append(rec)
-    for r in results:
-        r["config_comparable"] = not ours_empty
     RESULTS.parent.mkdir(exist_ok=True)
     with RESULTS.open("a") as f:
         for r in results:
@@ -286,7 +282,7 @@ def report():
         public = [best_valid[(name, i)] for i in IMPLS if (name, i) in best_valid]
         best = min(public, key=lambda r: r["sec_per_pass"]) if public else None
         shape = f"{rs[0]['rows']:,} x {rs[0]['dims']}, k={rs[0]['k']}"
-        comparable = all(r.get("config_comparable", True) for r in rs)
+        comparable = not ours.get("saw_empty_cluster", False) or ours.get("commit") not in PRE_RELOCATION if ours else True
         if ours and best:
             ratio = best["sec_per_pass"] / ours["sec_per_pass"]
             mark = "✅" if ratio >= PUBLISH_TARGET else ("🟡" if ratio >= 1 else "❌")

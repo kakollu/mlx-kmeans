@@ -312,22 +312,61 @@ def _accumulate_blocks(x, labels, best, k):
     return (np.array(total, dtype=np.float64) + np.array(total_comp, dtype=np.float64)).reshape(k, w)
 
 
-def assign_mlx(parts, C, method="auto", return_labels=False, accumulate="auto"):
-    """One Lloyd pass on the GPU -> (per-cluster sums, counts, inertia[, labels])."""
+def _gpu_pass(parts, C, method="auto", accumulate="auto"):
+    """One assignment pass -> (float64 totals (k, d+2), [(labels, best) per slice] as MLX arrays)."""
     mx = _mx()
     k, d = C.shape
     if method == "auto":
         method = "pairs" if d >= PAIRS_MIN_DIMS else "rows"
     Cm = mx.array(C)
     tot = np.zeros((k, d + 2), dtype=np.float64)
-    all_labels = []
+    nearest = []
     for x in parts:
         labels, best = _nearest(x, Cm, method)
         tot += _accumulate(x, labels, best, k, accumulate)
-        if return_labels:
-            all_labels.append(np.array(labels).astype(np.int64))
+        nearest.append((labels, best))
+    return tot, nearest
+
+
+def assign_mlx(parts, C, method="auto", return_labels=False, accumulate="auto"):
+    """One Lloyd pass on the GPU -> (per-cluster sums, counts, inertia[, labels])."""
+    tot, nearest = _gpu_pass(parts, C, method, accumulate)
     result = (tot[:, 2:], np.rint(tot[:, 0]).astype(np.int64), float(tot[:, 1].sum()))
-    return result + (np.concatenate(all_labels),) if return_labels else result
+    if return_labels:
+        result += (np.concatenate([np.array(lab).astype(np.int64) for lab, _ in nearest]),)
+    return result
+
+
+def lloyd_step(parts, C, method="auto", accumulate="auto"):
+    """One exact Lloyd iteration on the GPU -> (new centers float32, inertia, number of empty clusters).
+
+    Empty clusters follow scikit-learn's rules (_relocate_empty_clusters_dense, _average_centers): each empty cluster
+    takes one of the points farthest from their assigned centers, which leaves its old cluster; a cluster still empty
+    after that (only when every point sits on its center) goes to the largest cluster's center. One deliberate
+    difference: when several clusters empty at once, scikit-learn pairs them with far points in np.argpartition's
+    unspecified order; here the farthest point goes to the lowest-numbered empty cluster (ties: lower row index).
+    """
+    tot, nearest = _gpu_pass(parts, C, method, accumulate)
+    sums, counts, inertia = tot[:, 2:], np.rint(tot[:, 0]).astype(np.int64), float(tot[:, 1].sum())
+    empty = np.flatnonzero(counts == 0)
+    if len(empty):
+        best = np.concatenate([np.array(b) for _, b in nearest])        # float32 distance to assigned center
+        if best.max() > 0:
+            far = np.argpartition(best, -len(empty))[-len(empty):]
+            far = far[np.lexsort((far, -best[far]))]                    # farthest first, lower row index on ties
+            labels = np.concatenate([np.array(lab) for lab, _ in nearest]).astype(np.int64)
+            for new, f, row in zip(empty, far, take_rows(parts, far).astype(np.float64)):
+                old = labels[f]
+                sums[old] -= row
+                counts[old] -= 1
+                sums[new] = row
+                counts[new] = 1
+    del nearest
+    C_new = np.empty_like(C)
+    has = counts > 0
+    C_new[has] = sums[has] / counts[has, None]
+    C_new[~has] = C_new[np.argmax(counts)]
+    return C_new, inertia, len(empty)
 
 
 # ---------------------------------------------------------------- driver
@@ -335,19 +374,23 @@ def assign_mlx(parts, C, method="auto", return_labels=False, accumulate="auto"):
 def kmeans(parts, rows, k, max_iter, tol, seed, backend):
     rng = np.random.default_rng(seed)
     C = kmeans_pp_init(parts, rows, k, rng)
-    assign = assign_mlx if backend == "mlx" else assign_numpy
     prev = None
     for it in range(1, max_iter + 1):
         t = time.perf_counter()
-        sums, counts, inertia = assign(parts, C)
-        empty = counts == 0
-        newC = C.copy()
-        newC[~empty] = (sums[~empty] / counts[~empty, None]).astype(np.float32)
-        if empty.any():  # re-seed empty clusters from random points
-            newC[empty] = take_rows(parts, rng.integers(0, rows, size=int(empty.sum())))
+        if backend == "mlx":
+            newC, inertia, n_empty = lloyd_step(parts, C)
+        else:  # NumPy CPU reference: empty clusters re-seeded from random points
+            sums, counts, inertia = assign_numpy(parts, C)
+            empty = counts == 0
+            n_empty = int(empty.sum())
+            newC = C.copy()
+            newC[~empty] = (sums[~empty] / counts[~empty, None]).astype(np.float32)
+            if n_empty:
+                newC[empty] = take_rows(parts, rng.integers(0, rows, size=n_empty))
         shift = float(np.sqrt(((newC - C) ** 2).sum(1)).max())
         C = newC
-        print(f"iter {it:3d}  inertia {inertia:.6e}  max_center_shift {shift:.5f}  {time.perf_counter() - t:.3f}s")
+        note = f"  ({n_empty} empty clusters relocated)" if n_empty else ""
+        print(f"iter {it:3d}  inertia {inertia:.6e}  max_center_shift {shift:.5f}  {time.perf_counter() - t:.3f}s{note}")
         if prev is not None and abs(prev - inertia) <= tol * prev:
             break
         prev = inertia

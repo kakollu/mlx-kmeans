@@ -10,6 +10,8 @@ For each case and each combination of nearest-center path (rows, pairs) and accu
      labels, measured relative to the data's RMS coordinate (~8x float32 eps: float32 centers can't do much
      better); inertia within 1e-6 relative.
 
+Plus full Lloyd iterations with empty-cluster relocation, checked against scikit-learn's lloyd from the same start.
+
 Run:  python3 tests/accuracy.py        (exit code 1 on any failure)
 """
 import sys
@@ -80,6 +82,71 @@ def check(name, X, C, slice_rows=None, dist_bytes=None):
     return ok
 
 
+def reference_lloyd_step(X, C, labels):
+    """Independent float64 Lloyd step (accumulation + empty-cluster rules of km.lloyd_step) for given labels."""
+    X64, C64 = X.astype(np.float64), C.astype(np.float64)
+    best = ((X64 - C64[labels]) ** 2).sum(1)
+    k = len(C)
+    counts = np.bincount(labels, minlength=k)
+    sums = np.zeros((k, X.shape[1]))
+    np.add.at(sums, labels, X64)
+    empty = np.flatnonzero(counts == 0)
+    if len(empty) and best.max() > 0:
+        order = sorted(range(len(X)), key=lambda i: (-best[i], i))[:len(empty)] if len(X) < 5000 else \
+            [i for _, i in sorted((-best[i], i) for i in np.argsort(-best, kind="stable")[:len(empty) + 50])][:len(empty)]
+        for new, f in zip(empty, order):
+            sums[labels[f]] -= X64[f]
+            counts[labels[f]] -= 1
+            sums[new] = X64[f]
+            counts[new] = 1
+    out = np.empty_like(C64)
+    has = counts > 0
+    out[has] = sums[has] / counts[has, None]
+    out[~has] = out[np.argmax(counts)]
+    return out, len(empty)
+
+
+def check_relocation(name, X, C0, steps=8, vs_sklearn=False):
+    """Lloyd steps including empty-cluster relocation, each step started from the same centers.
+
+    Always: our labels are float64-optimal up to float32 resolution, and given those labels, our centers match the
+    float64 reference step above within 1e-6 of the data scale (labels are shared so float32-level ties, which either
+    implementation may break either way, can't masquerade as relocation differences).
+    With vs_sklearn (cases where at most one cluster empties per step, so pairing order can't matter): steps that
+    relocate must also match scikit-learn's lloyd within 1e-5 (scikit-learn sums centers in float32) or, if a
+    float32-level tie label differs, give inertia within 1e-6.
+    """
+    from sklearn.cluster import KMeans
+    mx = km._mx()
+    parts = [mx.array(X)]
+    scale = float(np.sqrt((X.astype(np.float64) ** 2).mean()))
+    C, empties, ref_err, sk_err = C0.copy(), 0, 0.0, 0.0
+    for _ in range(steps):
+        ours, _, n_empty = km.lloyd_step(parts, C)
+        labels = km.assign_mlx(parts, C, return_labels=True)[3]
+        _, ref_best = reference(X, C)
+        X64, C64 = X.astype(np.float64), C.astype(np.float64)
+        d_lab = ((X64 - C64[labels]) ** 2).sum(1)
+        if (d_lab > ref_best + 8 * EPS32 * ((X64 ** 2).sum(1) + (C64[labels] ** 2).sum(1))).any():
+            ref_err = float("inf")  # a label that isn't optimal even at float32 resolution
+        ref, _ = reference_lloyd_step(X, C, labels)
+        ref_err = max(ref_err, float(np.max(np.abs(ours.astype(np.float64) - ref)) / scale))
+        empties += n_empty
+        if vs_sklearn and n_empty:
+            sk = KMeans(n_clusters=len(C), init=C, n_init=1, max_iter=1, tol=0.0, algorithm="lloyd").fit(X)
+            err = float(np.max(np.abs(ours.astype(np.float64) - sk.cluster_centers_)) / scale)
+            if err > 1e-5:  # allow a float32-level tie label: then inertia must still agree
+                a, b = km.assign_mlx(parts, ours)[2], km.assign_mlx(parts, sk.cluster_centers_.astype(np.float32))[2]
+                err = 0.0 if abs(a - b) / b <= 1e-6 else err
+            sk_err = max(sk_err, err)
+        C = ours
+    passed = empties > 0 and ref_err <= 1e-6 and sk_err <= 1e-5
+    extra = f"  vs scikit-learn {sk_err:.1e}" if vs_sklearn else ""
+    print(f"{'PASS' if passed else 'FAIL'}  {name:50s} {empties} empty clusters relocated in {steps} steps  "
+          f"center err vs float64 reference {ref_err:.1e}{extra}")
+    return passed
+
+
 def blobs(rng, n, d, true_k, spread, noise):
     centers = rng.uniform(-spread, spread, size=(true_k, d))
     return (centers[rng.integers(0, true_k, n)] + rng.normal(0, noise, (n, d))).astype(np.float32)
@@ -114,6 +181,17 @@ def main():
     # accumulation stress: ~5M points per cluster at |x| ~ 1000, one slice, few large blocks
     X = (blobs(rng, 20_000_000, 2, 4, 10, 1) + 1000).astype(np.float32)
     results.append(check("accumulation 20M rows +1000 d2 k4", X, X[rng.choice(len(X), 4, replace=False)]))
+    # empty clusters: several empty at once (pairing order matters) -> checked against the float64 reference
+    X = blobs(rng, 200_000, 16, 8, 10, 1)
+    C0 = np.concatenate([X[rng.choice(len(X), 24, replace=False)], rng.uniform(900, 1000, (8, 16)).astype(np.float32)])
+    results.append(check_relocation("relocation, 8 empty at once d16 k32", X, C0))
+    X = blobs(rng, 300_000, 50, 64, 10, 1)
+    C0 = np.concatenate([X[rng.choice(len(X), 60, replace=False)], rng.uniform(900, 1000, (4, 50)).astype(np.float32)])
+    results.append(check_relocation("relocation, 4 empty at once d50 k64", X, C0))
+    # one cluster empties -> also checked against scikit-learn itself
+    X = blobs(rng, 200_000, 12, 16, 10, 1)
+    C0 = np.concatenate([X[rng.choice(len(X), 31, replace=False)], rng.uniform(900, 1000, (1, 12)).astype(np.float32)])
+    results.append(check_relocation("relocation, 1 empty d12 k32 (+ scikit-learn)", X, C0, vs_sklearn=True))
     print(f"\n{sum(results)}/{len(results)} cases passed")
     sys.exit(0 if all(results) else 1)
 
