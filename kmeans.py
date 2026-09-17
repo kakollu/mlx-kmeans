@@ -107,15 +107,26 @@ def _mx():
 # ---------------------------------------------------------------- init
 
 def kmeans_pp_init(parts, rows, k, rng, sample=200_000):
-    """k-means++ seeding on a random subsample (full k-means++ over 1B rows is needlessly slow)."""
-    S = take_rows(parts, rng.choice(rows, size=min(sample, rows), replace=False))
-    C = np.empty((k, S.shape[1]), dtype=np.float32)
-    C[0] = S[rng.integers(len(S))]
-    d2 = ((S - C[0]) ** 2).sum(1)
-    for i in range(1, k):
-        C[i] = S[rng.choice(len(S), p=d2 / d2.sum())]
-        d2 = np.minimum(d2, ((S - C[i]) ** 2).sum(1))
-    return C
+    """k-means++ seeding on a random subsample (full k-means++ over 1B rows is needlessly slow).
+
+    The k sequential rounds run on the GPU with only the chosen row index crossing back each round; doing them in
+    NumPy costs ~10 s at k=1024 (and is why scikit-learn's own k-means++ takes minutes on SIFT1M).
+    """
+    mx = _mx()
+    S = mx.array(take_rows(parts, np.sort(rng.choice(rows, size=min(sample, rows), replace=False))))
+    picks = [int(rng.integers(S.shape[0]))]
+    d2 = ((S - S[picks[0]]) ** 2).sum(1)
+    for _ in range(1, k):
+        # Pick the next center with probability proportional to d2 via the Gumbel-max trick: argmax(log d2 + G),
+        # G = -log(-log U). A cumulative-sum inverse-CDF is the textbook route but stalls in float32 once the running
+        # sum dwarfs later weights, which biases the choice towards early rows.
+        u = mx.random.uniform(shape=d2.shape, key=mx.random.key(int(rng.integers(2**31))), low=1e-20, high=1.0)
+        nxt = mx.argmax(mx.log(mx.maximum(d2, 1e-30)) - mx.log(-mx.log(u)))
+        mx.eval(nxt)
+        i = int(nxt.item())
+        picks.append(i)
+        d2 = mx.minimum(d2, ((S - S[i]) ** 2).sum(1))
+    return np.array(S[mx.array(picks)], dtype=np.float32)
 
 
 # ---------------------------------------------------------------- assignment passes
