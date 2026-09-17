@@ -150,49 +150,104 @@ def assign_numpy(parts, C, chunk=2_000_000):
     return sums, counts, inertia
 
 
-# Each GPU thread owns one block of BS rows and writes its own (K, D+2) row of [count, inertia, sums...],
-# so there is no shared-write contention; the small per-block results are reduced on the host in float64.
-_METAL_SRC = """
+# Two GPU paths for one assignment pass; both give each point the center with the smallest float32 distance
+# sum((x - c)^2), computed directly (never via |x|^2 - 2x.c + |c|^2, which cancels badly), lowest index on ties.
+#   direct:   one kernel, each GPU thread takes a block of rows and loops over all centers. One read of the data,
+#             best when k * dims is small.
+#   pairwise: one GPU thread per (row, center) pair writes a chunk of distances, then a second kernel picks the
+#             nearest center per row. Branch-free work the GPU parallelizes well: ~18x faster per distance term
+#             than direct, best when k * dims is large. (MLX's GPU matmul would be faster still, but its float32
+#             error is ~5000x eps -- too inexact to trust for nearest-center decisions.)
+# Picking and accumulation: each GPU thread owns one block of BS rows and writes its own (K, D+2) row of
+# [count, inertia, sums...], so there are no shared writes; per-block results are reduced on the host in float64.
+_ACCUMULATE = """
+        uint o = base + bl * W;
+        out[o] += 1; out[o + 1] += best;
+        for (uint j = 0; j < D; j++) out[o + 2 + j] += X[xi + j];
+        if (LABELS) labels[i] = bl;
+    }
+"""
+_DIRECT_SRC = """
     uint b = thread_position_in_grid.x;
-    uint start = b * BS;
-    uint end = min(start + BS, n_rows[0]);
-    uint W = D + 2;
-    uint base = b * K * W;
+    uint start = b * BS, end = min(start + BS, n_rows[0]), W = D + 2, base = b * K * W;
     for (uint c = 0; c < K * W; c++) out[base + c] = 0;
     for (uint i = start; i < end; i++) {
+        uint xi = i * D;
         float best = INFINITY; uint bl = 0;
         for (uint c = 0; c < K; c++) {
             float s = 0;
-            for (uint j = 0; j < D; j++) { float t = X[i*D + j] - C[c*D + j]; s += t*t; }
+            for (uint j = 0; j < D; j++) { float t = X[xi + j] - C[c*D + j]; s += t*t; }
             if (s < best) { best = s; bl = c; }
         }
-        uint o = base + bl * W;
-        out[o] += 1; out[o + 1] += best;
-        for (uint j = 0; j < D; j++) out[o + 2 + j] += X[i*D + j];
-    }
+""" + _ACCUMULATE
+_PAIR_SRC = """
+    uint i = thread_position_in_grid.y, c = thread_position_in_grid.x;
+    uint xi = (row0[0] + i) * D, ci = c * D;
+    float s = 0;
+    for (uint j = 0; j < D; j++) { float t = X[xi + j] - C[ci + j]; s += t*t; }
+    dist[i * K + c] = s;
 """
-_kernel = None
+_PICK_SRC = """
+    uint b = thread_position_in_grid.x;
+    uint start = b * BS, end = min(start + BS, n_rows[0]), W = D + 2, base = b * K * W;
+    for (uint c = 0; c < K * W; c++) out[base + c] = 0;
+    for (uint i = start; i < end; i++) {
+        uint xi = (row0[0] + i) * D, di = i * K;
+        float best = INFINITY; uint bl = 0;
+        for (uint c = 0; c < K; c++) if (dist[di + c] < best) { best = dist[di + c]; bl = c; }
+""" + _ACCUMULATE
+_kernels = {}
+PAIRWISE_MIN_KD = 256        # use the pairwise path when k * dims >= this (see benchmarks/NOTES.md)
+DIST_BYTES = 512 << 20       # largest (rows x k) float32 distance chunk in the pairwise path
+GPU_BLOCK = 4096             # rows per GPU thread when picking in the pairwise path
 
 
-def assign_mlx(parts, C):
-    global _kernel
+def _kernel(name, inputs, outputs, src):
+    if name not in _kernels:
+        _kernels[name] = _mx().fast.metal_kernel(name=name, input_names=inputs, output_names=outputs, source=src)
+    return _kernels[name]
+
+
+def _accumulate(kern, inputs, n, k, d, block, labels):
     mx = _mx()
-    if _kernel is None:
-        _kernel = mx.fast.metal_kernel(name="kmeans_step", input_names=["X", "C", "n_rows"],
-                                       output_names=["out"], source=_METAL_SRC)
+    nb = -(-n // block)
+    return kern(inputs=inputs, template=[("D", d), ("K", k), ("BS", block), ("LABELS", int(labels))],
+                grid=(nb, 1, 1), threadgroup=(64, 1, 1),
+                output_shapes=[(nb, k, d + 2), (n if labels else 1,)], output_dtypes=[mx.float32, mx.uint32])
+
+
+def assign_mlx(parts, C, method="auto", return_labels=False):
+    """One Lloyd pass on the GPU -> (per-cluster sums, counts, inertia[, labels])."""
+    mx = _mx()
     k, d = C.shape
+    if method == "auto":
+        method = "pairwise" if k * d >= PAIRWISE_MIN_KD else "direct"
     Cm = mx.array(C)
     tot = np.zeros((k, d + 2), dtype=np.float64)
+    labels = []
     for x in parts:
         n = x.shape[0]
-        block = block_rows(n, k, d)
-        nb = -(-n // block)
-        out = _kernel(inputs=[x, Cm, mx.array([n], dtype=mx.uint32)],
-                      template=[("D", d), ("K", k), ("BS", block)],
-                      grid=(nb, 1, 1), threadgroup=(64, 1, 1),
-                      output_shapes=[(nb, k, d + 2)], output_dtypes=[mx.float32])[0]
-        tot += np.array(out, dtype=np.float64).sum(0)
-    return tot[:, 2:], tot[:, 0].astype(np.int64), float(tot[:, 1].sum())
+        if method == "direct":
+            kern = _kernel("kmeans_direct", ["X", "C", "n_rows"], ["out", "labels"], _DIRECT_SRC)
+            outs = [_accumulate(kern, [x, Cm, mx.array([n], dtype=mx.uint32)], n, k, d, block_rows(n, k, d), return_labels)]
+        else:
+            pair = _kernel("kmeans_pair", ["X", "C", "row0"], ["dist"], _PAIR_SRC)
+            pick = _kernel("kmeans_pick", ["X", "dist", "row0", "n_rows"], ["out", "labels"], _PICK_SRC)
+            chunk = max(1, DIST_BYTES // (4 * k))
+            outs = []
+            for r0 in range(0, n, chunk):
+                m = min(chunk, n - r0)
+                row0 = mx.array([r0], dtype=mx.uint32)
+                dist = pair(inputs=[x, Cm, row0], template=[("D", d), ("K", k)], grid=(k, m, 1), threadgroup=(16, 16, 1),
+                            output_shapes=[(m, k)], output_dtypes=[mx.float32])[0]
+                outs.append(_accumulate(pick, [x, dist, row0, mx.array([m], dtype=mx.uint32)], m, k, d, GPU_BLOCK, return_labels))
+                mx.eval(outs[-1])  # bound memory: one distance chunk alive at a time
+        for out, lab in outs:
+            tot += np.array(out, dtype=np.float64).sum(0)
+            if return_labels:
+                labels.append(np.array(lab))
+    result = (tot[:, 2:], tot[:, 0].astype(np.int64), float(tot[:, 1].sum()))
+    return result + (np.concatenate(labels),) if return_labels else result
 
 
 # ---------------------------------------------------------------- driver
