@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Accuracy suite: every assignment-pass path must match float64 ground truth.
 
-For each case and each path (rows, pairs):
+For each case and each combination of nearest-center path (rows, pairs) and accumulation (blocks, sorted):
   1. Labels: every point's center is optimal in float64, up to float32 resolution:
          d64(x, label) <= d64(x, best) + 8 * eps32 * (|x|^2 + |c|^2)
      (points whose float64 distances to two centers differ by less than that are ties at float32 precision).
@@ -56,8 +56,8 @@ def check(name, X, C, slice_rows=None, dist_bytes=None):
     ref_c, ref_d = reference(X, C)
     X64, C64 = X.astype(np.float64), C.astype(np.float64)
     ok = True
-    for method in ["rows", "pairs"]:
-        sums, counts, inertia, labels = km.assign_mlx(parts, C, method=method, return_labels=True)
+    for method, accumulate in [("rows", "blocks"), ("rows", "sorted"), ("pairs", "blocks"), ("pairs", "sorted")]:
+        sums, counts, inertia, labels = km.assign_mlx(parts, C, method=method, return_labels=True, accumulate=accumulate)
         d_lab = ((X64 - C64[labels]) ** 2).sum(1)
         tol = 8 * EPS32 * ((X64 ** 2).sum(1) + (C64[labels] ** 2).sum(1))
         bad = int((d_lab > ref_d + tol).sum())
@@ -73,7 +73,7 @@ def check(name, X, C, slice_rows=None, dist_bytes=None):
         inertia_err = abs(inertia - ref_inertia) / max(ref_inertia, 1e-30)
         passed = bad == 0 and np.array_equal(counts, ref_counts) and center_err <= 1e-6 and inertia_err <= 1e-6
         ok &= passed
-        print(f"{'PASS' if passed else 'FAIL'}  {name:44s} {method:8s}  wrong labels {bad}  "
+        print(f"{'PASS' if passed else 'FAIL'}  {name:36s} {method + '/' + accumulate:13s}  wrong labels {bad}  "
               f"(float32-level ties {strict - bad})  counts {'ok' if np.array_equal(counts, ref_counts) else 'MISMATCH'}  "
               f"center err {center_err:.1e}  inertia err {inertia_err:.1e}")
     km.SLICE_ROWS, km.DIST_BYTES = 100_000_000, 512 << 20

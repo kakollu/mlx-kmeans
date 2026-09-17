@@ -150,9 +150,14 @@ def assign_numpy(parts, C, chunk=2_000_000):
 #             the branch-free argmin. Faster at high dims with modest k.
 #    GPUs run many threads in lockstep; the original design (one thread per 4096-row block, branchy argmin)
 #    was 9-40x slower at large k * dims.
-# 2. Accumulation: each GPU thread owns a block of rows and adds [count, inertia, sums...] per cluster with
-#    compensated (Neumaier) summation, then one thread per output value reduces the blocks the same way.
-#    Exact to float32 rounding regardless of block size; the host adds sum + compensation in float64.
+# 2. Accumulation of [count, inertia, sums...] per cluster, compensated (Neumaier) summation throughout, so it is
+#    exact to float32 rounding; the host adds sum + compensation in float64. Two interchangeable methods:
+#      blocks: each GPU thread owns a block of rows and writes into its own (k, dims+2) buffer; then one thread
+#              per output value reduces the blocks. Best when k * (dims+2) is small.
+#      sorted: rows are argsorted by label and split into 256-row segments of one cluster; one GPU thread per
+#              segment writes one small row, then one thread per (cluster, value) reduces its segments.
+#              At large k * dims the blocks method's scattered writes into multi-MB buffers dominate the whole
+#              pass (GIST1M: 4.2 s of 4.8 s); sorted segments keep writes cache-local (0.05 s).
 _KAHAN = """
 #define KAHAN_ADD(s, c, v) { float v_ = (v); float t_ = (s) + v_; \\
     (c) += select((v_ - t_) + (s), ((s) - t_) + v_, fabs(s) >= fabs(v_)); (s) = t_; }
@@ -191,6 +196,22 @@ _ACCUMULATE_SRC = """
         for (uint j = 0; j < D; j++) KAHAN_ADD(sums[o + 2 + j], comp[o + 2 + j], X[xi + j]);
     }
 """
+_SEGMENT_SRC = """
+    uint s = thread_position_in_grid.x, W = D + 2, o = s * W;
+    for (uint e = 0; e < W; e++) { sums[o + e] = 0; comp[o + e] = 0; }
+    for (uint p = seg_start[s]; p < seg_end[s]; p++) {
+        uint r = perm[p], xi = r * D;
+        sums[o] += 1;
+        KAHAN_ADD(sums[o + 1], comp[o + 1], best_d[r]);
+        for (uint j = 0; j < D; j++) KAHAN_ADD(sums[o + 2 + j], comp[o + 2 + j], X[xi + j]);
+    }
+"""
+_SEGMENT_REDUCE_SRC = """
+    uint c = thread_position_in_grid.y, e = thread_position_in_grid.x;
+    float s = 0, cc = 0;
+    for (uint q = seg_first[c]; q < seg_first[c + 1]; q++) { KAHAN_ADD(s, cc, sums[q * W + e]); cc += comp[q * W + e]; }
+    total[c * W + e] = s; total_comp[c * W + e] = cc;
+"""
 _REDUCE_SRC = """
     uint e = thread_position_in_grid.x;
     float s = 0, c = 0;
@@ -202,6 +223,8 @@ PAIRS_MIN_DIMS = 64                     # use the pairs path when dims >= 64 (me
 DIST_BYTES = 512 << 20                  # largest (rows x k) float32 distance chunk in the pairs path
 ACC_BYTES = 256 << 20                   # budget for per-block accumulation buffers
 ACC_MAX_BLOCKS = 1024                   # GPU threads for accumulation
+SORTED_MIN_KW = 1024                    # use sorted accumulation when k * (dims + 2) >= this (measured crossover)
+SEGMENT_ROWS = 256                      # rows per GPU thread in sorted accumulation
 
 
 def _kernel(name, inputs, outputs, src, header=""):
@@ -240,8 +263,38 @@ def _nearest(x, Cm, method):
     return (labels[0], best[0]) if len(labels) == 1 else (mx.concatenate(labels), mx.concatenate(best))
 
 
-def _accumulate(x, labels, best, k):
+def _accumulate(x, labels, best, k, method="auto"):
     """Per-cluster [count, inertia, sums...] for one slice -> float64 numpy array (k, d + 2)."""
+    if method == "auto":
+        method = "sorted" if k * (x.shape[1] + 2) >= SORTED_MIN_KW else "blocks"
+    return _accumulate_sorted(x, labels, best, k) if method == "sorted" else _accumulate_blocks(x, labels, best, k)
+
+
+def _accumulate_sorted(x, labels, best, k):
+    mx = _mx()
+    n, d = x.shape
+    w = d + 2
+    perm = mx.argsort(labels).astype(mx.uint32)
+    counts = np.array(mx.zeros((k,), dtype=mx.uint32).at[labels].add(mx.array(1, dtype=mx.uint32))).astype(np.int64)
+    offs = np.concatenate([[0], np.cumsum(counts)])
+    nseg = -(-counts // SEGMENT_ROWS)                      # segments per cluster (0 for an empty cluster)
+    seg_first = np.concatenate([[0], np.cumsum(nseg)])
+    seg_cluster = np.repeat(np.arange(k), nseg)
+    starts = offs[seg_cluster] + (np.arange(len(seg_cluster)) - seg_first[seg_cluster]) * SEGMENT_ROWS
+    ends = np.minimum(starts + SEGMENT_ROWS, offs[seg_cluster + 1])
+    ns = len(starts)
+    seg = _kernel("kmeans_segments", ["X", "best_d", "perm", "seg_start", "seg_end"], ["sums", "comp"], _SEGMENT_SRC, _KAHAN)
+    sums, comp = seg(inputs=[x, best, perm, mx.array(starts.astype(np.uint32)), mx.array(ends.astype(np.uint32))],
+                     template=[("D", d)], grid=(ns, 1, 1), threadgroup=(64, 1, 1),
+                     output_shapes=[(ns * w,), (ns * w,)], output_dtypes=[mx.float32, mx.float32])
+    red = _kernel("kmeans_segment_reduce", ["sums", "comp", "seg_first"], ["total", "total_comp"], _SEGMENT_REDUCE_SRC, _KAHAN)
+    total, total_comp = red(inputs=[sums, comp, mx.array(seg_first.astype(np.uint32))], template=[("W", w)],
+                            grid=(w, k, 1), threadgroup=(32, 8, 1),
+                            output_shapes=[(k * w,), (k * w,)], output_dtypes=[mx.float32, mx.float32])
+    return (np.array(total, dtype=np.float64) + np.array(total_comp, dtype=np.float64)).reshape(k, w)
+
+
+def _accumulate_blocks(x, labels, best, k):
     mx = _mx()
     n, d = x.shape
     w = d + 2
@@ -259,7 +312,7 @@ def _accumulate(x, labels, best, k):
     return (np.array(total, dtype=np.float64) + np.array(total_comp, dtype=np.float64)).reshape(k, w)
 
 
-def assign_mlx(parts, C, method="auto", return_labels=False):
+def assign_mlx(parts, C, method="auto", return_labels=False, accumulate="auto"):
     """One Lloyd pass on the GPU -> (per-cluster sums, counts, inertia[, labels])."""
     mx = _mx()
     k, d = C.shape
@@ -270,7 +323,7 @@ def assign_mlx(parts, C, method="auto", return_labels=False):
     all_labels = []
     for x in parts:
         labels, best = _nearest(x, Cm, method)
-        tot += _accumulate(x, labels, best, k)
+        tot += _accumulate(x, labels, best, k, accumulate)
         if return_labels:
             all_labels.append(np.array(labels).astype(np.int64))
     result = (tot[:, 2:], np.rint(tot[:, 0]).astype(np.int64), float(tot[:, 1].sum()))
