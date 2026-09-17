@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """Benchmark k-means implementations head to head on this machine.
 
-Every implementation gets the same data, the same starting centers and the same number of full Lloyd passes
-(no early stopping, no subsampling). Data transfer and kernel compilation happen in an untimed warm-up.
-Each run appends one JSON line per implementation to benchmarks/results.jsonl, and BENCHMARKS.md is
-regenerated from that file.
+Every implementation gets the same data, the same k-means++ starting centers and the same number of full Lloyd
+passes (no early stopping, no subsampling). An untimed warm-up handles transfers, kernel compilation and thread
+pools; then the pass loop is timed REPEATS times and the median is reported.
 
-Run with the venv that has the public baselines (faiss-cpu, torch, fast-pytorch-kmeans):
-  .venv/bin/python bench.py --rows 10_000_000 --dims 8 --k 16
-  .venv/bin/python bench.py --report          # only rebuild BENCHMARKS.md
+Trust checks per result:
+  - inertia of the final centers is recomputed the same way for every implementation and compared with ours
+    (ours is verified against float64 by tests/accuracy.py); > 1e-4 relative difference = "different work",
+    excluded from the fastest-public pick.
+  - if ours ever sees an empty cluster, libraries legitimately diverge (each re-seeds differently): the config
+    is flagged as not comparable.
+  - 1-minute load average is recorded before each timing; > 4 is flagged.
+
+Each run appends one JSON line per implementation to benchmarks/results.jsonl; BENCHMARKS.md is regenerated.
+
+  .venv/bin/python bench.py --suite                 # representative suite (see SUITE)
+  .venv/bin/python bench.py --config sift-k1024     # one suite config
+  .venv/bin/python bench.py --report                # only rebuild BENCHMARKS.md
 """
 import argparse
 import datetime
@@ -28,19 +37,39 @@ ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "benchmarks" / "results.jsonl"
 REPORT = ROOT / "BENCHMARKS.md"
 OURS = "ours: kmeans.py metal"
-PUBLISH_TARGET = 1.5  # publish if ours is >= 1.5x the fastest public implementation
+PUBLISH_TARGET = 1.5
+ITERS, REPEATS = 5, 3
+
+# Representative problems (see google_chat.txt): shapes people actually cluster.
+SUITE = {
+    "geo-trips":      dict(data="synthetic", rows=10_000_000, dims=4, k=256,
+                           why="GPS / origin-destination points"),
+    "satellite":      dict(data="synthetic", rows=10_000_000, dims=12, k=32,
+                           why="multispectral pixels (Sentinel-2 has 13 bands)"),
+    "logs":           dict(data="synthetic", rows=10_000_000, dims=32, k=256,
+                           why="network/security feature vectors"),
+    "single-cell":    dict(data="synthetic", rows=2_000_000, dims=50, k=64,
+                           why="scRNA-seq after PCA to 50 components"),
+    "sift-k1024":     dict(data="sift", rows=1_000_000, dims=128, k=1024,
+                           why="SIFT1M: vector-search training (IVF coarse quantizer)"),
+    "gist-k1024":     dict(data="gist", rows=1_000_000, dims=960, k=1024,
+                           why="GIST1M: high-dimensional vector-search training"),
+}
 
 
 # ---------------------------------------------------------------- implementations
-# Each takes (X numpy float32, parts mlx list, C0, iters) and returns a runner: runner(iters) -> final centers.
+# Each takes (X numpy float32, parts mlx list, C0) and returns run(iters) -> final centers.
 
 def ours_metal(X, parts, C0):
     def run(iters):
         C = C0.copy()
+        empty = False
         for _ in range(iters):
             sums, counts, _ = km.assign_mlx(parts, C)
             has = counts > 0
+            empty |= not has.all()
             C[has] = (sums[has] / counts[has, None]).astype(np.float32)
+        run.saw_empty = empty
         return C
     return run
 
@@ -89,12 +118,32 @@ IMPLS = {
     "fast-pytorch-kmeans (MPS GPU)": (fast_pytorch_kmeans_mps, "fast_pytorch_kmeans"),
 }
 # Rough extra memory beyond the data, to skip runs that would swap this shared machine.
-MEMORY_GB = {"fast-pytorch-kmeans (MPS GPU)": lambda rows, dims, k: rows * k * 4 / 1e9 + rows * dims * 4 / 1e9}  # dense k x rows mask
+MEMORY_GB = {"fast-pytorch-kmeans (MPS GPU)": lambda rows, dims, k: rows * k * 4 / 1e9 + rows * dims * 4 / 1e9}
 MAX_EXTRA_GB = 24
-
-# scikit-learn runs one extra assignment pass after max_iter (to make labels match centers), so its
-# time is divided by iters + 1 -- in its favour.
+# scikit-learn runs one extra assignment pass after max_iter, so its time is divided by iters + 1 (in its favour).
 EXTRA_PASSES = {"scikit-learn lloyd (CPU)": 1, "scikit-learn elkan (CPU)": 1}
+
+
+# ---------------------------------------------------------------- data
+
+def read_fvecs(path):
+    raw = np.fromfile(path, dtype=np.int32)
+    d = int(raw[0])
+    return raw.reshape(-1, d + 1)[:, 1:].view(np.float32).copy()
+
+
+def load(cfg, seed):
+    mx = km._mx()
+    if cfg["data"] == "synthetic":
+        parts = km.make_data_mlx(cfg["rows"], cfg["dims"], cfg["k"], seed)
+        X = np.concatenate([np.array(p) for p in parts])
+    else:
+        X = read_fvecs(ROOT / "data" / cfg["data"] / f"{cfg['data']}_base.fvecs")[:cfg["rows"]]
+        assert X.shape[1] == cfg["dims"], X.shape
+        per = km.slice_rows(X.shape[1])
+        parts = [mx.array(X[s:s + per]) for s in range(0, len(X), per)]
+    mx.eval(parts)
+    return X, parts
 
 
 # ---------------------------------------------------------------- run + record
@@ -125,21 +174,21 @@ def machine():
     return f"{chip}, {mem} GB, macOS {platform.mac_ver()[0]}"
 
 
-def bench(rows, dims, k, iters, only, seed):
-    import mlx.core as mx
-    parts = km.make_data_mlx(rows, dims, k, seed)
-    mx.eval(parts)
-    X = np.concatenate([np.array(p) for p in parts])
+def bench(name, cfg, only, seed=0):
+    X, parts = load(cfg, seed)
+    rows, dims, k = X.shape[0], X.shape[1], cfg["k"]
     C0 = km.kmeans_pp_init(parts, rows, k, np.random.default_rng(seed))
     commit, dirty = git_state()
-    results = []
-    for name, (make, module) in IMPLS.items():
-        if only and not any(o.lower() in name.lower() for o in only):
+    results, ours_inertia, ours_empty = [], None, False
+    print(f"== {name}: {rows:,} rows, {dims} dims, k={k} ({cfg['data']})")
+    for impl, (make, module) in IMPLS.items():
+        if only and impl != OURS and not any(o.lower() in impl.lower() for o in only):
             continue
-        print(f"{name:32s} ", end="", flush=True)
+        print(f"   {impl:32s} ", end="", flush=True)
         rec = dict(date=datetime.datetime.now().isoformat(timespec="seconds"), commit=commit, dirty=dirty,
-                   machine=machine(), impl=name, version=version(module), rows=rows, dims=dims, k=k, iters=iters)
-        need = MEMORY_GB.get(name, lambda *a: 0)(rows, dims, k)
+                   machine=machine(), config=name, data=cfg["data"], impl=impl, version=version(module),
+                   rows=rows, dims=dims, k=k, iters=ITERS, repeats=REPEATS)
+        need = MEMORY_GB.get(impl, lambda *a: 0)(rows, dims, k)
         if need > MAX_EXTRA_GB:
             rec.update(error=f"skipped: needs ~{need:.0f} GB extra memory (limit {MAX_EXTRA_GB} GB)")
             print(rec["error"])
@@ -147,65 +196,95 @@ def bench(rows, dims, k, iters, only, seed):
             continue
         try:
             run = make(X, parts, C0)
-            run(1)  # warm-up: transfers, kernel compilation, thread pools
-            t = time.perf_counter()
-            C = run(iters)
-            total = time.perf_counter() - t
-            rec.update(total_s=round(total, 4), sec_per_pass=round(total / (iters + EXTRA_PASSES.get(name, 0)), 5),
-                       inertia=km.assign_mlx(parts, np.ascontiguousarray(C, dtype=np.float32))[2])
-            print(f"{rec['sec_per_pass']:.4f} s/pass   inertia {rec['inertia']:.6e}")
+            run(1)  # warm-up
+            times, loads = [], []
+            for _ in range(REPEATS):
+                loads.append(os.getloadavg()[0])
+                t = time.perf_counter()
+                C = run(ITERS)
+                times.append((time.perf_counter() - t) / (ITERS + EXTRA_PASSES.get(impl, 0)))
+            inertia = km.assign_mlx(parts, np.ascontiguousarray(C, dtype=np.float32))[2]
+            rec.update(sec_per_pass=float(np.median(times)), min_s=min(times), max_s=max(times),
+                       load1=max(loads), inertia=inertia)
+            if impl == OURS:
+                ours_inertia, ours_empty = inertia, run.saw_empty
+                rec["saw_empty_cluster"] = ours_empty
+            else:
+                rec["inertia_rel_vs_ours"] = (inertia - ours_inertia) / ours_inertia
+                rec["valid"] = abs(rec["inertia_rel_vs_ours"]) <= 1e-4
+            flags = ("  LOAD>4" if rec["load1"] > 4 else "") + ("" if rec.get("valid", True) else "  DIFFERENT WORK")
+            print(f"{rec['sec_per_pass']:.4f} s/pass (min {rec['min_s']:.4f}, max {rec['max_s']:.4f})"
+                  f"  inertia {inertia:.6e}{flags}")
         except Exception as e:
             rec.update(error=f"{type(e).__name__}: {str(e)[:200]}")
             print("FAILED", rec["error"])
         results.append(rec)
+    for r in results:
+        r["config_comparable"] = not ours_empty
     RESULTS.parent.mkdir(exist_ok=True)
     with RESULTS.open("a") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
-    return results
+    del X, parts
+    km._mx().clear_cache()
 
 
 def report():
     rows = [json.loads(line) for line in RESULTS.read_text().splitlines()] if RESULTS.exists() else []
-    latest = {}  # newest result per (config, impl)
+    rows = [r for r in rows if r.get("config") in SUITE]  # suite results only; older ad-hoc runs stay in the jsonl
+    latest = {}
     for r in rows:
-        latest[(r["rows"], r["dims"], r["k"], r["impl"])] = r
-    configs = sorted({key[:3] for key in latest})
+        latest[(r["config"], r["impl"])] = r
     out = [
         "# Benchmarks",
         "",
         f"Generated by `bench.py` from `benchmarks/results.jsonl` (full history). Machine: {rows[-1]['machine'] if rows else '?'}.",
         "",
-        "**Method:** identical data, identical k-means++ starting centers and a fixed number of full Lloyd passes for "
-        "every implementation (no early stopping, no subsampling: FAISS's 256-points-per-cluster sampling is disabled). "
-        "Warm-up run first. Time is per pass (assignment + center update); scikit-learn's extra final assignment pass "
-        "is counted in its favour. Final inertia is recomputed the same way for all, to check they did the same work.",
+        f"**Method:** identical data, identical k-means++ starting centers, {ITERS} full Lloyd passes per timed run "
+        f"(no early stopping; FAISS's 256-points-per-cluster subsampling disabled), untimed warm-up, median of "
+        f"{REPEATS} timed runs. scikit-learn's extra final assignment pass is counted in its favour.",
         "",
-        f"**Publish target:** ours at least {PUBLISH_TARGET}x faster than the fastest public implementation on this machine.",
+        "**Trust checks:** our pass is verified against float64 by `tests/accuracy.py` (every label, centers, inertia). "
+        "A library whose final inertia differs from ours by more than 1e-4 relative did different work and is excluded "
+        "from the comparison. A config where our run hit an empty cluster is flagged not comparable. Load average > 4 "
+        "during timing is flagged.",
         "",
+        f"**Publish target:** ours at least {PUBLISH_TARGET}x faster than the fastest valid public implementation on every config.",
+        "",
+        "| Config | Problem | Shape | Ours s/pass | Fastest valid public | Its s/pass | Ours vs it |",
+        "|---|---|---|---|---|---|---|",
     ]
-    for rows_, dims, k in configs:
-        rs = [latest[(rows_, dims, k, i)] for i in IMPLS if (rows_, dims, k, i) in latest]
-        ok = [r for r in rs if "sec_per_pass" in r]
-        public = [r for r in ok if r["impl"] != OURS]
-        ours = next((r for r in ok if r["impl"] == OURS), None)
-        best_pub = min(public, key=lambda r: r["sec_per_pass"]) if public else None
-        out += [f"## {rows_:,} rows, {dims} dims, k={k}", ""]
-        if ours and best_pub:
-            ratio = best_pub["sec_per_pass"] / ours["sec_per_pass"]
-            verdict = "meets" if ratio >= PUBLISH_TARGET else "below"
-            out += [f"Ours vs fastest public ({best_pub['impl']}): **{ratio:.1f}x** ({verdict} the {PUBLISH_TARGET}x target)", ""]
-        out += ["| Implementation | Version | s/pass | vs ours | Inertia rel. to ours | Commit | Date |",
-                "|---|---|---|---|---|---|---|"]
+    details = []
+    for name, cfg in SUITE.items():
+        rs = [latest[(name, i)] for i in IMPLS if (name, i) in latest]
+        if not rs:
+            continue
+        ours = next((r for r in rs if r["impl"] == OURS and "sec_per_pass" in r), None)
+        public = [r for r in rs if r["impl"] != OURS and "sec_per_pass" in r and r.get("valid")]
+        best = min(public, key=lambda r: r["sec_per_pass"]) if public else None
+        shape = f"{rs[0]['rows']:,} x {rs[0]['dims']}, k={rs[0]['k']}"
+        comparable = all(r.get("config_comparable", True) for r in rs)
+        if ours and best:
+            ratio = best["sec_per_pass"] / ours["sec_per_pass"]
+            mark = "✅" if ratio >= PUBLISH_TARGET else ("🟡" if ratio >= 1 else "❌")
+            verdict = f"{mark} {ratio:.1f}x" + ("" if comparable else " (not comparable: empty cluster)")
+            out.append(f"| {name} | {cfg['why']} | {shape} | {ours['sec_per_pass']:.4f} | {best['impl']} | {best['sec_per_pass']:.4f} | {verdict} |")
+        details += [f"### {name}: {cfg['why']} ({shape}, {cfg['data']} data)", "",
+                    "| Implementation | Version | s/pass (median) | min–max | vs ours | Inertia vs ours | Load | Commit | Date |",
+                    "|---|---|---|---|---|---|---|---|---|"]
         for r in sorted(rs, key=lambda r: r.get("sec_per_pass", float("inf"))):
             if "sec_per_pass" not in r:
-                out.append(f"| {r['impl']} | {r['version']} | failed: {r['error'][:60]} | | | {r['commit']} | {r['date'][:10]} |")
+                details.append(f"| {r['impl']} | {r['version']} | {r['error'][:70]} | | | | | {r['commit']} | {r['date'][:10]} |")
                 continue
-            vs = f"{r['sec_per_pass'] / ours['sec_per_pass']:.1f}x slower" if ours and r is not ours else "—"
-            rel = f"{(r['inertia'] - ours['inertia']) / ours['inertia']:+.1e}" if ours and r is not ours else "—"
+            is_ours = r["impl"] == OURS
+            vs = "—" if is_ours or not ours else f"{r['sec_per_pass'] / ours['sec_per_pass']:.1f}x slower" \
+                if r["sec_per_pass"] >= ours["sec_per_pass"] else f"{ours['sec_per_pass'] / r['sec_per_pass']:.1f}x faster"
+            rel = "—" if is_ours else f"{r['inertia_rel_vs_ours']:+.1e}" + ("" if r.get("valid") else " ⚠️ different work")
             commit = f"{r['commit']}{'*' if r['dirty'] else ''}"
-            out.append(f"| {r['impl']} | {r['version']} | {r['sec_per_pass']:.4f} | {vs} | {rel} | {commit} | {r['date'][:10]} |")
-        out.append("")
+            details.append(f"| {r['impl']} | {r['version']} | {r['sec_per_pass']:.4f} | {r['min_s']:.4f}–{r['max_s']:.4f} | {vs} | "
+                           f"{rel} | {r['load1']:.1f} | {commit} | {r['date'][:10]} |")
+        details.append("")
+    out += ["", "✅ meets target · 🟡 faster but below target · ❌ slower", "", "## Details", ""] + details
     out += ["`*` after a commit = uncommitted changes to kmeans.py/bench.py at run time.", ""]
     REPORT.write_text("\n".join(out))
     print(f"wrote {REPORT.relative_to(ROOT)}")
@@ -213,17 +292,15 @@ def report():
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--rows", type=int, default=10_000_000)
-    p.add_argument("--dims", type=int, default=8)
-    p.add_argument("--k", type=int, default=16)
-    p.add_argument("--iters", type=int, default=5)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--only", nargs="*", help="substring filter on implementation names")
+    p.add_argument("--suite", action="store_true", help="run every config in SUITE")
+    p.add_argument("--config", nargs="*", default=[], choices=list(SUITE), help="run these suite configs")
+    p.add_argument("--only", nargs="*", help="substring filter on public implementation names (ours always runs)")
     p.add_argument("--report", action="store_true", help="only regenerate BENCHMARKS.md")
     a = p.parse_args()
+    names = list(SUITE) if a.suite else a.config
     if not a.report:
-        print(f"rows={a.rows:,} dims={a.dims} k={a.k} iters={a.iters}")
-        bench(a.rows, a.dims, a.k, a.iters, a.only, a.seed)
+        for name in names:
+            bench(name, SUITE[name], a.only)
     report()
 
 

@@ -198,7 +198,7 @@ _REDUCE_SRC = """
     total[e] = s; total_comp[e] = c;
 """
 _kernels = {}
-PAIRS_MIN_DIMS, PAIRS_MAX_K = 64, 256   # use the pairs path when dims >= 64 and k <= 256 (see benchmarks/NOTES.md)
+PAIRS_MIN_DIMS = 64                     # use the pairs path when dims >= 64 (measured crossover, benchmarks/NOTES.md)
 DIST_BYTES = 512 << 20                  # largest (rows x k) float32 distance chunk in the pairs path
 ACC_BYTES = 256 << 20                   # budget for per-block accumulation buffers
 ACC_MAX_BLOCKS = 1024                   # GPU threads for accumulation
@@ -264,7 +264,7 @@ def assign_mlx(parts, C, method="auto", return_labels=False):
     mx = _mx()
     k, d = C.shape
     if method == "auto":
-        method = "pairs" if d >= PAIRS_MIN_DIMS and k <= PAIRS_MAX_K else "rows"
+        method = "pairs" if d >= PAIRS_MIN_DIMS else "rows"
     Cm = mx.array(C)
     tot = np.zeros((k, d + 2), dtype=np.float64)
     all_labels = []
