@@ -263,10 +263,11 @@ _MARGIN_SRC = """
     }
     labels[i] = bl; best_d[i] = best;
 """
+# Outputs are zero-filled by MLX (init_value=0); zeroing k*(dims+2) slots per thread inside the kernel cost more
+# than the accumulation itself on small inputs (0.98 ms of a 1.6 ms pass at 100k x 32, k=64).
 _ACCUMULATE_SRC = """
     uint b = thread_position_in_grid.x, W = D + 2;
     uint start = b * BS, end = min(start + BS, n_rows[0]), base = b * K * W;
-    for (uint e = 0; e < K * W; e++) { sums[base + e] = 0; comp[base + e] = 0; }
     for (uint i = start; i < end; i++) {
         uint o = base + labels[i] * W, xi = i * D;
         sums[o] += 1;                                   // exact: at most 2^24 rows per block
@@ -276,7 +277,6 @@ _ACCUMULATE_SRC = """
 """
 _SEGMENT_SRC = """
     uint s = thread_position_in_grid.x, W = D + 2, o = s * W;
-    for (uint e = 0; e < W; e++) { sums[o + e] = 0; comp[o + e] = 0; }
     for (uint p = seg_start[s]; p < seg_end[s]; p++) {
         uint r = perm[p], xi = r * D;
         sums[o] += 1;
@@ -301,7 +301,8 @@ PAIRS_MIN_DIMS = 64                     # dims from which the pairs/tiles paths 
 TILE_THREADGROUP = 512                  # threads per threadgroup in the tiles path (measured best)
 DIST_BYTES = 512 << 20                  # largest (rows x k) float32 distance chunk in the pairs path
 ACC_BYTES = 256 << 20                   # budget for per-block accumulation buffers
-ACC_MAX_BLOCKS = 1024                   # GPU threads for accumulation
+ACC_ROWS_PER_BLOCK = 256                # target rows per accumulation thread (measured sweet spot)
+ACC_MIN_BLOCKS, ACC_MAX_BLOCKS = 1024, 4096   # more blocks = less work per thread but more to reduce
 SORTED_MIN_KW = 1024                    # use sorted accumulation when k * (dims + 2) >= this (measured crossover)
 SEGMENT_ROWS = 256                      # rows per GPU thread in sorted accumulation
 
@@ -400,7 +401,7 @@ def _accumulate_sorted(x, labels, best, k):
     ns = len(starts)
     seg = _kernel("kmeans_segments", ["X", "best_d", "perm", "seg_start", "seg_end"], ["sums", "comp"], _SEGMENT_SRC, _KAHAN)
     sums, comp = seg(inputs=[x, best, perm, mx.array(starts.astype(np.uint32)), mx.array(ends.astype(np.uint32))],
-                     template=[("D", d)], grid=(ns, 1, 1), threadgroup=(64, 1, 1),
+                     template=[("D", d)], grid=(ns, 1, 1), threadgroup=(64, 1, 1), init_value=0,
                      output_shapes=[(ns * w,), (ns * w,)], output_dtypes=[mx.float32, mx.float32])
     red = _kernel("kmeans_segment_reduce", ["sums", "comp", "seg_first"], ["total", "total_comp"], _SEGMENT_REDUCE_SRC, _KAHAN)
     total, total_comp = red(inputs=[sums, comp, mx.array(seg_first.astype(np.uint32))], template=[("W", w)],
@@ -413,12 +414,13 @@ def _accumulate_blocks(x, labels, best, k):
     mx = _mx()
     n, d = x.shape
     w = d + 2
-    nb = max(-(-n // 2**24), min(ACC_MAX_BLOCKS, max(1, ACC_BYTES // (8 * k * w)), n))
+    nb = min(max(-(-n // ACC_ROWS_PER_BLOCK), ACC_MIN_BLOCKS), ACC_MAX_BLOCKS)   # ~256 rows per thread
+    nb = max(-(-n // 2**24), min(nb, max(1, ACC_BYTES // (8 * k * w)), n))       # memory cap; counts stay exact
     bs = -(-n // nb)
     nb = -(-n // bs)
     acc = _kernel("kmeans_accumulate", ["X", "labels", "best_d", "n_rows"], ["sums", "comp"], _ACCUMULATE_SRC, _KAHAN)
     sums, comp = acc(inputs=[x, labels, best, _u32(n)], template=[("D", d), ("K", k), ("BS", bs)],
-                     grid=(nb, 1, 1), threadgroup=(min(nb, 64), 1, 1),
+                     grid=(nb, 1, 1), threadgroup=(min(nb, 64), 1, 1), init_value=0,
                      output_shapes=[(nb * k * w,), (nb * k * w,)], output_dtypes=[mx.float32, mx.float32])
     red = _kernel("kmeans_reduce", ["sums", "comp", "n_blocks"], ["total", "total_comp"], _REDUCE_SRC, _KAHAN)
     total, total_comp = red(inputs=[sums, comp, _u32(nb)], template=[("KW", k * w)],
