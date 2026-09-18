@@ -60,6 +60,8 @@ def check(name, X, C, slice_rows=None, dist_bytes=None):
     X64, C64 = X.astype(np.float64), C.astype(np.float64)
     ok = True
     combos = [("rows", "blocks"), ("rows", "sorted"), ("pairs", "blocks"), ("pairs", "sorted")]
+    if len(C) * (C.shape[1] + 2) <= km.core.ATOMIC_MAX_KW:
+        combos += [("rows", "atomic")]
     if C.shape[1] % 8 == 0 and len(C) % 8 == 0:
         combos += [("tiles", "blocks"), ("tiles", "sorted")]
     for method, accumulate in combos:

@@ -285,6 +285,27 @@ _ACCUMULATE_SRC = """
         for (uint j = 0; j < D; j++) KAHAN_ADD(sums[o + 2 + j], comp[o + 2 + j], X[xi + j]);
     }
 """
+# Threadgroup accumulation (opt-in, accumulate="atomic"): one threadgroup per chunk of rows sums into on-chip memory
+# (atomic float adds) and
+# writes a single (k, dims+2) block. The blocks path has to zero-fill and re-read one buffer per thread - ~18 MB for
+# 3.4M additions at 100k x 32, k=64 - which dominates small inputs. Needs k*(dims+2) floats to fit threadgroup memory
+# (32 KB), and sums a chunk in plain float32 rather than compensated, so it is used only where that is accurate
+# enough (see ATOMIC_MAX_ROWS_PER_BLOCK).
+_ATOMIC_SRC = """
+    threadgroup atomic_float tile[KW];
+    uint lid = thread_position_in_threadgroup.x, b = threadgroup_position_in_grid.x, W = D + 2;
+    for (uint e = lid; e < KW; e += TG) atomic_store_explicit(&tile[e], 0.0f, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint start = b * BS, end = min(start + BS, n_rows[0]);
+    for (uint i = start + lid; i < end; i += TG) {
+        uint o = labels[i] * W, xi = i * D;
+        atomic_fetch_add_explicit(&tile[o], 1.0f, memory_order_relaxed);
+        atomic_fetch_add_explicit(&tile[o + 1], best_d[i], memory_order_relaxed);
+        for (uint j = 0; j < D; j++) atomic_fetch_add_explicit(&tile[o + 2 + j], X[xi + j], memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = lid; e < KW; e += TG) sums[b * KW + e] = atomic_load_explicit(&tile[e], memory_order_relaxed);
+"""
 _SEGMENT_SRC = """
     uint s = thread_position_in_grid.x, W = D + 2, o = s * W;
     for (uint p = seg_start[s]; p < seg_end[s]; p++) {
@@ -313,7 +334,12 @@ DIST_BYTES = 512 << 20                  # largest (rows x k) float32 distance ch
 ACC_BYTES = 256 << 20                   # budget for per-block accumulation buffers
 ACC_ROWS_PER_BLOCK = 256                # target rows per accumulation thread (measured sweet spot)
 ACC_MIN_BLOCKS, ACC_MAX_BLOCKS = 1024, 4096   # more blocks = less work per thread but more to reduce
-SORTED_MIN_KW = 1024                    # use sorted accumulation when k * (dims + 2) >= this (measured crossover)
+ATOMIC_MAX_KW = 8192                    # k*(dims+2) floats must fit threadgroup memory (32 KB)
+ATOMIC_MAX_ROWS_PER_BLOCK = 4096        # rows summed in plain float32 per threadgroup; keeps the error ~1e-7
+ATOMIC_THREADGROUP = 256
+SORTED_MIN_KW = 1024                    # k*(dims+2) from which sorting by label can beat per-block buffers
+SORTED_MAX_ROWS = 2_000_000             # above this the argsort costs more than the buffers it saves...
+SORTED_ALWAYS_KW = 4096                 # ...unless the buffers are this large, where blocks is hopeless                    # use sorted accumulation when k * (dims + 2) >= this (measured crossover)
 SEGMENT_ROWS = 256                      # rows per GPU thread in sorted accumulation
 
 
@@ -391,9 +417,36 @@ def _nearest(x, Cm, method):
 
 def _accumulate(x, labels, best, k, method="auto"):
     """Per-cluster [count, inertia, sums...] for one slice -> float64 numpy array (k, d + 2)."""
+    w, n = x.shape[1] + 2, x.shape[0]
+    if method == "atomic" and k * w > ATOMIC_MAX_KW:
+        method = "auto"                       # the tile would not fit threadgroup memory
     if method == "auto":
-        method = "sorted" if k * (x.shape[1] + 2) >= SORTED_MIN_KW else "blocks"
+        # "atomic" is faster but not bit-reproducible (threadgroup atomics fix no summation order), and in an
+        # iterative algorithm a 1e-9 difference can flip a near-tie label and change the local minimum reached.
+        # It stays opt-in; the default paths give identical results run to run.
+        #
+        # Between the two deterministic paths: sorting pays for itself when the per-block buffers are large
+        # (k*(dims+2) >= 1024) but the argsort is O(n log n), so at many rows with a small k the blocks path wins -
+        # measured at 10M rows: blocks 5.8 ms vs sorted 9.0 ms for k*w = 1536.
+        big_buffers = k * w >= SORTED_MIN_KW
+        method = "sorted" if big_buffers and (n <= SORTED_MAX_ROWS or k * w >= SORTED_ALWAYS_KW) else "blocks"
+    if method == "atomic":
+        return _accumulate_atomic(x, labels, best, k)
     return _accumulate_sorted(x, labels, best, k) if method == "sorted" else _accumulate_blocks(x, labels, best, k)
+
+
+def _accumulate_atomic(x, labels, best, k):
+    mx = _mx()
+    n, d = x.shape
+    w, kw = d + 2, k * (d + 2)
+    bs = min(ATOMIC_MAX_ROWS_PER_BLOCK, max(256, -(-n // 2048)))
+    nb = -(-n // bs)
+    kern = _kernel("kmeans_atomic", ["X", "labels", "best_d", "n_rows"], ["sums"], _ATOMIC_SRC)
+    sums = kern(inputs=[x, labels, best, _u32(n)],
+                template=[("D", d), ("KW", kw), ("BS", bs), ("TG", ATOMIC_THREADGROUP)],
+                grid=(nb * ATOMIC_THREADGROUP, 1, 1), threadgroup=(ATOMIC_THREADGROUP, 1, 1),
+                output_shapes=[(nb * kw,)], output_dtypes=[mx.float32])[0]
+    return np.array(sums, dtype=np.float64).reshape(nb, k, w).sum(0)
 
 
 def _accumulate_sorted(x, labels, best, k):
