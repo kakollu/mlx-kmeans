@@ -62,17 +62,23 @@ _GEN_SRC = """
     }
 """
 _gen_kernel = None
-# One k-means++ round: distance from every sample row to the newly chosen center, running minimum, and the
-# Gumbel-max sampling key for the next draw - fused so a round costs two kernels instead of ~6 MLX ops.
-_PP_ROUND_SRC = """
-    uint i = thread_position_in_grid.x, xi = i * D, ci = center[0] * D;
+# Greedy k-means++ (what scikit-learn does): each round samples 2 + log(k) candidate rows with probability
+# proportional to their squared distance d2, then keeps the candidate that lowers the total d2 the most. Picking a
+# single candidate per round - the textbook version - converged to 2x worse inertia on clustered synthetic data.
+# Two kernels per round, both one thread per (row, candidate), and no CPU round-trip: the chosen indices stay on
+# the GPU until the centers are gathered at the end.
+_PP_KEYS_SRC = """
+    uint i = thread_position_in_grid.y, t = thread_position_in_grid.x;
+    ulong h = mix64(seed[0] ^ mix64(i * TRIALS + t));
+    // Gumbel-max: argmax over rows of log(d2) + Gumbel noise samples in proportion to d2
+    key[i * TRIALS + t] = log(max(d2[i], 1e-30f)) - log(-log(u01(h)));
+"""
+_PP_EVAL_SRC = """
+    uint i = thread_position_in_grid.y, t = thread_position_in_grid.x;
+    uint xi = i * D, ci = cand[t] * D;
     float s = 0;
-    for (uint j = 0; j < D; j++) { float t = S[xi + j] - S[ci + j]; s += t * t; }
-    float d = min(d2_in[i], s);
-    d2_out[i] = d;
-    ulong h = mix64(seed[0] ^ mix64(i));
-    float u = u01(h);                                   // in (0, 1]
-    key[i] = log(max(d, 1e-30f)) - log(-log(u));        // Gumbel-max: argmax over rows samples in proportion to d
+    for (uint j = 0; j < D; j++) { float q = S[xi + j] - S[ci + j]; s += q * q; }
+    mins[i * TRIALS + t] = min(d2[i], s);
 """
 
 
@@ -134,19 +140,25 @@ def kmeans_pp_init(parts, rows, k, rng, sample=None):
         sample = min(200_000, max(20_000, 20 * k))
     S = mx.array(take_rows(parts, np.sort(rng.choice(rows, size=min(sample, rows), replace=False))))
     m, d = S.shape
-    kern = _kernel("kmeans_pp_round", ["S", "d2_in", "center", "seed"], ["d2_out", "key"], _PP_ROUND_SRC, _GEN_HEADER)
-    picks = [int(rng.integers(m))]
-    d2 = mx.full((m,), mx.inf, dtype=mx.float32)
+    trials = 2 + int(np.log(k)) if k > 1 else 1
+    keys_k = _kernel("kmeans_pp_keys", ["d2", "seed"], ["key"], _PP_KEYS_SRC, _GEN_HEADER)
+    eval_k = _kernel("kmeans_pp_eval", ["S", "d2", "cand"], ["mins"], _PP_EVAL_SRC)
+    first = int(rng.integers(m))
+    picks = [mx.array([first], dtype=mx.uint32)]
+    d2 = ((S - S[first]) ** 2).sum(1)
     for _ in range(k - 1):
-        # Sampling uses the Gumbel-max trick (argmax of log d2 + Gumbel noise). A cumulative-sum inverse-CDF is the
-        # textbook route but stalls in float32 once the running sum dwarfs later weights, biasing picks to early rows.
-        d2, key = kern(inputs=[S, d2, _u32(picks[-1]), mx.array([int(rng.integers(2**63 - 1))], dtype=mx.uint64)],
-                       template=[("D", d)], grid=(m, 1, 1), threadgroup=(64, 1, 1),
-                       output_shapes=[(m,), (m,)], output_dtypes=[mx.float32, mx.float32])
-        nxt = mx.argmax(key)
-        mx.eval(d2, nxt)
-        picks.append(int(nxt.item()))
-    return np.array(S[mx.array(picks)], dtype=np.float32)
+        key = keys_k(inputs=[d2, mx.array([int(rng.integers(2**63 - 1))], dtype=mx.uint64)],
+                     template=[("TRIALS", trials)], grid=(trials, m, 1), threadgroup=(trials, 64 // trials or 1, 1),
+                     output_shapes=[(m * trials,)], output_dtypes=[mx.float32])[0]
+        cand = mx.argmax(key.reshape(m, trials), axis=0).astype(mx.uint32)
+        mins = eval_k(inputs=[S, d2, cand], template=[("D", d), ("TRIALS", trials)],
+                      grid=(trials, m, 1), threadgroup=(trials, 64 // trials or 1, 1),
+                      output_shapes=[(m * trials,)], output_dtypes=[mx.float32])[0].reshape(m, trials)
+        best = mx.argmin(mins.sum(0))                      # candidate that lowers total d2 the most
+        d2 = mins[:, best]
+        picks.append(cand[best][None])
+        mx.eval(d2, picks[-1])
+    return np.array(S[mx.concatenate(picks)], dtype=np.float32)
 
 
 # ---------------------------------------------------------------- assignment passes

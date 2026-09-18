@@ -165,7 +165,10 @@ def main():
         "scikit-learn all rows, 25 iters": lambda: sklearn_kmeans(base, k, a.seed),
         "usearch f32, 25 iters": lambda: usearch_kmeans(base, k, a.seed, "f32"),
         "usearch bf16 (its default), 25 iters": lambda: usearch_kmeans(base, k, a.seed, "bf16"),
-        "kmeans-pytorch (MPS GPU), to convergence": lambda: kmeans_pytorch_mps(base, k, a.seed),
+        # kmeans-pytorch is opt-in (--only kmeans-pytorch): it has no iteration limit, and interrupting it mid-run
+        # leaves its Metal work wedged (process at 0% CPU until killed), so it cannot run unattended in a suite.
+        **({"kmeans-pytorch (MPS GPU), to convergence": lambda: kmeans_pytorch_mps(base, k, a.seed)}
+           if a.only and any("kmeans-pytorch" in o for o in a.only) else {}),
     }
     if a.only:
         methods = {n: f for n, f in methods.items() if any(o.lower() in n.lower() for o in a.only)}
