@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-import kmeans as km
+import mlx_kmeans as km
 from bench import machine, other_cpu_percent, read_fvecs, git_state
 
 ROOT = Path(__file__).resolve().parent
@@ -68,9 +68,13 @@ def faiss_kmeans(X, k, seed, subsample, niter=FAISS_NITER):
     return m.centroids.copy(), niter
 
 
+SKLEARN_PP_ROW_LIMIT = 20_000_000   # above this, scikit-learn's k-means++ (k passes over all rows) takes hours
+
+
 def sklearn_kmeans(X, k, seed, max_iter=FAISS_NITER):
     from sklearn.cluster import KMeans
-    m = KMeans(n_clusters=k, n_init=1, max_iter=max_iter, tol=1e-4, random_state=seed).fit(X)
+    init = "k-means++" if len(X) <= SKLEARN_PP_ROW_LIMIT else "random"
+    m = KMeans(n_clusters=k, init=init, n_init=1, max_iter=max_iter, tol=1e-4, random_state=seed).fit(X)
     return m.cluster_centers_.astype(np.float32), int(m.n_iter_)
 
 
@@ -162,7 +166,8 @@ def main():
         "ours, all rows, 25 iters (FAISS's budget)": lambda: ours(parts, rows, k, a.seed, max_iter=FAISS_NITER, tol=0.0),
         "FAISS default (subsample, 25 iters)": lambda: faiss_kmeans(base, k, a.seed, subsample=True),
         "FAISS all rows, 25 iters": lambda: faiss_kmeans(base, k, a.seed, subsample=False),
-        "scikit-learn all rows, 25 iters": lambda: sklearn_kmeans(base, k, a.seed),
+        f"scikit-learn all rows, 25 iters ({'k-means++' if rows <= SKLEARN_PP_ROW_LIMIT else 'random init'})":
+            lambda: sklearn_kmeans(base, k, a.seed),
         "usearch f32, 25 iters": lambda: usearch_kmeans(base, k, a.seed, "f32"),
         "usearch bf16 (its default), 25 iters": lambda: usearch_kmeans(base, k, a.seed, "bf16"),
         # kmeans-pytorch is opt-in (--only kmeans-pytorch): it has no iteration limit, and interrupting it mid-run

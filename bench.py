@@ -34,7 +34,7 @@ from pathlib import Path
 
 import numpy as np
 
-import kmeans as km
+import mlx_kmeans as km
 
 ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "benchmarks" / "results.jsonl"

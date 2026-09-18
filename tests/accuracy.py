@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import kmeans as km  # noqa: E402
+import mlx_kmeans as km  # noqa: E402
 
 EPS32 = float(np.finfo(np.float32).eps)
 

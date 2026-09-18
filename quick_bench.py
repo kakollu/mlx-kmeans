@@ -14,7 +14,7 @@ import time
 
 import numpy as np
 
-import kmeans as km
+import mlx_kmeans as km
 
 SHAPES = [(1_000_000, 8, 16), (1_000_000, 32, 256), (1_000_000, 128, 1024), (10_000_000, 12, 32)]
 
