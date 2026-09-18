@@ -78,6 +78,14 @@ def sklearn_kmeans(X, k, seed, max_iter=FAISS_NITER):
     return m.cluster_centers_.astype(np.float32), int(m.n_iter_)
 
 
+def sklearn_minibatch(X, k, seed, max_iter=100, batch=10_000):
+    """MiniBatchKMeans - what practitioners reach for when full k-means is too slow. Quality for speed."""
+    from sklearn.cluster import MiniBatchKMeans
+    m = MiniBatchKMeans(n_clusters=k, batch_size=batch, max_iter=max_iter, n_init=1, random_state=seed,
+                        max_no_improvement=20).fit(X)
+    return m.cluster_centers_.astype(np.float32), int(m.n_iter_)
+
+
 def usearch_kmeans(X, k, seed, dtype, niter=FAISS_NITER):
     """usearch's clustering (CPU, hand-tuned NEON). Its default dtype is bf16; f32 is the accurate setting."""
     from usearch.index import kmeans as us
@@ -168,6 +176,7 @@ def main():
         "FAISS all rows, 25 iters": lambda: faiss_kmeans(base, k, a.seed, subsample=False),
         f"scikit-learn all rows, 25 iters ({'k-means++' if rows <= SKLEARN_PP_ROW_LIMIT else 'random init'})":
             lambda: sklearn_kmeans(base, k, a.seed),
+        "scikit-learn MiniBatchKMeans": lambda: sklearn_minibatch(base, k, a.seed),
         "usearch f32, 25 iters": lambda: usearch_kmeans(base, k, a.seed, "f32"),
         "usearch bf16 (its default), 25 iters": lambda: usearch_kmeans(base, k, a.seed, "bf16"),
         # kmeans-pytorch is opt-in (--only kmeans-pytorch): it has no iteration limit, and interrupting it mid-run

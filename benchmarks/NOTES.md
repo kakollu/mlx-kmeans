@@ -161,3 +161,24 @@ the latest run; "best valid public" is the fastest library whose inertia matches
 - **FAISS drifts from our inertia at large k and high dims** (+0.3% to +3.3%, and +17.7% at 1M x 128 k=64) because it
   splits large clusters to fill empty ones. scikit-learn, which relocates to far points like us, matches our inertia
   exactly on every shape in this sweep.
+
+## 2026-09-18 — the "approximate to go faster" tools lose here
+
+The standard answers to "full k-means is too slow" are FAISS's subsample default and scikit-learn's
+MiniBatchKMeans. On this machine both are slower *and* worse than our exact run over all the data.
+
+SIFT1M (1M x 128, k=1024), wall clock to a finished set of centroids, inertia measured by our exact pass:
+
+| Method | Train | Inertia (x best) | recall@10 nprobe 8 |
+|---|---|---|---|
+| ours, all rows, to convergence | 2.09 s | 1.0000 | 84.89% |
+| ours, all rows, 25 iters | 1.59 s | 1.0010 | 84.71% |
+| FAISS default (262k subsample) | 5.02 s | 1.0102 | 84.17% |
+| scikit-learn MiniBatchKMeans | 9.71 s | 1.0129 | 83.86% |
+
+Synthetic 100M x 32, k=1024: ours 11.97 s to convergence (4 iterations, best inertia). **MiniBatchKMeans did not
+finish in 84 minutes** at that shape (killed; ~700% CPU, 40 GB resident) - its per-batch assignment against k=1024
+centres runs on the CPU for every batch, so the batching that saves memory does not save time here.
+
+Takeaway for the write-up: on a machine where a full exact pass over 100M rows costs ~0.5 s, the approximations that
+exist to protect a CPU budget stop paying for themselves - they cost both time and quality.
