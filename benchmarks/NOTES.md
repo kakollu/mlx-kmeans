@@ -204,3 +204,10 @@ Recommendation in the README: use scikit-learn under ~100k rows; this library is
 
 Also fixed here: the deterministic path choice (sorted vs blocks) now switches on row count as well as k*(dims+2) -
 geo-trips 10M x 4 k=256 went 0.0133 -> 0.0099 s/pass (25%), since the argsort cost more than the buffers it saved.
+
+## 2026-09-18 — 1B-row regression after all the changes
+
+`python3 -m mlx_kmeans --rows 1_000_000_000 --dims 8 --k 16`: 0.7 s to generate 32 GB on the GPU, 1.6 s to cluster
+(3 iterations), 2.31 s wall. Final inertia 8.000078e9 against a theoretical optimum of 8.0e9 (1B rows x 8 dims x
+unit variance) - the greedy k-means++ seeding lands in the right basin and converges immediately. The same run
+before that change took 8 iterations and finished at 1.271e10, 59% worse.
