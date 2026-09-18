@@ -14,6 +14,14 @@ implementations) on problems where it counts: realistic shapes, real datasets, i
 - **Correctness first, then performance.** Every path must pass `tests/accuracy.py` (every point's label vs float64,
   centers and inertia vs float64 accumulation) before any speed claim. Commit each verified state.
 
+## When to use this
+
+| Rows | Verdict |
+|---|---|
+| under ~100k | **Use scikit-learn.** A pass costs 1-2 ms and GPU dispatch dominates: measured 0.4-0.5x of scikit-learn/FAISS. |
+| 1M - 10M+ | 2-8x faster than the fastest public library that reaches the same quality, at any dims 4-960 and k 8-8192. |
+| 100M+ | The gap widens: 100M x 32 k=1024 converged in 12 s here; scikit-learn and FAISS take 4-9 minutes and land 3.4-3.9x worse, and MiniBatchKMeans did not finish in 84 minutes. |
+
 ## Other Macs
 
 Every hot kernel is GPU-bound, so performance tracks GPU cores and memory bandwidth. This machine: 40 GPU cores,

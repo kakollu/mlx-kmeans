@@ -182,3 +182,25 @@ centres runs on the CPU for every batch, so the batching that saves memory does 
 
 Takeaway for the write-up: on a machine where a full exact pass over 100M rows costs ~0.5 s, the approximations that
 exist to protect a CPU budget stop paying for themselves - they cost both time and quality.
+
+## 2026-09-18 — where the boundary actually is
+
+Suite after the accumulation-path fix (ours vs the fastest public library matching our inertia):
+
+| Config | Ours s/pass | Best public | Ratio |
+|---|---|---|---|
+| geo-trips 10M x 4 k256 | 0.0099 | FAISS 0.0661 | 6.7x |
+| satellite 10M x 12 k32 | 0.0093 | scikit-learn 0.0711 | 7.7x |
+| logs 10M x 32 k256 | 0.0700 | scikit-learn 0.2903 | 4.1x |
+| single-cell 2M x 50 k64 | 0.0102 | scikit-learn 0.0289 | 2.8x |
+| SIFT1M 1M x 128 k1024 | 0.0540 | fast-pytorch-kmeans 0.1746 | 3.2x |
+| GIST1M 1M x 960 k1024 | 0.2899 | fast-pytorch-kmeans 0.6081 | 2.1x |
+
+**Below ~100k rows the CPU libraries win**, and on a quiet machine it is not a tie: 100k x 32 k=64 scikit-learn
+1.44 ms vs ours 2.82 ms (0.5x); 100k x 8 k=8 FAISS 0.69 ms vs ours 1.59 ms (0.4x). A pass that small costs 1-2 ms,
+most of it GPU dispatch (~0.14 ms per kernel launch, several per pass), so no kernel tuning changes it - the fix
+would be fusing the pass into one or two dispatches, which the deterministic accumulation design does not allow.
+Recommendation in the README: use scikit-learn under ~100k rows; this library is for 1M rows and up.
+
+Also fixed here: the deterministic path choice (sorted vs blocks) now switches on row count as well as k*(dims+2) -
+geo-trips 10M x 4 k=256 went 0.0133 -> 0.0099 s/pass (25%), since the argsort cost more than the buffers it saved.
