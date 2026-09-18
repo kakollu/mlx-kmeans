@@ -10,3 +10,6 @@ demos/taxi_page.html
 demos/taxi_zones.geojson
 demos/satellite_classes.png
 demos/*.json
+demos/overview.html
+demos/overview_data.json
+demos/taxi_page_data.json

@@ -1,0 +1,265 @@
+<title>Three Problems, One Laptop</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Public+Sans:wght@400;600;800&family=IBM+Plex+Mono:wght@400;600&display=swap">
+<style>
+  :root {
+    --paper:#f7f5f0; --card:#fffefb; --ink:#16181d; --ink-2:#4a4e58; --ink-3:#7c808b;
+    --rule:#ded9cd; --rule-2:#ebe7dd; --accent:#1d4f8f; --taxi:#e8a800; --alert:#c8422f; --good:#1baf7a;
+    --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --s5:#e87ba4; --s6:#008300; --s7:#4a3aa7; --s8:#e34948;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper:#14151a; --card:#1b1d23; --ink:#f4f2ee; --ink-2:#bdc0c8; --ink-3:#8a8e98;
+      --rule:#32353d; --rule-2:#262931; --accent:#6fa8e8; --taxi:#f2be2e; --alert:#e2705c; --good:#199e70;
+      --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper:#14151a; --card:#1b1d23; --ink:#f4f2ee; --ink-2:#bdc0c8; --ink-3:#8a8e98;
+    --rule:#32353d; --rule-2:#262931; --accent:#6fa8e8; --taxi:#f2be2e; --alert:#e2705c; --good:#199e70;
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--paper); color: var(--ink); margin: 0; padding-block: 0 60px;
+         font: 400 16px/1.55 "Public Sans", ui-sans-serif, system-ui, sans-serif; }
+  .wrap { max-width: 1060px; margin: 0 auto; padding-inline: 20px; }
+  h1,h2,h3 { margin: 0; text-wrap: balance; }
+  h1 { font-family: "Instrument Serif", Georgia, serif; font-weight: 400; font-size: clamp(38px,6.2vw,64px); line-height: 1.02; }
+  h2 { font-family: "Instrument Serif", Georgia, serif; font-weight: 400; font-size: clamp(26px,3.6vw,34px); line-height: 1.1; }
+  h3 { font-size: 13px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-2); }
+  p { margin: 0; max-width: 70ch; }
+  .lede { font-size: 18px; color: var(--ink-2); }
+  .eyebrow { font: 600 12px/1 "IBM Plex Mono", ui-monospace, monospace; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-3); }
+  .num { font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  header { border-bottom: 2px solid var(--ink); padding-block: 40px 24px; display: flex; flex-direction: column; gap: 14px; }
+  section { padding-block: 44px 0; display: flex; flex-direction: column; gap: 18px; }
+  .case { border-top: 1px solid var(--rule); padding-top: 26px; }
+  .case-head { display: flex; flex-direction: column; gap: 8px; }
+  .stats { display: flex; flex-wrap: wrap; gap: 22px 40px; }
+  .stat { display: flex; flex-direction: column; gap: 1px; }
+  .stat b { font: 600 clamp(22px,3.4vw,30px)/1 "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  .stat.key b { color: var(--taxi); }
+  .stat span { font-size: 12.5px; color: var(--ink-3); }
+  .split { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 26px; align-items: start; }
+  @media (max-width: 780px) { .split { grid-template-columns: 1fr; } }
+  .tablewrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 3px; background: var(--card); }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; min-width: 460px; }
+  th, td { padding: 8px 11px; text-align: right; border-bottom: 1px solid var(--rule-2); white-space: nowrap; }
+  th { font-size: 10.5px; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; }
+  th:first-child, td:first-child { text-align: left; white-space: normal; }
+  tr:last-child td { border-bottom: none; }
+  .chip { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 7px; }
+  figure { margin: 0; display: flex; flex-direction: column; gap: 9px; }
+  figcaption { font-size: 12.5px; color: var(--ink-3); }
+  img.scene { width: 100%; border: 1px solid var(--rule); border-radius: 3px; image-rendering: auto; }
+  .bars { display: flex; flex-direction: column; gap: 8px; }
+  .barrow { display: grid; grid-template-columns: 150px 1fr; gap: 10px; align-items: center; font-size: 13px; }
+  .bar { height: 11px; border-radius: 0 4px 4px 0; position: relative; }
+  .bar span { position: absolute; left: calc(100% + 7px); top: -3px; font: 600 11px/1.4 "IBM Plex Mono", ui-monospace, monospace; color: var(--ink-2); }
+  .themes { columns: 2; column-gap: 26px; font-size: 13.5px; }
+  @media (max-width: 640px) { .themes { columns: 1; } }
+  .theme { break-inside: avoid; padding: 6px 0; border-bottom: 1px solid var(--rule-2); display: flex; gap: 10px; }
+  .theme b { font-family: "IBM Plex Mono", ui-monospace, monospace; font-weight: 600; color: var(--ink-3); font-size: 12px; min-width: 42px; }
+  .callout { background: var(--card); border: 1px solid var(--rule); border-left: 3px solid var(--alert); border-radius: 3px; padding: 18px 20px; display: flex; flex-direction: column; gap: 9px; }
+  .callout h3 { color: var(--alert); }
+  .note { font-size: 13px; color: var(--ink-3); }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  pre { background: var(--card); border: 1px solid var(--rule); border-radius: 3px; padding: 13px 15px; overflow-x: auto;
+        font: 400 13px/1.6 "IBM Plex Mono", ui-monospace, monospace; margin: 0; }
+  footer { border-top: 1px solid var(--rule); margin-top: 48px; padding-top: 18px; font-size: 13px; color: var(--ink-3); display: flex; flex-direction: column; gap: 7px; }
+  .ratio { color: var(--good); font-weight: 600; }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">k-means on one Apple M5 Max laptop &middot; exact, not approximate</div>
+    <h1>Three problems that<br>used to need a cluster</h1>
+    <p class="lede">98 million taxi trips, 96 million satellite pixels, a million OpenAI embeddings. Each one
+      clustered here in under 13 seconds, using every row — no sampling, no Spark, no cloud bill. The algorithm is
+      ordinary k-means; what changed is that a laptop now holds the whole dataset in memory and reads it at
+      400&nbsp;GB/s.</p>
+  </header>
+
+  <section class="case">
+    <div class="case-head">
+      <div class="eyebrow">Case 1 &middot; Demand segmentation</div>
+      <h2>98.5M NYC taxi trips &rarr; eight trip archetypes</h2>
+      <p>Every yellow-cab trip from January to August 2015, clustered on fare, distance, duration, hour, tip rate and
+        party size — the segmentation an operations team would actually run.</p>
+    </div>
+    <div class="stats" id="taxistats"></div>
+    <div class="split">
+      <figure>
+        <h3>Segments by revenue</h3>
+        <div class="tablewrap"><table id="taxitable"></table></div>
+        <figcaption>Revenue is fare + tip across 8 months.</figcaption>
+      </figure>
+      <div style="display:flex;flex-direction:column;gap:16px">
+        <div class="callout">
+          <h3>Two segments are an artifact</h3>
+          <p>Two of the eight differ mainly by tip rate: ~23% versus ~1%. That is not generosity, it is
+            <strong>card versus cash</strong> — the meter only records a tip when the fare is paid by card. A third of
+            all trips split on how people paid, not how they travelled.</p>
+          <p class="note">The fix is a judgement call, not a model tweak: cluster card trips only, or drop tip rate and
+            treat tipping as its own question.</p>
+        </div>
+        <figure>
+          <h3>Where the money is</h3>
+          <p style="font-size:14px">The two airport segments are <strong>9% of trips and 28% of revenue</strong>
+            ($60 a trip from JFK, $36 from LaGuardia). Short Manhattan hops earn the most per mile ($6.68 against
+            $3.40 for an airport run) and the least per trip — the classic distance-pricing gradient, visible without
+            a single label.</p>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <section class="case">
+    <div class="case-head">
+      <div class="eyebrow">Case 2 &middot; Unsupervised land cover</div>
+      <h2>96M satellite pixels &rarr; land cover without labels</h2>
+      <p>One cloud-free Sentinel-2 scene over New York, 10-metre resolution, clustered on four bands plus vegetation
+        and water indices. No training set: the classes come from what the pixels look like.</p>
+    </div>
+    <div class="stats" id="satstats"></div>
+    <div class="split">
+      <figure>
+        <img class="scene" id="satimg" alt="Sentinel-2 scene over New York, each pixel coloured by its cluster">
+        <figcaption>Every pixel coloured by class, shown at 1/6 scale. Colours are each class's own average
+          reflectance, so the map reads like the ground it came from.</figcaption>
+      </figure>
+      <figure>
+        <h3>What the classes are</h3>
+        <div class="tablewrap"><table id="sattable"></table></div>
+        <figcaption>Interpreted from each class's NDVI (vegetation) and NDWI (water) — the algorithm names nothing.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section class="case">
+    <div class="case-head">
+      <div class="eyebrow">Case 3 &middot; Vector search</div>
+      <h2>1M OpenAI embeddings &rarr; themes, and the index itself</h2>
+      <p>Embeddings of a million Wikipedia/DBpedia entities, 1,536 dimensions each. Clustered twice: a small k to see
+        what the corpus is about, and a large k because <em>that is how a vector index is built</em> — every IVF index
+        in a RAG stack starts with k-means over the embeddings.</p>
+    </div>
+    <div class="stats" id="embstats"></div>
+    <div class="themes" id="themes"></div>
+    <p class="note">Each line: share of the corpus, then the entities closest to that cluster's centre. Nobody labelled
+      these — the topics are what the embedding space already encodes.</p>
+  </section>
+
+  <section class="case">
+    <div class="case-head">
+      <div class="eyebrow">The evidence</div>
+      <h2>Faster, and the same answer</h2>
+      <p>Time for one k-means pass against the fastest public library that reaches the same clustering quality on this
+        machine — scikit-learn, FAISS, and a PyTorch-on-Metal implementation.</p>
+    </div>
+    <div class="tablewrap"><table id="bench"></table></div>
+    <div class="split" style="padding-top:6px">
+      <figure>
+        <h3>What sampling costs at 100M rows</h3>
+        <div class="bars" id="scalebars"></div>
+        <figcaption>Synthetic 100M × 32, k=1024. Bar length is time; the label is how much worse that method's
+          clustering is than the best. FAISS's default trains on 0.26% of the rows.</figcaption>
+      </figure>
+      <figure>
+        <h3>Exact, and checked against float64</h3>
+        <p style="font-size:14px">Every point is assigned to the center with the smallest float32 distance, verified
+          point-by-point against a float64 reference across 16 test cases — overlapping clusters, duplicate points,
+          empty clusters, 960 dimensions. Cluster centers match float64 means to ~1e-13.</p>
+        <p class="note">Speed here comes from GPU work layout, not from approximating: one thread per row, cache-local
+          accumulation, Metal SIMD-group matrix instructions, and greedy k-means++ seeding.</p>
+      </figure>
+    </div>
+  </section>
+
+  <section class="case">
+    <div class="case-head">
+      <div class="eyebrow">Run it yourself</div>
+      <h2>On any Apple Silicon Mac</h2>
+    </div>
+    <pre>pip install mlx-kmeans
+
+from mlx_kmeans import KMeans
+model = KMeans(n_clusters=8).fit(X)      # X: (rows, dims) float32
+model.cluster_centers_, model.labels_, model.inertia_</pre>
+    <p class="note">A MacBook Air has roughly a quarter of this machine's GPU, so expect roughly a quarter of the
+      speed and a lower memory ceiling — still 100M+ rows at low dimensions. <code>quick_bench.py</code> prints
+      what your own Mac does.</p>
+  </section>
+
+  <footer>
+    <div>Data: NYC TLC yellow-taxi records (Jan–Aug 2015); Sentinel-2 L2A scene <span id="scene"></span> via AWS Open
+      Data; DBpedia entity embeddings (OpenAI text-embedding-ada-002) via Hugging Face.</div>
+    <div>All timings measured on one Apple M5 Max (40 GPU cores, 128 GB unified memory). Benchmarks, the correctness
+      suite and these demo scripts are in the repository.</div>
+  </footer>
+</div>
+
+<script>
+const D = __DATA__;
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const SERIES = ["--s1","--s2","--s3","--s4","--s5","--s6","--s7","--s8"].map(css);
+const F = (n, d = 0) => n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+const pct = (n, d = 1) => F(n * 100, d) + "%";
+const secs = s => s < 1 ? F(s, 2) + "s" : s < 10 ? F(s, 1) + "s" : F(s, 0) + "s";
+const stat = (v, l, key) => `<div class="stat${key ? " key" : ""}"><b class="num">${v}</b><span>${l}</span></div>`;
+
+/* Case 1 — taxi */
+const t = D.taxi;
+document.getElementById("taxistats").innerHTML =
+  stat(F(t.rows / 1e6, 1) + "M", "trips clustered") +
+  stat(secs(t.fit_s), `to cluster (${t.iters} passes)`, true) +
+  stat(secs(t.load_s), "to read 1.3 GB of Parquet") +
+  stat("$" + F(t.revenue / 1e9, 2) + "B", "of fares + tips explained") +
+  stat(F(t.sklearn_s / t.ours_s, 0) + "×", "faster than scikit-learn, same 10M trips");
+const TAXI_NAMES = ["Penn Station runs", "LaGuardia runs", "Short hops, card", "JFK runs", "Morning hops, card",
+                    "Short hops, cash", "Midday hops, cash", "Evening mid-length"];
+document.getElementById("taxitable").innerHTML =
+  `<thead><tr><th>Segment</th><th>Trips</th><th>Revenue</th><th>$/trip</th><th>$/mile</th><th>Card</th></tr></thead><tbody>` +
+  t.segments.map((s, i) => `<tr><td><span class="chip" style="background:${SERIES[i]}"></span>${TAXI_NAMES[i]}</td>
+    <td class="num">${pct(s.share)}</td><td class="num">${pct(s.revenue_share)}</td>
+    <td class="num">$${F(s.revenue_per_trip, 2)}</td><td class="num">$${F(s.fare_per_mile, 2)}</td>
+    <td class="num">${F(s.card_share * 100, 0)}%</td></tr>`).join("") + "</tbody>";
+
+/* Case 2 — satellite */
+const s = D.sat;
+document.getElementById("satstats").innerHTML =
+  stat(F(s.pixels / 1e6, 0) + "M", "pixels clustered") +
+  stat(secs(s.fit_s), `to cluster (${s.iters} passes)`, true) +
+  stat(secs(s.read_s), "to read 2.9 GB of imagery") +
+  stat(F(s.k), "classes, no labels") +
+  stat(F(s.sklearn_s / s.ours_s, 0) + "×", "faster than scikit-learn, same 10M pixels");
+document.getElementById("satimg").src = "data:image/png;base64," + s.img;
+document.getElementById("scene").textContent = s.scene;
+document.getElementById("sattable").innerHTML =
+  `<thead><tr><th>Class</th><th>Share</th><th>km²</th><th>NDVI</th><th>NDWI</th></tr></thead><tbody>` +
+  s.classes.map(c => `<tr><td><span class="chip" style="background:rgb(${c.colour.join(",")})"></span>${c.kind}</td>
+    <td class="num">${pct(c.share)}</td><td class="num">${F(c.km2)}</td>
+    <td class="num">${F(c.ndvi, 2)}</td><td class="num">${F(c.ndwi, 2)}</td></tr>`).join("") + "</tbody>";
+
+/* Case 3 — embeddings */
+const e = D.emb;
+document.getElementById("embstats").innerHTML =
+  stat(F(e.rows / 1e6, 2) + "M", `embeddings × ${F(e.dims)} dims`) +
+  stat(secs(e.themes_s), `${e.themes_k} themes (${e.themes_iters} passes)`, true) +
+  stat(secs(e.index_s), `${F(e.index_k)}-cluster IVF index (${e.index_iters} passes)`) +
+  stat(secs(e.read_s), "to read 5.9 GB") +
+  stat(F(e.sklearn_s / e.ours_s, 0) + "×", "faster than scikit-learn, same 200k vectors");
+document.getElementById("themes").innerHTML = e.themes.map(th =>
+  `<div class="theme"><b>${pct(th.share, 1)}</b><span>${th.titles.slice(0, 3).join(" &middot; ")}</span></div>`).join("");
+
+/* Evidence */
+document.getElementById("bench").innerHTML =
+  `<thead><tr><th>Problem</th><th>Shape</th><th>Ours</th><th>Fastest public</th><th>Speedup</th></tr></thead><tbody>` +
+  D.bench.map(b => `<tr><td>${b.name}</td><td class="num">${b.shape}</td><td class="num">${F(b.ours, 4)}s</td>
+    <td class="num">${F(b.pub, 4)}s <span style="color:var(--ink-3)">${b.lib}</span></td>
+    <td class="num ratio">${F(b.pub / b.ours, 1)}×</td></tr>`).join("") + "</tbody>";
+const maxS = Math.max(...D.scale.map(x => x.s));
+document.getElementById("scalebars").innerHTML = D.scale.map(x => `
+  <div class="barrow"><div>${x.name}</div><div>
+    <div class="bar" style="width:${Math.max(3, x.s / maxS * 66)}%;background:${x.q === 1 ? css("--taxi") : "var(--ink-3)"}">
+      <span>${secs(x.s)}${x.q > 1 ? " · " + F(x.q, 1) + "× worse" : " · best"}</span></div></div></div>`).join("");
+</script>
