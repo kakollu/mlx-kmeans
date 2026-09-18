@@ -13,3 +13,6 @@ demos/*.json
 demos/overview.html
 demos/overview_data.json
 demos/taxi_page_data.json
+
+# informal research notes, not part of the package
+google_chat.txt
