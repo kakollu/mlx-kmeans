@@ -5,3 +5,6 @@ __pycache__/
 .DS_Store
 .venv/
 data/
+data/
+demos/taxi_page.html
+demos/taxi_zones.geojson

@@ -1,0 +1,317 @@
+<title>Eight Kinds of Taxi Trip</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Public+Sans:wght@400;600;800&family=IBM+Plex+Mono:wght@400;600&display=swap">
+<style>
+  :root {
+    --paper: #f7f5f0; --card: #fffefb; --ink: #16181d; --ink-2: #4a4e58; --ink-3: #7c808b;
+    --rule: #ded9cd; --rule-2: #ebe7dd; --taxi: #e8a800; --good: #1baf7a; --alert: #c8422f;
+    --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --s5:#e87ba4; --s6:#008300; --s7:#4a3aa7; --s8:#e34948;
+    --map-lo: #eef2f7; --map-hi: #1d4f8f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #14151a; --card: #1b1d23; --ink: #f4f2ee; --ink-2: #bdc0c8; --ink-3: #8a8e98;
+      --rule: #32353d; --rule-2: #262931; --taxi: #f2be2e; --good: #199e70; --alert: #e2705c;
+      --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
+      --map-lo: #23262e; --map-hi: #6fa8e8;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #14151a; --card: #1b1d23; --ink: #f4f2ee; --ink-2: #bdc0c8; --ink-3: #8a8e98;
+    --rule: #32353d; --rule-2: #262931; --taxi: #f2be2e; --good: #199e70; --alert: #e2705c;
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
+    --map-lo: #23262e; --map-hi: #6fa8e8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--paper); color: var(--ink); margin: 0;
+    font: 400 16px/1.55 "Public Sans", ui-sans-serif, system-ui, sans-serif;
+    padding-block: 0 56px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding-inline: 20px; }
+  h1, h2, h3 { text-wrap: balance; margin: 0; }
+  h1 { font-family: "Instrument Serif", Georgia, serif; font-weight: 400; font-size: clamp(38px, 6vw, 62px); line-height: 1.02; letter-spacing: -0.01em; }
+  h2 { font-family: "Instrument Serif", Georgia, serif; font-weight: 400; font-size: clamp(25px, 3.4vw, 33px); line-height: 1.12; }
+  h3 { font-size: 15px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-2); }
+  p { margin: 0; max-width: 68ch; }
+  .lede { font-size: 18px; color: var(--ink-2); }
+  .eyebrow { font: 600 12px/1 "IBM Plex Mono", ui-monospace, monospace; letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-3); }
+  .num { font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+
+  header.masthead { border-bottom: 2px solid var(--ink); padding-block: 40px 22px; display: flex; flex-direction: column; gap: 16px; }
+  .headline-stats { display: flex; flex-wrap: wrap; gap: 28px 44px; padding-block: 18px 0; }
+  .hstat { display: flex; flex-direction: column; gap: 2px; }
+  .hstat b { font: 600 clamp(26px, 4vw, 36px)/1 "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  .hstat span { font-size: 13px; color: var(--ink-3); }
+  .hstat.key b { color: var(--taxi); }
+
+  section { padding-block: 40px 0; display: flex; flex-direction: column; gap: 16px; }
+  .section-head { display: flex; flex-direction: column; gap: 6px; }
+
+  .tablewrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 3px; background: var(--card); }
+  table { border-collapse: collapse; width: 100%; min-width: 860px; font-size: 14px; }
+  th, td { padding: 9px 12px; text-align: right; border-bottom: 1px solid var(--rule-2); white-space: nowrap; }
+  th { font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; position: sticky; top: 0; background: var(--card); }
+  th:first-child, td:first-child { text-align: left; }
+  td.name { font-weight: 600; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: color-mix(in srgb, var(--taxi) 9%, transparent); }
+  tbody tr[aria-selected="true"] { background: color-mix(in srgb, var(--taxi) 16%, transparent); }
+  tbody tr:last-child td { border-bottom: none; }
+  .chip { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 8px; vertical-align: baseline; }
+  .cash td { color: var(--ink-2); }
+  td .sub { display: block; font-size: 12px; color: var(--ink-3); font-weight: 400; white-space: normal; max-width: 26ch; }
+
+  .split { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 28px; align-items: start; }
+  @media (max-width: 760px) { .split { grid-template-columns: 1fr; } }
+  figure { margin: 0; display: flex; flex-direction: column; gap: 10px; }
+  figcaption { font-size: 13px; color: var(--ink-3); }
+  svg { display: block; max-width: 100%; height: auto; }
+  .zone { stroke: var(--card); stroke-width: 0.8; cursor: pointer; }
+  .zone:hover { stroke: var(--ink); stroke-width: 1.6; }
+  .legend { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-3); }
+  .ramp { height: 10px; flex: 1; max-width: 220px; border-radius: 2px; background: linear-gradient(90deg, var(--map-lo), var(--map-hi)); border: 1px solid var(--rule); }
+
+  .smalls { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 16px; }
+  .small { background: var(--card); border: 1px solid var(--rule); border-radius: 3px; padding: 12px; display: flex; flex-direction: column; gap: 6px; }
+  .small b { font-size: 13px; display: flex; align-items: center; gap: 7px; }
+  .small span { font-size: 12px; color: var(--ink-3); }
+
+  .callout { background: var(--card); border: 1px solid var(--rule); border-left: 3px solid var(--alert); border-radius: 3px; padding: 18px 20px; display: flex; flex-direction: column; gap: 10px; }
+  .callout h3 { color: var(--alert); }
+  .note { font-size: 13px; color: var(--ink-3); }
+  .bars { display: flex; flex-direction: column; gap: 9px; }
+  .barrow { display: grid; grid-template-columns: 116px 1fr; gap: 10px; align-items: center; font-size: 13px; }
+  .bartrack { display: flex; flex-direction: column; gap: 3px; }
+  .bar { height: 11px; border-radius: 0 4px 4px 0; position: relative; }
+  .bar span { position: absolute; left: calc(100% + 7px); top: -3px; font: 600 11px/1.4 "IBM Plex Mono", ui-monospace, monospace; color: var(--ink-2); }
+  footer { border-top: 1px solid var(--rule); margin-top: 46px; padding-top: 18px; font-size: 13px; color: var(--ink-3); display: flex; flex-direction: column; gap: 8px; }
+  code { font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 0.92em; background: var(--rule-2); padding: 1px 5px; border-radius: 3px; }
+  .tip { position: fixed; pointer-events: none; background: var(--ink); color: var(--paper); padding: 7px 10px; border-radius: 4px; font-size: 12px; line-height: 1.4; opacity: 0; transition: opacity .12s; z-index: 10; max-width: 240px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header class="masthead">
+    <div class="eyebrow">NYC Taxi &amp; Limousine Commission &middot; Jan–Aug 2015 &middot; every yellow-cab trip</div>
+    <h1>Eight kinds of taxi trip,<br>found in 0.7 seconds</h1>
+    <p class="lede">98.5 million trips, clustered on a laptop by what a fleet manager cares about: fare, distance,
+      duration, time of day, tip rate and party size. No sampling, no cluster, no cloud bill.</p>
+    <div class="headline-stats">
+      <div class="hstat"><b class="num">98.5M</b><span>trips clustered</span></div>
+      <div class="hstat key"><b class="num">0.67s</b><span>to cluster (11 passes)</span></div>
+      <div class="hstat"><b class="num">4.5s</b><span>to read 1.3&nbsp;GB of Parquet</span></div>
+      <div class="hstat"><b class="num">$1.42B</b><span>of fares + tips explained</span></div>
+      <div class="hstat"><b class="num">M5&nbsp;Max</b><span>one MacBook Pro</span></div>
+    </div>
+  </header>
+
+  <section>
+    <div class="section-head">
+      <h2>The segments, ranked by revenue</h2>
+      <p>Two of the eight are airport runs. They are 9% of trips and 28% of revenue. Click a row to see where that
+        segment comes from.</p>
+    </div>
+    <div class="tablewrap">
+      <table id="segtable">
+        <thead>
+          <tr>
+            <th>Segment</th><th>Trips</th><th>Revenue</th><th>$/trip</th><th>$/mile</th><th>$/minute</th>
+            <th>Tip</th><th>Card</th><th>Miles</th><th>Minutes</th><th>Peak</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="note">Revenue is fare + tip. $/minute is revenue per minute the meter runs — the closest thing in this
+      data to utilisation. Peak is the busiest hour of the day for that segment.</p>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Where each segment starts</h2>
+      <p id="mapcaption">Share of a zone's pickups belonging to the selected segment.</p>
+    </div>
+    <div class="split">
+      <figure>
+        <svg id="map" viewBox="0 0 1000 1319" role="img" aria-label="New York City taxi zones shaded by segment share"></svg>
+        <div class="legend"><span>0%</span><div class="ramp"></div><span id="rampmax">100%</span>
+          <span style="margin-left:auto">162 pickup zones</span></div>
+      </figure>
+      <figure>
+        <h3>Top pickup zones</h3>
+        <div class="bars" id="zonebars"></div>
+        <figcaption>Share of the selected segment's trips starting in each zone.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>When each segment happens</h2>
+      <p>Share of the segment's trips by hour of day. The commute, the evening, and the red-eye airport run are
+        different businesses sharing one fleet.</p>
+    </div>
+    <div class="smalls" id="dayparts"></div>
+  </section>
+
+  <section>
+    <div class="callout">
+      <h3>Read the segments before you act on them</h3>
+      <p>Segments 6 and 7 look like generous-tip and no-tip versions of the same short Manhattan trip. They are not.
+        They are <strong>card and cash</strong>: the meter only records a tip when the fare is paid by card, so a cash
+        trip enters the data as a 0% tipper. Those two segments are 33% of trips and are an artifact of data
+        collection, not a difference in customers.</p>
+      <p class="note">Worth noticing because the fix is a business decision, not a modelling one: cluster card trips
+        only, or drop tip rate from the features and treat tipping as a separate question.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>What the hardware changed</h2>
+      <p>Not the method — this is ordinary k-means, the same algorithm in every stats package. What changed is that
+        all 98.5M trips fit in memory and a pass costs milliseconds, so sampling stops being necessary.</p>
+    </div>
+    <div class="split">
+      <figure>
+        <h3>Same 10M trips, same 11 passes</h3>
+        <div class="bars" id="speedbars"></div>
+        <figcaption>scikit-learn on 18 CPU cores vs this library on the GPU, identical data and iteration count.
+          Ours also finished with 1.4% lower inertia.</figcaption>
+      </figure>
+      <figure>
+        <h3>The cost of sampling</h3>
+        <p style="font-size:14px">On a synthetic 100M-row benchmark, FAISS's default trains the quantiser on 262k
+          rows — 0.26% of the data — and lands <strong>3.9× worse</strong> on inertia. Using every row took 14.2
+          seconds here. When the full pass is cheap, the defaults that protect a CPU budget start costing accuracy
+          instead.</p>
+        <p class="note">Benchmarks, method and the float64 correctness suite are in the repository.</p>
+      </figure>
+    </div>
+  </section>
+
+  <footer>
+    <div>Data: NYC TLC yellow-taxi trip records, January–August 2015 (99.8M trips; 98.5M kept after dropping
+      implausible fares, durations and distances). Clustered on six standardised features with exact k-means —
+      every point's assignment verified against float64.</div>
+    <div>Run on one Apple M5 Max laptop: <code>python3 demos/taxi_segments.py --k 8 --months 8</code></div>
+  </footer>
+</div>
+<div class="tip" id="tip" role="status"></div>
+
+<script>
+const DATA = __DATA__;
+const SERIES = ["--s1","--s2","--s3","--s4","--s5","--s6","--s7","--s8"].map(v => getComputedStyle(document.documentElement).getPropertyValue(v).trim());
+const F = (n, d = 0) => n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+const money = n => "$" + F(n, 2);
+const pct = n => F(n * 100, 1) + "%";
+const NAMES = ["Penn Station runs", "LaGuardia runs", "Short hops, card", "JFK runs", "Morning hops, card",
+               "Short hops, cash", "Midday hops, cash", "Evening mid-length"];
+const NOTE = ["4 miles, 23 minutes — station to office", "9 miles, peaks after midnight", "1.5 miles, 25% tip",
+              "18 miles, 47 minutes, $60", "1.7 miles, peaks at 8am", "1.6 miles, 14% card — cash trips",
+              "1.9 miles, 16% card — cash trips", "2 miles, evening, mixed payment"];
+let selected = 0;
+
+const tip = document.getElementById("tip");
+function showTip(e, html) { tip.innerHTML = html; tip.style.opacity = 1; moveTip(e); }
+function moveTip(e) {
+  const pad = 14, w = tip.offsetWidth, h = tip.offsetHeight;
+  tip.style.left = Math.min(e.clientX + pad, innerWidth - w - 8) + "px";
+  tip.style.top = Math.max(8, Math.min(e.clientY - h - pad, innerHeight - h - 8)) + "px";
+}
+function hideTip() { tip.style.opacity = 0; }
+
+/* Table -------------------------------------------------------------------- */
+const tbody = document.querySelector("#segtable tbody");
+DATA.segments.forEach((s, i) => {
+  const peak = s.by_hour.indexOf(Math.max(...s.by_hour));
+  const tr = document.createElement("tr");
+  tr.tabIndex = 0;
+  tr.setAttribute("aria-selected", i === selected);
+  if (s.card_share < 0.3) tr.className = "cash";
+  tr.innerHTML = `<td class="name"><span class="chip" style="background:${SERIES[i]}"></span>${NAMES[i]}
+      <span class="sub">${NOTE[i]}</span></td>
+    <td class="num">${pct(s.share)}</td><td class="num">${pct(s.revenue_share)}</td>
+    <td class="num">${money(s.revenue_per_trip)}</td><td class="num">${money(s.fare_per_mile)}</td>
+    <td class="num">${money(s.revenue_per_minute)}</td><td class="num">${F(s["tip rate (%)"], 1)}%</td>
+    <td class="num">${F(s.card_share * 100, 0)}%</td><td class="num">${F(s["distance (mi)"], 1)}</td>
+    <td class="num">${F(s["duration (min)"], 0)}</td><td class="num">${String(peak).padStart(2, "0")}:00</td>`;
+  tr.onclick = () => select(i);
+  tr.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); select(i); } };
+  tbody.appendChild(tr);
+});
+
+/* Map ---------------------------------------------------------------------- */
+const map = document.getElementById("map");
+map.setAttribute("viewBox", `0 0 ${DATA.view.w} ${DATA.view.h}`);
+const paths = DATA.zones.map(z => {
+  const d = z.polys.map(p => "M" + p.map(q => q.join(",")).join("L") + "Z").join(" ");
+  const el = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  el.setAttribute("d", d);
+  el.setAttribute("class", "zone");
+  el.addEventListener("mousemove", e => {
+    const share = z.mix[selected] / z.trips;
+    showTip(e, `<b>${z.name}</b><br>${F(z.trips)} pickups<br>${pct(share)} ${NAMES[selected]}`);
+  });
+  el.addEventListener("mouseleave", hideTip);
+  map.appendChild(el);
+  return el;
+});
+
+function mixColor(t) {           /* sequential ramp: one hue, light to dark */
+  const lo = getComputedStyle(document.documentElement).getPropertyValue("--map-lo").trim();
+  const hi = getComputedStyle(document.documentElement).getPropertyValue("--map-hi").trim();
+  return `color-mix(in oklab, ${hi} ${Math.round(t * 100)}%, ${lo})`;
+}
+
+/* Zone bars, dayparts, speed ------------------------------------------------ */
+function drawZoneBars(i) {
+  const s = DATA.segments[i], host = document.getElementById("zonebars");
+  const max = s.top_zones[0].share;
+  host.innerHTML = s.top_zones.map(z => `
+    <div class="barrow"><div>${z.name.replace(/ \(.*\)/, "")}</div>
+      <div class="bartrack"><div class="bar" style="width:${Math.max(2, z.share / max * 78)}%;background:${SERIES[i]}">
+        <span>${pct(z.share)}</span></div></div></div>`).join("");
+}
+function drawDayparts() {
+  document.getElementById("dayparts").innerHTML = DATA.segments.map((s, i) => {
+    const max = Math.max(...s.by_hour), W = 170, H = 46;
+    const pts = s.by_hour.map((v, h) => `${(h / 23 * W).toFixed(1)},${(H - v / max * (H - 6)).toFixed(1)}`).join(" ");
+    const peak = s.by_hour.indexOf(max);
+    return `<div class="small"><b><span class="chip" style="background:${SERIES[i]}"></span>${NAMES[i]}</b>
+      <svg viewBox="0 0 ${W} ${H}" aria-label="${NAMES[i]} trips by hour, peak ${peak}:00">
+        <polygon points="0,${H} ${pts} ${W},${H}" fill="${SERIES[i]}" opacity="0.18"></polygon>
+        <polyline points="${pts}" fill="none" stroke="${SERIES[i]}" stroke-width="2" stroke-linejoin="round"></polyline>
+        <circle cx="${(peak / 23 * W).toFixed(1)}" cy="${(H - 1 * (H - 6)).toFixed(1)}" r="3" fill="${SERIES[i]}"></circle>
+      </svg><span>peak ${String(peak).padStart(2, "0")}:00 · midnight → midnight</span></div>`;
+  }).join("");
+}
+function drawSpeed() {
+  const s = DATA.summary, max = Math.max(s.sklearn_s, s.ours_same_rows_s);
+  document.getElementById("speedbars").innerHTML = [
+    ["scikit-learn (18 CPU cores)", s.sklearn_s, "var(--ink-3)"],
+    ["this library (GPU)", s.ours_same_rows_s, "var(--taxi)"],
+  ].map(([label, v, color]) => `
+    <div class="barrow"><div>${label}</div><div class="bartrack">
+      <div class="bar" style="width:${Math.max(3, v / max * 72)}%;background:${color}"><span>${F(v, 2)}s</span></div>
+    </div></div>`).join("") +
+    `<div class="note" style="margin-top:4px">${F(s.sklearn_s / s.ours_same_rows_s, 0)}× faster on 10M trips;
+      the full 98.5M took ${F(s.fit_s, 2)}s.</div>`;
+}
+
+function select(i) {
+  selected = i;
+  const shares = DATA.zones.map(z => z.mix[i] / z.trips);
+  const max = Math.max(...shares);
+  paths.forEach((el, j) => el.setAttribute("fill", mixColor(shares[j] / max)));
+  document.getElementById("rampmax").textContent = pct(max);
+  document.getElementById("mapcaption").textContent =
+    `Share of each zone's pickups that are ${NAMES[i].toLowerCase()} — darkest zone is ${pct(max)}.`;
+  [...tbody.children].forEach((tr, j) => tr.setAttribute("aria-selected", j === i));
+  drawZoneBars(i);
+}
+addEventListener("mousemove", e => { if (tip.style.opacity == 1) moveTip(e); });
+drawDayparts();
+drawSpeed();
+select(0);
+</script>
