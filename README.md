@@ -14,6 +14,23 @@ implementations) on problems where it counts: realistic shapes, real datasets, i
 - **Correctness first, then performance.** Every path must pass `tests/accuracy.py` (every point's label vs float64,
   centers and inertia vs float64 accumulation) before any speed claim. Commit each verified state.
 
+## Other Macs
+
+Every hot kernel is GPU-bound, so performance tracks GPU cores and memory bandwidth. This machine: 40 GPU cores,
+~400-500 GB/s. Rough expectations relative to it (measure yours with `quick_bench.py` rather than trusting these):
+
+| Machine | GPU cores | vs M5 Max |
+|---|---|---|
+| MacBook Air | ~10 | ~3.5-4x slower |
+| MacBook Pro (Pro chip) | ~16-20 | ~2-2.5x slower |
+| MacBook Pro (Max chip) | 40 | 1x |
+| Mac Studio (Ultra chip) | ~80 | ~1.7-2x faster |
+
+Memory is the harder limit on small machines: data needs rows * dims * 4 bytes and must fit the GPU working set
+(about 70% of RAM), so a 16 GB Air handles ~300M rows at 8 dims or ~20M at 128 dims. The speedup over scikit-learn
+and FAISS should if anything be *larger* on an Air, since those lose CPU cores too while the GPU/CPU ratio holds.
+Portability: the kernels use Metal simdgroup matrices (M1 and later), not the M5-only Neural Accelerator path.
+
 ## Files
 
 | File | What |
@@ -23,6 +40,8 @@ implementations) on problems where it counts: realistic shapes, real datasets, i
 | `kmeans.mm` | C++/Metal port of an earlier version (plus an 18-core CPU mode); not kept in sync |
 | `tests/accuracy.py` | Float64 ground-truth suite; run before committing kernel changes |
 | `bench.py` | Head-to-head suite vs public libraries; writes `benchmarks/results.jsonl` and `BENCHMARKS.md` |
+| `bench_ann.py` | End-to-end: wall clock to a given clustering quality, and IVF recall@10 on SIFT1M/GIST1M |
+| `quick_bench.py` | Self-benchmark for any Mac: machine info, memory bandwidth, passes vs scikit-learn |
 | `benchmarks/NOTES.md` | Findings, design decisions and incidents, in order |
 
 ## Running

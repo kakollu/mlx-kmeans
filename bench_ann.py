@@ -74,6 +74,38 @@ def sklearn_kmeans(X, k, seed, max_iter=FAISS_NITER):
     return m.cluster_centers_.astype(np.float32), int(m.n_iter_)
 
 
+def usearch_kmeans(X, k, seed, dtype, niter=FAISS_NITER):
+    """usearch's clustering (CPU, hand-tuned NEON). Its default dtype is bf16; f32 is the accurate setting."""
+    from usearch.index import kmeans as us
+    _, _, centroids = us(X, k, dtype=dtype, max_iterations=niter, inertia_threshold=1e-4, max_seconds=3600, seed=seed)
+    return np.ascontiguousarray(centroids, dtype=np.float32), niter
+
+
+KP_BUDGET_S = 600
+
+
+def kmeans_pytorch_mps(X, k, seed, tol=1e-4, budget=KP_BUDGET_S):
+    """kmeans-pytorch on the Metal GPU. It has no iteration limit - only a center-shift tolerance it may never reach
+    (it ran 10 h on 200k x 32, k=64 without finishing) - so it gets a wall-clock budget and is reported as
+    non-convergent if it overruns."""
+    import contextlib, io, signal, torch
+    from kmeans_pytorch import kmeans as kp
+    torch.manual_seed(seed)
+
+    def bail(signum, frame):
+        raise TimeoutError(f"no iteration limit; did not converge within {budget} s")
+
+    old = signal.signal(signal.SIGALRM, bail)
+    signal.setitimer(signal.ITIMER_REAL, budget)
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):      # its tqdm progress bar
+            _, centers = kp(X=torch.from_numpy(X), num_clusters=k, distance="euclidean", tol=tol, device=torch.device("mps"))
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+    return np.ascontiguousarray(centers.cpu().numpy(), dtype=np.float32), -1
+
+
 # ---------------------------------------------------------------- ANN evaluation
 
 def ivf_recall(base, queries, gt, C, k):
@@ -103,16 +135,26 @@ def main():
     p.add_argument("--k", type=int, default=1024)
     p.add_argument("--queries", type=int, default=10_000)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--data", default="sift", help="sift, gist, or synthetic:ROWS,DIMS (k comes from --k)")
+    p.add_argument("--only", nargs="*", help="substring filter on method names")
     a = p.parse_args()
     mx = km._mx()
-    base = read_fvecs(ROOT / "data/sift/sift_base.fvecs")
-    queries = read_fvecs(ROOT / "data/sift/sift_query.fvecs")[:a.queries]
-    gt = read_ivecs(ROOT / "data/sift/sift_groundtruth.ivecs")[:a.queries]
+    if a.data.startswith("synthetic"):
+        rows, dims = (int(v) for v in a.data.split(":")[1].split(","))
+        parts_gen = km.make_data_mlx(rows, dims, a.k, a.seed)
+        base = np.concatenate([np.array(p) for p in parts_gen])
+        queries = gt = None
+    else:
+        base = read_fvecs(ROOT / f"data/{a.data}/{a.data}_base.fvecs")
+        queries = read_fvecs(ROOT / f"data/{a.data}/{a.data}_query.fvecs")[:a.queries]
+        gt = read_ivecs(ROOT / f"data/{a.data}/{a.data}_groundtruth.ivecs")[:a.queries]
     parts = [mx.array(base)]
     mx.eval(parts)
     rows, k = len(base), a.k
     sample_rows = FAISS_SAMPLE * k
-    print(f"SIFT1M: {rows:,} x {base.shape[1]}, k={k}, {len(queries):,} queries; FAISS-style subsample = {sample_rows:,} rows\n")
+    print(f"{a.data}: {rows:,} x {base.shape[1]}, k={k}"
+          + (f", {len(queries):,} queries" if gt is not None else ", no ground truth (quality/time only)")
+          + f"; FAISS-style subsample = {sample_rows:,} rows\n")
 
     methods = {
         f"ours, all {rows//1000}k rows, to convergence": lambda: ours(parts, rows, k, a.seed),
@@ -121,16 +163,29 @@ def main():
         "FAISS default (subsample, 25 iters)": lambda: faiss_kmeans(base, k, a.seed, subsample=True),
         "FAISS all rows, 25 iters": lambda: faiss_kmeans(base, k, a.seed, subsample=False),
         "scikit-learn all rows, 25 iters": lambda: sklearn_kmeans(base, k, a.seed),
+        "usearch f32, 25 iters": lambda: usearch_kmeans(base, k, a.seed, "f32"),
+        "usearch bf16 (its default), 25 iters": lambda: usearch_kmeans(base, k, a.seed, "bf16"),
+        "kmeans-pytorch (MPS GPU), to convergence": lambda: kmeans_pytorch_mps(base, k, a.seed),
     }
+    if a.only:
+        methods = {n: f for n, f in methods.items() if any(o.lower() in n.lower() for o in a.only)}
     commit, dirty = git_state()
     rows_out = []
+    print(f"methods: {', '.join(methods)}\n", flush=True)
     for name, fn in methods.items():
         load = other_cpu_percent()
         t = time.perf_counter()
-        C, iters = fn()
+        try:
+            C, iters = fn()
+        except Exception as e:
+            print(f"{name:46s} FAILED after {time.perf_counter()-t:.1f}s: {type(e).__name__}: {str(e)[:120]}", flush=True)
+            rows_out.append(dict(date=time.strftime("%Y-%m-%dT%H:%M:%S"), commit=commit, dirty=dirty, machine=machine(),
+                                 method=name, k=k, rows=rows, error=f"{type(e).__name__}: {str(e)[:200]}",
+                                 train_s=time.perf_counter() - t))
+            continue
         train_s = time.perf_counter() - t
         inertia = inertia_full(parts, C)
-        recall, build_s = ivf_recall(base, queries, gt, C, k)
+        recall, build_s = ivf_recall(base, queries, gt, C, k) if gt is not None else ({n: (float("nan"), float("nan")) for n in NPROBE}, float("nan"))
         rec = dict(date=time.strftime("%Y-%m-%dT%H:%M:%S"), commit=commit, dirty=dirty, machine=machine(),
                    method=name, k=k, rows=rows, iters=iters, train_s=train_s, inertia=inertia,
                    index_build_s=build_s, other_cpu=load,
@@ -142,6 +197,9 @@ def main():
     with RESULTS.open("a") as f:
         for r in rows_out:
             f.write(json.dumps(r) + "\n")
+    rows_out = [r for r in rows_out if "inertia" in r]
+    if not rows_out:
+        return
     best = min(rows_out, key=lambda r: r["inertia"])
     print(f"\nlowest inertia: {best['method']} ({best['inertia']:.6e})")
     for r in rows_out:
