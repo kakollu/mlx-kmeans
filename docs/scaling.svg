@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 430" width="760" height="430" role="img" aria-label="Time per pass against dataset size">
+<rect width="760" height="430" fill="#fbfaf7"/>
+<text x="24" y="32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" fill="#16181d" text-anchor="start" font-weight="700">Time per pass as the data grows</text>
+<text x="24" y="52" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#7c808b" text-anchor="start" font-weight="400">32 dimensions, k=64 · both axes logarithmic</text>
+<line x1="78" y1="374.0" x2="610" y2="374.0" stroke="#e2ded4" stroke-width="1"/>
+<text x="68" y="378.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#7c808b" text-anchor="end" font-weight="400">1 ms</text>
+<line x1="78" y1="299.0" x2="610" y2="299.0" stroke="#e2ded4" stroke-width="1"/>
+<text x="68" y="303.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#7c808b" text-anchor="end" font-weight="400">10 ms</text>
+<line x1="78" y1="224.0" x2="610" y2="224.0" stroke="#e2ded4" stroke-width="1"/>
+<text x="68" y="228.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#7c808b" text-anchor="end" font-weight="400">100 ms</text>
+<line x1="78" y1="149.0" x2="610" y2="149.0" stroke="#e2ded4" stroke-width="1"/>
+<text x="68" y="153.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#7c808b" text-anchor="end" font-weight="400">1 s</text>
+<line x1="78" y1="74.0" x2="610" y2="74.0" stroke="#e2ded4" stroke-width="1"/>
+<text x="68" y="78.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#7c808b" text-anchor="end" font-weight="400">10 s</text>
+<text x="78.0" y="394" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#7c808b" text-anchor="middle" font-weight="400">1M</text>
+<text x="344.0" y="394" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#7c808b" text-anchor="middle" font-weight="400">10M</text>
+<text x="610.0" y="394" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#7c808b" text-anchor="middle" font-weight="400">100M</text>
+<polyline points="78.0,304.2 344.0,227.6 610.0,151.7" fill="none" stroke="#b8b2a4" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="78.0" cy="304.2" r="4.5" fill="#b8b2a4" stroke="#fbfaf7" stroke-width="1.5"/>
+<circle cx="344.0" cy="227.6" r="4.5" fill="#b8b2a4" stroke="#fbfaf7" stroke-width="1.5"/>
+<circle cx="610.0" cy="151.7" r="4.5" fill="#b8b2a4" stroke="#fbfaf7" stroke-width="1.5"/>
+<text x="622.0" y="155.73625693988168" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#4a4e58" text-anchor="start" font-weight="400">scikit-learn</text>
+<polyline points="78.0,275.1 344.0,200.3 610.0,125.1" fill="none" stroke="#8c8578" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="78.0" cy="275.1" r="4.5" fill="#8c8578" stroke="#fbfaf7" stroke-width="1.5"/>
+<circle cx="344.0" cy="200.3" r="4.5" fill="#8c8578" stroke="#fbfaf7" stroke-width="1.5"/>
+<circle cx="610.0" cy="125.1" r="4.5" fill="#8c8578" stroke="#fbfaf7" stroke-width="1.5"/>
+<text x="622.0" y="129.10455341745268" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#4a4e58" text-anchor="start" font-weight="400">FAISS</text>
+<polyline points="78.0,336.8 344.0,257.3 610.0,183.1" fill="none" stroke="#1d4f8f" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="78.0" cy="336.8" r="4.5" fill="#1d4f8f" stroke="#fbfaf7" stroke-width="1.5"/>
+<circle cx="344.0" cy="257.3" r="4.5" fill="#1d4f8f" stroke="#fbfaf7" stroke-width="1.5"/>
+<circle cx="610.0" cy="183.1" r="4.5" fill="#1d4f8f" stroke="#fbfaf7" stroke-width="1.5"/>
+<text x="622.0" y="187.06247758115458" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#16181d" text-anchor="start" font-weight="700">this library</text>
+<text x="24" y="414" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#7c808b" text-anchor="start" font-weight="400">At 100M rows: 351 ms per pass vs 919 ms for scikit-learn (3× faster).</text>
+</svg>
