@@ -8,3 +8,5 @@ data/
 data/
 demos/taxi_page.html
 demos/taxi_zones.geojson
+demos/satellite_classes.png
+demos/*.json
