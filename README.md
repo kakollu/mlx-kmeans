@@ -4,8 +4,11 @@
 no cluster, no cloud. Same answers as scikit-learn, 2–8× faster from 1M rows up.
 
 ```bash
-pip install mlx-kmeans
+pip install git+https://github.com/kakollu/mlx-kmeans.git
 ```
+
+(Not on PyPI yet — that one line installs it straight from this repository. While the repo is private, use
+`git+ssh://git@github.com/kakollu/mlx-kmeans.git` instead, with your GitHub SSH key set up.)
 
 ```python
 import numpy as np
@@ -102,7 +105,7 @@ optimum.
 ```bash
 git clone https://github.com/kakollu/mlx-kmeans && cd mlx-kmeans
 python3 -m venv --system-site-packages .venv
-.venv/bin/pip install scikit-learn faiss-cpu torch fast-pytorch-kmeans
+.venv/bin/pip install . scikit-learn faiss-cpu torch fast-pytorch-kmeans
 python3 scripts/get_data.py sift gist      # public benchmark sets, no account needed
 .venv/bin/python bench.py --suite          # regenerates BENCHMARKS.md
 python3 tests/accuracy.py                  # 16 correctness cases against float64
