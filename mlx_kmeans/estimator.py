@@ -9,63 +9,97 @@ class KMeans:
 
         KMeans(n_clusters=64).fit(X).cluster_centers_
 
-    Parameters mirror scikit-learn where the meaning is the same: n_clusters, max_iter, tol (relative inertia
-    change), random_state. Empty clusters are relocated exactly as scikit-learn does.
+    Parameters mirror scikit-learn where the meaning is the same: n_clusters, n_init, max_iter, tol (relative
+    inertia change), random_state. Empty clusters are relocated exactly as scikit-learn does.
+
+    spherical=True runs spherical k-means (centers re-normalised to unit length each iteration), which is what you
+    want for text/image embeddings compared by cosine similarity - give it L2-normalised rows.
 
     accumulate="atomic" sums cluster totals in threadgroup memory: ~1.7-4.5x faster at small k * dims, at the cost
     of bit-reproducibility (centers move by ~1e-8 relative between identical runs, which can change which local
     minimum a run reaches). The default is deterministic.
 
-    X may be a (rows, dims) float32 NumPy array, an MLX array, or a list of MLX arrays (slices of at most
-    ~100M rows each), which is how datasets larger than one buffer are held.
+    X may be anything array-like - a NumPy array, a pandas DataFrame, a list of rows - or, for data larger than one
+    GPU buffer, a list of MLX arrays of at most ~100M rows each.
     """
 
-    def __init__(self, n_clusters=8, max_iter=300, tol=1e-4, random_state=None, verbose=False, accumulate="auto"):
+    def __init__(self, n_clusters=8, n_init=1, max_iter=300, tol=1e-4, random_state=None, verbose=False,
+                 spherical=False, accumulate="auto"):
         self.n_clusters = n_clusters
+        self.n_init = n_init
         self.max_iter = max_iter
         self.tol = tol
         self.random_state = random_state
         self.verbose = verbose
+        self.spherical = spherical
         self.accumulate = accumulate
+
+    @classmethod
+    def from_centers(cls, centers, **kwargs):
+        """A fitted model from centers you saved earlier: KMeans.from_centers(np.load("centers.npy"))."""
+        centers = np.ascontiguousarray(centers, dtype=np.float32)
+        model = cls(n_clusters=len(centers), **kwargs)
+        model.cluster_centers_ = centers
+        return model
 
     @staticmethod
     def _parts(X):
+        """-> list of MLX arrays, one per slice of the data."""
         mx = core._mx()
-        if isinstance(X, list):
-            return X
-        if isinstance(X, np.ndarray):
-            X = np.ascontiguousarray(X, dtype=np.float32)
-            per = core.slice_rows(X.shape[1])
-            return [mx.array(X[s:s + per]) for s in range(0, len(X), per)]
-        return [X]
+        if isinstance(X, list) and X and type(X[0]).__module__.startswith("mlx"):
+            return X                                      # already slices on the GPU
+        if type(X).__module__.startswith("mlx"):
+            return [X]
+        if not isinstance(X, np.ndarray):
+            X = np.asarray(X.to_numpy() if hasattr(X, "to_numpy") else X)   # pandas/polars/lists
+        X = np.ascontiguousarray(X, dtype=np.float32)
+        if X.ndim != 2:
+            raise ValueError(f"expected a 2-D (rows, dims) array, got shape {X.shape}")
+        per = core.slice_rows(X.shape[1])
+        return [mx.array(X[s:s + per]) for s in range(0, len(X), per)]
 
-    def fit(self, X, y=None):
-        parts = self._parts(X)
-        rows = sum(p.shape[0] for p in parts)
-        rng = np.random.default_rng(self.random_state)
+    @staticmethod
+    def _normalise(C):
+        n = np.linalg.norm(C, axis=1, keepdims=True)
+        return (C / np.where(n > 0, n, 1)).astype(np.float32)
+
+    def _one_run(self, parts, rows, seed):
+        rng = np.random.default_rng(seed)
         C = core.kmeans_pp_init(parts, rows, self.n_clusters, rng)
+        if self.spherical:
+            C = self._normalise(C)
         prev = None
         for it in range(self.max_iter):
             C, inertia, n_empty = core.lloyd_step(parts, C, accumulate=self.accumulate)
+            if self.spherical:
+                C = self._normalise(C)
             if self.verbose:
                 print(f"iter {it + 1}: inertia {inertia:.6e}" + (f", {n_empty} empty relocated" if n_empty else ""))
             if prev is not None and abs(prev - inertia) <= self.tol * prev:
                 break
             prev = inertia
-        self.cluster_centers_ = C
-        self.inertia_ = inertia
-        self.n_iter_ = it + 1
-        self._parts_cache = parts
+        return C, inertia, it + 1
+
+    def fit(self, X, y=None):
+        parts = self._parts(X)
+        rows = sum(p.shape[0] for p in parts)
+        best = None
+        for run in range(max(1, self.n_init)):            # restarts reuse the data already on the GPU
+            seed = None if self.random_state is None else self.random_state + run
+            C, inertia, iters = self._one_run(parts, rows, seed)
+            if self.verbose and self.n_init > 1:
+                print(f"start {run + 1}/{self.n_init}: inertia {inertia:.6e} after {iters} iterations")
+            if best is None or inertia < best[1]:
+                best = (C, inertia, iters)
+        self.cluster_centers_, self.inertia_, self.n_iter_ = best
+        self.labels_ = core.assign_mlx(parts, self.cluster_centers_, return_labels=True,
+                                       accumulate=self.accumulate)[3]
         return self
 
-    @property
-    def labels_(self):
-        """Cluster index for every row of the fitted data."""
-        return self.predict(self._parts_cache)
-
     def predict(self, X):
-        parts = self._parts(X)
-        return core.assign_mlx(parts, self.cluster_centers_, return_labels=True, accumulate=self.accumulate)[3]
+        """Cluster index for every row of X (any array-like)."""
+        return core.assign_mlx(self._parts(X), self.cluster_centers_, return_labels=True,
+                               accumulate=self.accumulate)[3]
 
     def fit_predict(self, X, y=None):
         return self.fit(X).labels_

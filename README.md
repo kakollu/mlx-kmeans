@@ -160,14 +160,34 @@ ground, each identifiable from its own vegetation and water index. 0.7 seconds o
 ## API
 
 ```python
-KMeans(n_clusters=8, max_iter=300, tol=1e-4, random_state=None, verbose=False, accumulate="auto")
+KMeans(n_clusters=8, n_init=1, max_iter=300, tol=1e-4, random_state=None,
+       verbose=False, spherical=False, accumulate="auto")
   .fit(X) / .predict(X) / .fit_predict(X)
   .cluster_centers_  .labels_  .inertia_  .n_iter_
+  KMeans.from_centers(centers)        # a fitted model from centers you saved
 ```
 
-`X` may be a NumPy array, an MLX array, or a list of MLX arrays for data larger than one GPU buffer. Empty clusters
-are relocated exactly as scikit-learn does. `accumulate="atomic"` is faster (1.7–4.5× on the accumulation step) but
-not bit-reproducible, so it is off by default.
+`X` is anything array-like — NumPy array, pandas DataFrame, list of rows — or a list of MLX arrays for data larger
+than one GPU buffer. Empty clusters are relocated exactly as scikit-learn does.
+
+**Picking k.** Passes are cheap enough to sweep instead of guess:
+
+```python
+for k in range(2, 21):
+    print(k, KMeans(n_clusters=k, random_state=0).fit(Z).inertia_)   # elbow curve over 10M rows in seconds
+```
+
+**Restarts.** `n_init=10` runs ten starts and keeps the best; the data stays on the GPU between them, so ten starts
+cost roughly ten passes, not ten uploads. Worth it — on clustered data the worst start can be 2× worse than the best.
+
+**Embeddings.** `spherical=True` re-normalises centers each iteration, which is the right objective for L2-normalised
+vectors compared by cosine similarity (what FAISS calls `spherical=True`).
+
+**Saving a model.** The centers are the model: `np.save("centers.npy", model.cluster_centers_)`, later
+`KMeans.from_centers(np.load("centers.npy")).predict(new_rows)`.
+
+`accumulate="atomic"` is faster (1.7–4.5× on the accumulation step) but not bit-reproducible, so it is off by
+default.
 
 For very large runs, `python3 -m mlx_kmeans --rows 1_000_000_000 --dims 8 --k 16` generates and clusters data without
 materialising it in NumPy first.
