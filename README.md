@@ -69,6 +69,14 @@ than by behaviour: the meter only records a tip when the fare is paid by card.
 clusters took 3.51 ms/pass here versus 1.59 ms for scikit-learn. A 100k × 8, k=8 case was roughly tied with FAISS.
 The crossover depends on shape, not just row count.
 
+The reason is latency, not arithmetic. A GPU round trip costs about 0.14 ms on this machine, and a Lloyd pass
+here spends roughly 0.9 ms on fixed per-pass cost before it touches any data — crossing back to the host for the
+float64 center update and the convergence check. That floor is flat in row count, so it is invisible at 10M rows
+and decisive at 10k. Work only overtakes it above roughly 300k rows at 32 features, after which a pass grows at
+about 2 ns per row. Seeding used to add a second, larger fixed cost of one round trip per cluster; that one is
+fixed (see *Where the speed comes from*), but the per-pass floor remains. **If you cluster many small datasets in
+a loop, you pay this floor on every iteration — measure before assuming the GPU helps.**
+
 ## What your Mac can handle
 
 **Measured machine: 128 GB M5 Max MacBook Pro, on AC power.** The timings below apply to this machine.
@@ -199,6 +207,7 @@ experiments recorded in `benchmarks/NOTES.md`, not fresh ablations in the Septem
 | **Cache-local cluster totals** (rows sorted by cluster, summed in small blocks) | GIST1M totals: 4.16 s → 0.053 s. That step had been 89% of a pass. |
 | **Metal SIMD-group matrix instructions** for distances | Historical high-dimensional experiments measured a ~3× gain. The default path refines candidate distances directly; the notes describe precision problems observed with the tested alternative matmul paths. |
 | **Greedy k-means++ seeding on the GPU** | Initialization 18.1 s → 0.2 s at k=1024, and roughly 10× fewer iterations to converge. |
+| **Seeding without a host sync per round** | Each of the k rounds does little work, so waiting for it made seeding cost k GPU round trips regardless of data size — 16 ms of a 19 ms fit at k=64 on 1k rows. Leaving the rounds unevaluated lets MLX pipeline them: 2–4× faster seeding, complete fits 1.1–1.9× faster, and the centers are bit-identical across k=8–1024 because only the timing of evaluation changed. |
 | **GPU-generated input** | The billion-row CLI creates data on the GPU, avoiding a NumPy input copy. NumPy input through the public API can require additional storage. |
 
 `benchmarks/NOTES.md` is the full record, including what *didn't* work: cache tiling (1.4×, so cache misses weren't

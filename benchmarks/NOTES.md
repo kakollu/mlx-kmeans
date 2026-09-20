@@ -211,3 +211,30 @@ geo-trips 10M x 4 k=256 went 0.0133 -> 0.0099 s/pass (25%), since the argsort co
 (3 iterations), 2.31 s wall. Final inertia 8.000078e9 against a theoretical optimum of 8.0e9 (1B rows x 8 dims x
 unit variance) - the greedy k-means++ seeding lands in the right basin and converges immediately. The same run
 before that change took 8 iterations and finished at 1.271e10, 59% worse.
+
+## Small-data losses are latency, not arithmetic (September 20, 2026)
+
+Prompted by a 10k-row smoke test where scikit-learn finished a complete fit in 33 ms against our 95 ms. A single
+case is noise; the question was whether a fixed per-call cost existed, since that compounds when a caller clusters
+many small datasets in a loop. Two fixed costs were found, both round-trip latency rather than work.
+
+**Seeding — fixed.** Init time was flat in row count and linear in k: at k=64 it cost about the same for 1k rows
+as for 3M (16-26 ms), and cutting the sample tenfold at fixed k=64 moved it from 13.9 ms to 14.3 ms, i.e. not at
+all. Against a measured bare MLX round trip of 142 us, the cost was one round trip per cluster. The `mx.eval` per
+round was removed; MLX then pipelines the rounds. Seeding is 2-4x faster (k=256 on 1M rows: 60 -> 14 ms; k=1024 on
+GIST-shaped data: 0.49 -> 0.26 s) and complete fits 1.1-1.9x faster, for a bounded ~90 MB of extra working memory
+that does not grow with k. Centers are bit-identical across 5 shapes x 3 seeds at k=8..1024, since only the timing
+of evaluation changed.
+
+Two alternatives were measured and rejected: running the rounds in NumPy on the host wins only below a few
+thousand sample rows and loses badly above (k=64 on 100k rows: 217 ms against 15.8 ms), and it changes the RNG
+stream, so it is not a drop-in. Keeping a periodic sync to bound memory proved unnecessary, as peak MLX memory
+was the same at k=256 and k=1024.
+
+**Per Lloyd pass — still present.** A pass has a ~0.9 ms floor independent of row count: it crosses to the host
+for the float64 center update, the empty-cluster check and the convergence test. At 32 dims, k=64, a pass costs
+0.98 ms at 1k rows and 1.03 ms at 100k; work only overtakes the floor above roughly 300k rows, growing at ~2 ns
+per row thereafter. This is why the recorded 100k x 32, k=64 per-pass loss reproduces after the seeding fix
+(2.2 ms against scikit-learn's 1.2 ms) - seeding is not part of a per-pass number. Removing this floor means
+keeping the center update and convergence test on the GPU, which would move float64 accumulation and
+scikit-learn-exact empty-cluster relocation off the host; not attempted, as correctness ranks above speed here.
