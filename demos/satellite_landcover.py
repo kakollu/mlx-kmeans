@@ -9,7 +9,9 @@ near-infrared) plus two indices that make the classes interpretable:
 Unsupervised land cover: no labels, no training set, just what the pixels look like. Writes a classified PNG and
 demos/satellite_results.json.
 
-  python3 demos/satellite_landcover.py [--k 8] [--compare]
+  python3 demos/satellite_landcover.py [--k 8] [--compare] [--verbose]
+
+Get the data first (~700 MB, no account needed):  python3 scripts/get_data.py sentinel
 """
 import argparse
 import json
@@ -32,21 +34,36 @@ BANDS = {"blue": "B02.tif", "green": "B03.tif", "red": "B04.tif", "nir": "B08.ti
 def load():
     """Stack the four bands, drop no-data pixels, and add NDVI/NDWI."""
     t = time.perf_counter()
+    print(f"[1/4] reading {len(BANDS)} bands from {DATA.relative_to(ROOT)}/")
     arrays, profile = {}, None
     for name, fn in BANDS.items():
+        bt = time.perf_counter()
         with rasterio.open(DATA / fn) as src:
             arrays[name] = src.read(1).astype(np.float32)
             profile = profile or src.profile
+        mb = (DATA / fn).stat().st_size / 1e6
+        print(f"      {fn:8} {name:6} {arrays[name].shape[0]}x{arrays[name].shape[1]}  "
+              f"{mb:6.0f} MB on disk  {time.perf_counter()-bt:5.2f}s")
     shape = arrays["blue"].shape
+    crs, res = profile.get("crs"), abs(profile["transform"][0])
+    print(f"      scene {shape[0]}x{shape[1]} = {shape[0]*shape[1]:,} pixels at {res:.0f} m, {crs}")
+
+    print("[2/4] building features")
     stack = np.stack([arrays[b].ravel() for b in BANDS], axis=1)
     valid = (stack > 0).all(1)
+    dropped = len(valid) - int(valid.sum())
     blue, green, red, nir = (stack[:, i] for i in range(4))
     ndvi = np.where(nir + red > 0, (nir - red) / (nir + red + 1e-6), 0).astype(np.float32)
     ndwi = np.where(green + nir > 0, (green - nir) / (green + nir + 1e-6), 0).astype(np.float32)
     feats = np.column_stack([stack / 10000.0, ndvi * 2, ndwi * 2]).astype(np.float32)  # indices weighted x2
-    print(f"scene {shape[0]}x{shape[1]} = {stack.shape[0]:,} pixels, {int(valid.sum()):,} valid, "
-          f"{feats.nbytes/1e9:.1f} GB of features, read in {time.perf_counter()-t:.1f}s")
-    return feats, valid, shape, time.perf_counter() - t
+    print(f"      6 features per pixel: blue, green, red, nir (reflectance), NDVI, NDWI (x2 weight)")
+    print(f"      NDVI = (nir-red)/(nir+red) -> vegetation;  NDWI = (green-nir)/(green+nir) -> water")
+    print(f"      dropped {dropped:,} no-data pixels ({dropped/len(valid)*100:.1f}%, the black corner off the "
+          f"satellite's swath)")
+    read_s = time.perf_counter() - t
+    print(f"      {int(valid.sum()):,} pixels x 6 = {feats[valid].nbytes/1e9:.1f} GB to cluster "
+          f"(read + prepare: {read_s:.1f}s)")
+    return feats, valid, shape, read_s
 
 
 # A land-cover map is read, not admired: colour carries the class, so the ramps are the conventional ones
@@ -74,15 +91,20 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--k", type=int, default=8)
     p.add_argument("--compare", action="store_true", help="also time scikit-learn on a 10M-pixel slice")
+    p.add_argument("--verbose", action="store_true", help="print inertia after every Lloyd iteration")
     a = p.parse_args()
 
     feats, valid, shape, read_s = load()
     X = np.ascontiguousarray(feats[valid])
+    print(f"[3/4] clustering on the GPU: k={a.k}, seed 0, greedy k-means++ seeding, every pixel every iteration")
     t = time.perf_counter()
-    model = KMeans(n_clusters=a.k, random_state=0).fit(X)
+    model = KMeans(n_clusters=a.k, random_state=0, verbose=a.verbose).fit(X)
     fit_s = time.perf_counter() - t
     labels = model.labels_
-    print(f"clustered {len(X):,} pixels x {X.shape[1]} into {a.k} classes in {fit_s:.1f}s ({model.n_iter_} iterations)")
+    print(f"      {len(X):,} pixels x {X.shape[1]} -> {a.k} classes in {fit_s:.2f}s, {model.n_iter_} iterations "
+          f"({fit_s/model.n_iter_*1e3:.0f} ms each, "
+          f"{len(X)*a.k*model.n_iter_/fit_s/1e9:.0f}B pixel-to-center distances/s)")
+    print(f"      inertia {model.inertia_:.6e}   labels for every pixel included in that time")
 
     counts = np.bincount(labels, minlength=a.k)
     centers = model.cluster_centers_
@@ -117,13 +139,15 @@ def main():
         png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", rgb.shape[1], rgb.shape[0], 8, 2, 0, 0, 0))
                + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
         out_png.write_bytes(png)
-    print(f"wrote {out_png.name}: {img.shape[1]}x{img.shape[0]} px, {out_png.stat().st_size/1e6:.1f} MB")
+    print(f"[4/4] wrote demos/{out_png.name}: {img.shape[1]}x{img.shape[0]} px, "
+          f"{out_png.stat().st_size/1e6:.1f} MB (every 6th pixel, so the page stays small)")
 
     res = dict(pixels=int(len(X)), dims=int(X.shape[1]), k=a.k, read_s=read_s, fit_s=fit_s,
                iterations=int(model.n_iter_), inertia=float(model.inertia_), scene="S2A_18TWL_20240903_0_L2A",
                shape=[int(shape[0]), int(shape[1])], classes=classes, image=out_png.name,
                image_shape=[int(img.shape[0]), int(img.shape[1])],
-               machine=subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip())
+               machine=subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip(),
+               power=subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True).stdout.splitlines()[0])
     if a.compare:
         from sklearn.cluster import KMeans as SK
         sub = X[:10_000_000]
