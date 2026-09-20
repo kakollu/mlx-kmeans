@@ -7,8 +7,10 @@ a subsample. Data stays on your Mac.
 Start with the [file guide](docs/USING_YOUR_FILES.md), [notebook](examples/cluster_your_file.ipynb), or
 [Python API](#api). To see it on real data at scale, open
 [examples/satellite_landcover.ipynb](examples/satellite_landcover.ipynb) — 96M satellite pixels clustered into
-land-cover classes, with saved outputs so it reads without running. On a 128 GB M5 Max, six measured workloads showed **2.2–8.1× faster passes** than the fastest
-tested comparator with matching final inertia. See [benchmark conditions and results](benchmarks/VERIFICATION-2026-09-19.md).
+land-cover classes, with saved outputs so it reads without running.
+
+On a 128 GB M5 Max, six measured workloads showed **2.2–8.1× faster passes** than the fastest tested comparator
+with matching final inertia. See [benchmark conditions and results](benchmarks/VERIFICATION-2026-09-19.md).
 
 For a local file, after installing `.[files]`:
 
