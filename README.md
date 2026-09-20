@@ -70,8 +70,8 @@ clusters took 3.51 ms/pass here versus 1.59 ms for scikit-learn. A 100k × 8, k=
 The crossover depends on shape, not just row count.
 
 The reason is latency, not arithmetic (measured September 20 on battery power). A GPU round trip costs about
-0.14 ms on this machine, and a Lloyd pass
-here spends roughly 0.9 ms on fixed per-pass cost before it touches any data — crossing back to the host for the
+0.14 ms on this machine, and a Lloyd pass here spends roughly 0.9 ms on fixed per-pass cost before it touches
+any data — crossing back to the host for the
 float64 center update and the convergence check. That floor is flat in row count, so it is invisible at 10M rows
 and decisive at 10k. Work only overtakes it above roughly 300k rows at 32 features, after which a pass grows at
 about 2 ns per row. Seeding used to add a second fixed cost of one round trip per cluster — the larger of the two
