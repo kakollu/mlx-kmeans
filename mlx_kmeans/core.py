@@ -577,4 +577,7 @@ def kmeans(parts, rows, k, max_iter, tol, seed, backend):
         if prev is not None and abs(prev - inertia) <= tol * prev:
             break
         prev = inertia
+    # Each pass reports the inertia of the centers it started from, so a run that stops before convergence would
+    # otherwise return a stale number (measured 0.31% off at 4 capped iterations). Score the centers being returned.
+    inertia = assign_mlx(parts, C)[2] if backend == "mlx" else assign_numpy(parts, C)[2]
     return C, inertia
