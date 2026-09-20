@@ -53,8 +53,8 @@ class KMeans:
         if not isinstance(X, np.ndarray):
             X = np.asarray(X.to_numpy() if hasattr(X, "to_numpy") else X)   # pandas/polars/lists
         X = np.ascontiguousarray(X, dtype=np.float32)
-        if X.ndim != 2:
-            raise ValueError(f"expected a 2-D (rows, dims) array, got shape {X.shape}")
+        if X.ndim != 2 or not all(X.shape):
+            raise ValueError(f"expected a nonempty 2-D (rows, dims) array, got shape {X.shape}")
         per = core.slice_rows(X.shape[1])
         return [mx.array(X[s:s + per]) for s in range(0, len(X), per)]
 
@@ -81,19 +81,28 @@ class KMeans:
         return C, inertia, it + 1
 
     def fit(self, X, y=None):
+        for name in ['n_clusters', 'n_init', 'max_iter']:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:
+                raise ValueError(f'{name} must be a positive integer')
+        if not np.isfinite(self.tol) or self.tol < 0:
+            raise ValueError('tol must be finite and nonnegative')
         parts = self._parts(X)
         rows = sum(p.shape[0] for p in parts)
+        if rows < self.n_clusters:
+            raise ValueError('n_clusters cannot exceed the number of rows')
         best = None
-        for run in range(max(1, self.n_init)):            # restarts reuse the data already on the GPU
+        for run in range(self.n_init):                  # restarts reuse the data already on the GPU
             seed = None if self.random_state is None else self.random_state + run
             C, inertia, iters = self._one_run(parts, rows, seed)
+            # A Lloyd step reports inertia before its center update. Score the final centers so restarts,
+            # labels_, and inertia_ all describe the same fitted model.
+            _, _, inertia, labels = core.assign_mlx(parts, C, return_labels=True, accumulate=self.accumulate)
             if self.verbose and self.n_init > 1:
                 print(f"start {run + 1}/{self.n_init}: inertia {inertia:.6e} after {iters} iterations")
             if best is None or inertia < best[1]:
-                best = (C, inertia, iters)
-        self.cluster_centers_, self.inertia_, self.n_iter_ = best
-        self.labels_ = core.assign_mlx(parts, self.cluster_centers_, return_labels=True,
-                                       accumulate=self.accumulate)[3]
+                best = (C, inertia, iters, labels)
+        self.cluster_centers_, self.inertia_, self.n_iter_, self.labels_ = best
         return self
 
     def predict(self, X):

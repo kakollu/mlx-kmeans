@@ -1,0 +1,7 @@
+{
+  "machine": "Apple M5 Max, 128 GB, macOS 27.0",
+  "python": "3.11.9 (v3.11.9:de54cf5be3, Apr  2 2024, 07:12:50) [Clang 13.0.0 (clang-1300.0.29.30)]",
+  "commit": "c5aa109dd77882bef4c399a731def31bf96594fa",
+  "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=23855203)\t98%; charging; (no estimate) present: true\n",
+  "method": "Original suite: warmup, median of three, five iterations; sklearn divided by six. No historical best selection."
+}

@@ -1,0 +1,84 @@
+PASS  separated d8 k16                     rows/blocks    wrong labels 0  (float32-level ties 0)  counts ok  center err 1.0e-13  inertia err 1.8e-09
+PASS  separated d8 k16                     rows/sorted    wrong labels 0  (float32-level ties 0)  counts ok  center err 3.8e-14  inertia err 1.8e-09
+PASS  separated d8 k16                     pairs/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.0e-13  inertia err 1.8e-09
+PASS  separated d8 k16                     pairs/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 3.8e-14  inertia err 1.8e-09
+PASS  separated d8 k16                     rows/atomic    wrong labels 0  (float32-level ties 0)  counts ok  center err 7.8e-09  inertia err 1.8e-09
+PASS  separated d8 k16                     tiles/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.0e-13  inertia err 1.8e-09
+PASS  separated d8 k16                     tiles/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 3.8e-14  inertia err 1.8e-09
+PASS  overlapping d32 k256                 rows/blocks    wrong labels 0  (float32-level ties 0)  counts ok  center err 1.5e-13  inertia err 1.3e-10
+PASS  overlapping d32 k256                 rows/sorted    wrong labels 0  (float32-level ties 0)  counts ok  center err 1.3e-14  inertia err 1.3e-10
+PASS  overlapping d32 k256                 pairs/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.5e-13  inertia err 1.3e-10
+PASS  overlapping d32 k256                 pairs/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.3e-14  inertia err 1.3e-10
+PASS  overlapping d32 k256                 tiles/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.5e-13  inertia err 1.3e-10
+PASS  overlapping d32 k256                 tiles/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.3e-14  inertia err 1.3e-10
+PASS  k >> true clusters d16 k512          rows/blocks    wrong labels 0  (float32-level ties 0)  counts ok  center err 1.7e-14  inertia err 1.5e-10
+PASS  k >> true clusters d16 k512          rows/sorted    wrong labels 0  (float32-level ties 0)  counts ok  center err 3.7e-15  inertia err 1.5e-10
+PASS  k >> true clusters d16 k512          pairs/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.7e-14  inertia err 1.5e-10
+PASS  k >> true clusters d16 k512          pairs/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 3.7e-15  inertia err 1.5e-10
+PASS  k >> true clusters d16 k512          tiles/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.7e-14  inertia err 1.5e-10
+PASS  k >> true clusters d16 k512          tiles/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 3.7e-15  inertia err 1.5e-10
+PASS  duplicate centers d8 k32             rows/blocks    wrong labels 0  (float32-level ties 0)  counts ok  center err 1.5e-14  inertia err 6.5e-10
+PASS  duplicate centers d8 k32             rows/sorted    wrong labels 0  (float32-level ties 0)  counts ok  center err 4.1e-15  inertia err 6.5e-10
+PASS  duplicate centers d8 k32             pairs/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.5e-14  inertia err 6.5e-10
+PASS  duplicate centers d8 k32             pairs/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 4.1e-15  inertia err 6.5e-10
+PASS  duplicate centers d8 k32             rows/atomic    wrong labels 0  (float32-level ties 0)  counts ok  center err 1.1e-08  inertia err 1.0e-09
+PASS  duplicate centers d8 k32             tiles/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.5e-14  inertia err 6.5e-10
+PASS  duplicate centers d8 k32             tiles/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 4.1e-15  inertia err 6.5e-10
+PASS  duplicate points d8 k64              rows/blocks    wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 5.1e-11
+PASS  duplicate points d8 k64              rows/sorted    wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 5.1e-11
+PASS  duplicate points d8 k64              pairs/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 5.1e-11
+PASS  duplicate points d8 k64              pairs/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 5.1e-11
+PASS  duplicate points d8 k64              rows/atomic    wrong labels 0  (float32-level ties 0)  counts ok  center err 1.7e-07  inertia err 1.3e-09
+PASS  duplicate points d8 k64              tiles/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 5.1e-11
+PASS  duplicate points d8 k64              tiles/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 5.1e-11
+PASS  tiny n=7 d3 k5                       rows/blocks    wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 5.7e-09
+PASS  tiny n=7 d3 k5                       rows/sorted    wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 5.7e-09
+PASS  tiny n=7 d3 k5                       pairs/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 5.7e-09
+PASS  tiny n=7 d3 k5                       pairs/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 5.7e-09
+PASS  tiny n=7 d3 k5                       rows/atomic    wrong labels 0  (float32-level ties 0)  counts ok  center err 3.0e-08  inertia err 5.7e-09
+PASS  offset +1000 d8 k64                  rows/blocks    wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 1.0e-08
+PASS  offset +1000 d8 k64                  rows/sorted    wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 1.0e-08
+PASS  offset +1000 d8 k64                  pairs/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 1.0e-08
+PASS  offset +1000 d8 k64                  pairs/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 1.0e-08
+PASS  offset +1000 d8 k64                  rows/atomic    wrong labels 0  (float32-level ties 0)  counts ok  center err 6.5e-09  inertia err 1.0e-08
+PASS  offset +1000 d8 k64                  tiles/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 1.0e-08
+PASS  offset +1000 d8 k64                  tiles/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 1.0e-08
+PASS  uniform 0-255 d128 k1024             rows/blocks    wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 1.2e-09
+PASS  uniform 0-255 d128 k1024             rows/sorted    wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 1.2e-09
+PASS  uniform 0-255 d128 k1024             pairs/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 1.2e-09
+PASS  uniform 0-255 d128 k1024             pairs/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 1.2e-09
+PASS  uniform 0-255 d128 k1024             tiles/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 1.2e-09
+PASS  uniform 0-255 d128 k1024             tiles/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 0.0e+00  inertia err 1.2e-09
+PASS  high dims d960 k304                  rows/blocks    wrong labels 0  (float32-level ties 0)  counts ok  center err 8.2e-15  inertia err 1.0e-08
+PASS  high dims d960 k304                  rows/sorted    wrong labels 0  (float32-level ties 0)  counts ok  center err 1.8e-14  inertia err 1.0e-08
+PASS  high dims d960 k304                  pairs/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 8.2e-15  inertia err 1.0e-08
+PASS  high dims d960 k304                  pairs/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.8e-14  inertia err 1.0e-08
+PASS  high dims d960 k304                  tiles/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 8.2e-15  inertia err 1.0e-08
+PASS  high dims d960 k304                  tiles/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.8e-14  inertia err 1.0e-08
+PASS  overlapping d64 k256                 rows/blocks    wrong labels 0  (float32-level ties 0)  counts ok  center err 4.0e-14  inertia err 6.1e-10
+PASS  overlapping d64 k256                 rows/sorted    wrong labels 0  (float32-level ties 0)  counts ok  center err 1.1e-14  inertia err 6.1e-10
+PASS  overlapping d64 k256                 pairs/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 4.0e-14  inertia err 6.1e-10
+PASS  overlapping d64 k256                 pairs/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.1e-14  inertia err 6.1e-10
+PASS  overlapping d64 k256                 tiles/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 4.0e-14  inertia err 6.1e-10
+PASS  overlapping d64 k256                 tiles/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.1e-14  inertia err 6.1e-10
+PASS  zero rows + tail d64 k128            rows/blocks    wrong labels 0  (float32-level ties 0)  counts ok  center err 1.2e-14  inertia err 1.9e-10
+PASS  zero rows + tail d64 k128            rows/sorted    wrong labels 0  (float32-level ties 0)  counts ok  center err 4.2e-15  inertia err 1.9e-10
+PASS  zero rows + tail d64 k128            pairs/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.2e-14  inertia err 1.9e-10
+PASS  zero rows + tail d64 k128            pairs/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 4.2e-15  inertia err 1.9e-10
+PASS  zero rows + tail d64 k128            tiles/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.2e-14  inertia err 1.9e-10
+PASS  zero rows + tail d64 k128            tiles/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 4.2e-15  inertia err 1.9e-10
+PASS  many slices + chunks d16 k100        rows/blocks    wrong labels 0  (float32-level ties 0)  counts ok  center err 9.3e-15  inertia err 4.1e-11
+PASS  many slices + chunks d16 k100        rows/sorted    wrong labels 0  (float32-level ties 0)  counts ok  center err 1.2e-15  inertia err 4.1e-11
+PASS  many slices + chunks d16 k100        pairs/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 9.3e-15  inertia err 4.1e-11
+PASS  many slices + chunks d16 k100        pairs/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 1.2e-15  inertia err 4.1e-11
+PASS  many slices + chunks d16 k100        rows/atomic    wrong labels 0  (float32-level ties 0)  counts ok  center err 6.8e-09  inertia err 1.6e-10
+PASS  accumulation 20M rows +1000 d2 k4    rows/blocks    wrong labels 0  (float32-level ties 0)  counts ok  center err 2.6e-12  inertia err 1.9e-09
+PASS  accumulation 20M rows +1000 d2 k4    rows/sorted    wrong labels 0  (float32-level ties 0)  counts ok  center err 6.5e-10  inertia err 1.9e-09
+PASS  accumulation 20M rows +1000 d2 k4    pairs/blocks   wrong labels 0  (float32-level ties 0)  counts ok  center err 2.6e-12  inertia err 1.9e-09
+PASS  accumulation 20M rows +1000 d2 k4    pairs/sorted   wrong labels 0  (float32-level ties 0)  counts ok  center err 6.5e-10  inertia err 1.9e-09
+PASS  accumulation 20M rows +1000 d2 k4    rows/atomic    wrong labels 0  (float32-level ties 0)  counts ok  center err 8.2e-09  inertia err 5.0e-09
+PASS  relocation, 8 empty at once d16 k32                8 empty clusters relocated in 8 steps  center err vs float64 reference 8.1e-08
+PASS  relocation, 4 empty at once d50 k64                5 empty clusters relocated in 8 steps  center err vs float64 reference 8.1e-08
+PASS  relocation, 1 empty d12 k32 (+ scikit-learn)       1 empty clusters relocated in 8 steps  center err vs float64 reference 8.4e-08  vs scikit-learn 6.7e-07
+
+16/16 cases passed

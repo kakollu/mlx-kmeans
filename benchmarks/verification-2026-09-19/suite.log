@@ -1,0 +1,11 @@
+== geo-trips: 10,000,000 rows, 4 dims, k=256 (synthetic)
+   ours: kmeans.py metal            0.0113 s/pass (min 0.0113, max 0.0114)  inertia 3.921102e+07
+   scikit-learn lloyd (CPU)         0.2419 s/pass (min 0.2392, max 0.2435)  inertia 3.921101e+07
+   scikit-learn elkan (CPU)         0.3831 s/pass (min 0.3802, max 0.3842)  inertia 3.921101e+07
+   faiss (CPU)                      0.0662 s/pass (min 0.0655, max 0.0696)  inertia 3.921103e+07
+   fast-pytorch-kmeans (MPS GPU)    1.0915 s/pass (min 1.0828, max 1.0998)  inertia 3.921101e+07
+== satellite: 10,000,000 rows, 12 dims, k=32 (synthetic)
+   ours: kmeans.py metal            0.0097 s/pass (min 0.0095, max 0.0098)  inertia 1.200187e+08
+   scikit-learn lloyd (CPU)         0.0726 s/pass (min 0.0725, max 0.0727)  inertia 1.200187e+08
+   scikit-learn elkan (CPU)         0.0967 s/pass (min 0.0965, max 0.0979)  inertia 1.200187e+08
+   faiss (CPU)

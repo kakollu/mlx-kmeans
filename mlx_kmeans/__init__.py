@@ -14,6 +14,7 @@ from .core import (  # noqa: F401
 from .core import _accumulate, _gpu_pass, _kernel, _mx, _nearest, _u32  # noqa: F401  (used by tests/benchmarks)
 from .core import _ACCUMULATE_SRC, _KAHAN, _PAIRS_SRC, _ROWS_SRC, _SEGMENT_SRC  # noqa: F401
 from .estimator import KMeans  # noqa: F401
+from .files import cluster_file  # noqa: F401
 
 __version__ = "0.1.0"
-__all__ = ["KMeans", "kmeans", "lloyd_step", "assign_mlx", "kmeans_pp_init", "make_data_mlx"]
+__all__ = ["KMeans", "cluster_file", "kmeans", "lloyd_step", "assign_mlx", "kmeans_pp_init", "make_data_mlx"]

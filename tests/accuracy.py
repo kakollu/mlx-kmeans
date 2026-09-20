@@ -50,12 +50,16 @@ def reference(X, C, chunk_terms=20_000_000):
 
 
 def check(name, X, C, slice_rows=None, dist_bytes=None):
-    km.SLICE_ROWS = slice_rows or 100_000_000
+    km.core.SLICE_ROWS = slice_rows or 100_000_000
     if dist_bytes:
-        km.DIST_BYTES = dist_bytes
+        km.core.DIST_BYTES = dist_bytes
     mx = km._mx()
     per = km.slice_rows(X.shape[1])
     parts = [mx.array(X[s:s + per]) for s in range(0, len(X), per)]
+    if slice_rows:
+        assert per == slice_rows and len(parts) == (len(X) + per - 1) // per
+    if dist_bytes:
+        assert km.core.DIST_BYTES == dist_bytes
     ref_c, ref_d = reference(X, C)
     X64, C64 = X.astype(np.float64), C.astype(np.float64)
     ok = True
@@ -84,7 +88,7 @@ def check(name, X, C, slice_rows=None, dist_bytes=None):
         print(f"{'PASS' if passed else 'FAIL'}  {name:36s} {method + '/' + accumulate:13s}  wrong labels {bad}  "
               f"(float32-level ties {strict - bad})  counts {'ok' if np.array_equal(counts, ref_counts) else 'MISMATCH'}  "
               f"center err {center_err:.1e}  inertia err {inertia_err:.1e}")
-    km.SLICE_ROWS, km.DIST_BYTES = 100_000_000, 512 << 20
+    km.core.SLICE_ROWS, km.core.DIST_BYTES = 100_000_000, 512 << 20
     return ok
 
 

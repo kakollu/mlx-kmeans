@@ -1,0 +1,125 @@
+{
+  "environment": {
+    "chip": "Apple M5 Max",
+    "platform": "macOS-27.0-arm64-arm-64bit",
+    "python": "3.11.9 (v3.11.9:de54cf5be3, Apr  2 2024, 07:12:50) [Clang 13.0.0 (clang-1300.0.29.30)]",
+    "mlx": "0.32.2",
+    "power": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23855203)\t100%; discharging; 17:27 remaining present: true",
+    "power_settings": "Battery Power:\n powermode            0\n Sleep On Power Button 1\n standby              1\n ttyskeepawake        1\n hibernatemode        3\n powernap             0\n hibernatefile        /var/vm/sleepimage\n displaysleep         2\n womp                 0\n networkoversleep     0\n sleep                1\n lessbright           1\n tcpkeepalive         1\n disksleep            10\nAC Power:\n Sleep On Power Button 1\n powermode            0\n standby              1\n ttyskeepawake        1\n hibernatemode        3\n powernap             1\n hibernatefile        /var/vm/sleepimage\n womp                 1\n displaysleep         33\n networkoversleep     0\n sleep                0\n tcpkeepalive         1\n disksleep            10"
+  },
+  "plan": {
+    "rows": 5000000,
+    "memory_budget_bytes": 2147483648,
+    "estimated_working_bytes": 1868435456,
+    "input_bytes": 120000000,
+    "total_ram_bytes": 137438953472,
+    "available_ram_bytes": 85958639616,
+    "gpu_recommended_bytes": 115448725504
+  },
+  "download": {
+    "url": "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2015-01.parquet",
+    "bytes": 175325767,
+    "sha256": "7edf04b129dd8e751967e6e964fe1c72e104774dba154410374284c739af1fc7"
+  },
+  "rows": 5000000,
+  "scanned_rows": 5079040,
+  "selection": "first valid rows of January 2015, not a random or representative sample",
+  "features": [
+    "distance_miles",
+    "duration_minutes",
+    "fare_dollars",
+    "tip_percent",
+    "hour",
+    "passengers"
+  ],
+  "clusters": 8,
+  "seed": 0,
+  "iterations": 15,
+  "download_or_cache_check_s": 6.60977045801701,
+  "load_s": 0.47463491701637395,
+  "prepare_s": 0.16776562499580905,
+  "mlx_fit_including_labels_s": 0.19317225000122562,
+  "cluster_counts": [
+    1230041,
+    1255290,
+    149572,
+    216028,
+    320200,
+    903315,
+    305564,
+    619990
+  ],
+  "centroids_original_units": [
+    [
+      1.4418504418284959,
+      8.097452912568706,
+      7.648489766548705,
+      23.79534055717627,
+      16.78958342889221,
+      1.2509537041692644
+    ],
+    [
+      1.354638406605111,
+      7.977150712477902,
+      7.469316194171943,
+      0.4300715128518853,
+      15.346267301380045,
+      1.2772346979132299
+    ],
+    [
+      17.693019522161176,
+      39.15361970788221,
+      52.47963644606334,
+      12.11986694914974,
+      13.360205449768264,
+      1.7834356992185363
+    ],
+    [
+      2.2691237166345672,
+      10.866850343104566,
+      10.22997517437717,
+      10.555003615640373,
+      6.8069350851419905,
+      5.160561060237422
+    ],
+    [
+      8.781490545588698,
+      26.616507606038937,
+      28.849939876645085,
+      13.210954361909007,
+      10.736734532738321,
+      1.5774589244749018
+    ],
+    [
+      2.0480177577791028,
+      9.309165039895722,
+      9.223611131221816,
+      14.032676107826331,
+      4.43565828817707,
+      1.2388956142135494
+    ],
+    [
+      1.987353057981817,
+      10.23709431366647,
+      9.418164802149915,
+      11.902311352752854,
+      17.90464191944762,
+      5.097333947804257
+    ],
+    [
+      3.9622852658508556,
+      19.574603379046938,
+      16.500210977436446,
+      11.305994533339428,
+      16.067868264304018,
+      1.2748025870134063
+    ]
+  ],
+  "sklearn": {
+    "version": "1.9.0",
+    "fit_s": 1.3147299169795588,
+    "iterations": 40
+  },
+  "process_peak_rss_bytes": 1139621888,
+  "power_at_end": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23855203)\t100%; discharging; 17:27 remaining present: true"
+}

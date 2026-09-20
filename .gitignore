@@ -16,3 +16,6 @@ demos/taxi_page_data.json
 
 # informal research notes, not part of the package
 google_chat.txt
+
+# Results produced by the included CSV example
+examples/customers-clusters-*/

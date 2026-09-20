@@ -1,14 +1,28 @@
 # mlx-kmeans
 
-**Exact k-means on Apple Silicon GPUs.** Cluster 100M rows in seconds on a MacBook, using every row — no sampling,
-no cluster, no cloud. Same answers as scikit-learn, 2–8× faster from 1M rows up.
+**K-means clustering on Apple Silicon GPUs.** Cluster local CSV/Excel files or NumPy/MLX arrays, assign rows to
+groups, and export labels and cluster summaries. Every Lloyd iteration uses all input rows; initialization uses
+a subsample. Data stays on your Mac.
+
+Start with the [file guide](docs/USING_YOUR_FILES.md), [notebook](examples/cluster_your_file.ipynb), or
+[Python API](#api). On a 128 GB M5 Max, six measured workloads showed **2.2–8.1× faster passes** than the fastest
+tested comparator with matching final inertia. See [benchmark conditions and results](benchmarks/VERIFICATION-2026-09-19.md).
+
+For a local file, after installing `.[files]`:
+
+```bash
+python -m mlx_kmeans customers.csv                         # inspect column names
+python -m mlx_kmeans customers.csv --columns annual_spend orders visits --k 3 --nstart 10
+```
+
+A new results folder contains the original rows with cluster labels, group means in original units, and run
+settings. Features are standardized by default; IDs stay out unless explicitly selected. Files are not uploaded.
 
 ```bash
 pip install git+https://github.com/kakollu/mlx-kmeans.git
 ```
 
-(Not on PyPI yet — that one line installs it straight from this repository. While the repo is private, use
-`git+ssh://git@github.com/kakollu/mlx-kmeans.git` instead, with your GitHub SSH key set up.)
+(Not on PyPI yet — that one line installs it straight from this public repository.)
 
 ```python
 import numpy as np
@@ -26,12 +40,14 @@ Requires an Apple Silicon Mac (M1 or later) and Python 3.9+. That's the whole se
 
 ![Seconds per k-means pass versus the fastest public library](docs/speedup.svg)
 
+Figure: historical September 18 measurements. The table below contains the September 19 rerun.
+
 ---
 
-## For a class or a first run
+## Preparing your data
 
-If you have used `kmeans()` in R or scikit-learn in Python, this is the same algorithm with the same arguments and
-the same result — it just runs on the Mac's GPU. Three things worth knowing:
+This implements Lloyd's k-means with a Python API resembling scikit-learn's. Initialization, stopping criteria,
+and numerical details can produce different clusters. Three things worth knowing:
 
 **1. It wants float32.** Call `X.astype(np.float32)` before fitting; float64 arrays are converted anyway, at the
 cost of a copy.
@@ -49,56 +65,101 @@ centers = model.cluster_centers_ * X.std(0) + X.mean(0)      # back to real unit
 nearest each center. In the taxi demo below, two of eight segments turned out to differ by *payment method* rather
 than by behaviour: the meter only records a tip when the fare is paid by card.
 
-**Under ~100k rows, use scikit-learn instead.** A pass that small takes 1–2 ms and GPU dispatch dominates; we measure
-0.4–0.5× of scikit-learn there. This library is for 1M rows and up.
+**Small datasets may be faster with scikit-learn.** In the September 19 rerun, 100k rows × 32 features with 64
+clusters took 3.51 ms/pass here versus 1.59 ms for scikit-learn. A 100k × 8, k=8 case was roughly tied with FAISS.
+The crossover depends on shape, not just row count.
 
 ## What your Mac can handle
 
-Data must fit in memory as `rows × dims × 4` bytes, within roughly 70% of RAM:
+**Measured machine: 128 GB M5 Max MacBook Pro, on AC power.** The timings below apply to this machine.
 
-| Machine | 8 dims | 32 dims | 128 dims | 1536 dims (embeddings) |
-|---|---|---|---|---|
-| 16 GB Air | 350M rows | 88M | 22M | 1.8M |
-| 36 GB Pro | 790M | 200M | 49M | 4.1M |
-| 128 GB Max | 2.8B | 700M | 175M | 14M |
+**MacBook Air: planning estimates only; not benchmarked here.** A million transactions with 20 numeric features
+occupy 80 MB as float32; ten million occupy 800 MB. These are input sizes, not peak memory requirements or tested
+Air capacity limits. Loading tables, standardizing features, making copies, storing labels, and GPU workspace all
+need additional memory. Start with a representative subset on your Air and measure the complete workflow.
 
-Speed tracks GPU cores: an Air has roughly a quarter of an M5 Max's, so expect roughly a quarter of the speed — and a
-*larger* advantage over scikit-learn and FAISS, which lose CPU cores too. `python3 quick_bench.py` prints what your
-own machine does.
+No Air runtime or speedup is established by the M5 Max results. `python3 quick_bench.py` measures your own Mac;
+also time `.fit()` on your actual data, since per-pass timings exclude initialization and data preparation.
+
+### Run a simple benchmark on your MacBook Air
+
+```bash
+git clone https://github.com/kakollu/mlx-kmeans.git
+cd mlx-kmeans
+python3 -m venv .venv
+.venv/bin/python -m pip install '.[benchmark]'
+.venv/bin/python air_bench.py --plan
+.venv/bin/python air_bench.py --cleanup-after
+```
+
+The plan makes no network request and runs no clustering. The benchmark:
+
+- Chooses up to five million valid taxi transactions using installed RAM, currently available memory, and MLX's
+  recommended GPU working set. It budgets at most 25% of RAM, 40% of available memory, or 2 GiB, whichever is lower
+  (also limited to 25% of the GPU recommendation). These are conservative working-memory estimates, not guarantees.
+- Downloads **one January 2015 taxi file, about 167 MiB**, only after the memory check and a disk-space check.
+  It does not download SIFT, GIST, embeddings, or a whole year of taxi records. The complete compressed month is
+  stored on disk; only a RAM-sized prefix of valid rows is processed, in batches. This is a benchmark sample,
+  not a representative sample for business analysis.
+- Measures loading, feature preparation, and complete fitting with labels. It optionally compares scikit-learn's
+  complete fitting time; initialization and stopping differ, so this is not an equal-work kernel comparison.
+- Saves a timestamped JSON report in `benchmarks/local-*.json` with the actual chip, RAM, power settings, row count,
+  iterations and timings. This measures the Air itself rather than projecting from the M5 Max.
+
+Plug in power and close heavy apps for comparable results. You can lower the workload further:
+
+```bash
+.venv/bin/python air_bench.py --rows 1000000 --memory-mib 512 --cleanup-after
+```
+
+Omit `--cleanup-after` to retain the file for repeat runs; the cached file is integrity-checked before reuse.
+Clean it up later with `.venv/bin/python air_bench.py --cleanup`. Cleanup removes only this script's owned files
+under `data/air-benchmark/`, including incomplete downloads. It preserves reports, other datasets, the repository,
+and your virtual environment. `--no-compare` skips scikit-learn. The benchmark does not change your Mac's settings.
 
 ## Benchmarks
 
-Time for one k-means pass against the fastest public library **whose clustering matches ours** (scikit-learn 1.9,
-FAISS 1.15, fast-pytorch-kmeans on Metal), same data and same starting centers, on one M5 Max:
+September 19 AC-power rerun: time per pass against the fastest tested library whose **final inertia matches within
+0.01%** (not necessarily identical labels). Same data and starting centers; median of three five-iteration runs.
+Scikit-learn time is divided by six to credit its final assignment pass. Initialization is excluded.
+The first four workloads are synthetic shapes; SIFT and GIST are real datasets.
 
 | Problem | Shape | This library | Fastest public | Speedup |
 |---|---|---|---|---|
-| GPS / trip points | 10M × 4, k=256 | 9.9 ms | FAISS 66.1 ms | **6.7×** |
-| Satellite pixels | 10M × 12, k=32 | 9.3 ms | scikit-learn 71.1 ms | **7.7×** |
-| Log / feature vectors | 10M × 32, k=256 | 70.0 ms | scikit-learn 290.3 ms | **4.1×** |
-| Single-cell (after PCA) | 2M × 50, k=64 | 10.2 ms | scikit-learn 28.9 ms | **2.8×** |
-| SIFT1M vectors | 1M × 128, k=1024 | 54.0 ms | fast-pytorch-kmeans 174.6 ms | **3.2×** |
-| GIST1M vectors | 1M × 960, k=1024 | 289.9 ms | fast-pytorch-kmeans 608.1 ms | **2.1×** |
+| GPS / trip points | 10M × 4, k=256 | 10.68 ms | FAISS 71.32 ms | **6.7×** |
+| Satellite pixels | 10M × 12, k=32 | 9.58 ms | scikit-learn 77.62 ms | **8.1×** |
+| Log / feature vectors | 10M × 32, k=256 | 70.89 ms | scikit-learn 303.01 ms | **4.3×** |
+| Single-cell (after PCA) | 2M × 50, k=64 | 10.65 ms | scikit-learn 30.57 ms | **2.9×** |
+| SIFT1M vectors | 1M × 128, k=1024 | 57.61 ms | scikit-learn 193.27 ms | **3.4×** |
+| GIST1M vectors | 1M × 960, k=1024 | 313.47 ms | fast-pytorch-kmeans 697.57 ms | **2.2×** |
 
-A 12-shape sweep (100k–10M rows, 4–960 dims, k 8–8192) gives 2.5–7.8× from 1M rows up, and losses below ~100k.
+A historical 12-shape sweep is recorded in `benchmarks/NOTES.md`; it was not repeated in full on September 19.
 
 ![Time per pass as the data grows](docs/scaling.svg)
 
-**End to end matters more than per pass.** Training an IVF quantiser on SIFT1M (1M × 128, k=1024) — wall clock to a
-finished set of centroids, with recall measured against the ground truth that ships with the dataset:
+Historical scaling measurements; not rerun on September 19.
 
-| Method | Train | Clustering quality | recall@10 |
+**Complete training matters more than per pass.** September 19–20 SIFT1M rerun (1M × 128, k=1024), three seeds per
+method. Times include initialization and training, but exclude loading, input conversion, and final label/index
+construction. Methods use different initialization and stopping settings; see the verification report.
+
+| Method | Median train time | Observed train range | recall@10 range, nprobe=8 |
 |---|---|---|---|
-| **This library, all rows** | **2.1 s** | **best** | **84.9%** |
-| FAISS default (trains on a 262k sample) | 5.0 s | 1.0% worse | 84.2% |
-| scikit-learn MiniBatchKMeans | 9.7 s | 1.3% worse | 83.9% |
-| FAISS, all rows | 18.1 s | 0.2% worse | 84.5% |
-| scikit-learn, all rows | 163.7 s | 0.1% worse | 84.8% |
+| **This library, all rows (core training)** | **2.50 s** | 2.46–2.59 s | 84.82–84.89% |
+| FAISS default (trains on a 262k sample) | 4.96 s | 4.93–5.08 s | 84.15–84.22% |
+| scikit-learn MiniBatchKMeans | 12.88 s | 10.92–13.30 s | 83.51–84.09% |
+| FAISS, all rows | 18.46 s | 18.23–18.49 s | 84.45–84.67% |
+| scikit-learn, all rows | 181.70 s | 181.35–187.07 s | 84.70–84.96% |
 
-At 100M × 32, k=1024 the gap widens: **12 s here** against 270 s (scikit-learn) and 532 s (FAISS), and those two land
-3.4–3.9× worse because at that size they fall back to random seeding within a fixed iteration budget.
-MiniBatchKMeans did not finish in 84 minutes. At 1B × 8: 32 GB of data, 1.6 s of clustering, reaching the theoretical
-optimum.
+Full-data quality is similar; these runs do not establish universal quality superiority. The billion-row CLI
+regression also completed: 1B × 8 synthetic rows, k=16, 0.7 s generation and 1.7 s training on this M5 Max.
+That CLI generates input directly on the GPU and does not return final labels.
+
+Historical synthetic 100M × 32, k=1024 runs recorded approximately 12 s here, 270 s for scikit-learn, and 532 s
+for FAISS. These are different training configurations: the harness explicitly chose random initialization for
+scikit-learn above 20M rows and capped competitors at 25 iterations. Their 3.4–3.9× higher inertia does not
+establish an inherent library quality disadvantage. These large competitor runs were not repeated on September 19.
+The historical 84-minute MiniBatchKMeans run was stopped without finishing.
 
 ### Check the numbers yourself
 
@@ -108,25 +169,26 @@ python3 -m venv --system-site-packages .venv
 .venv/bin/pip install . scikit-learn faiss-cpu torch fast-pytorch-kmeans
 python3 scripts/get_data.py sift gist      # public benchmark sets, no account needed
 .venv/bin/python bench.py --suite          # regenerates BENCHMARKS.md
-python3 tests/accuracy.py                  # 16 correctness cases against float64
+.venv/bin/python tests/accuracy.py         # 16 correctness cases against float64
 ```
 
 Every table in `BENCHMARKS.md` is generated from `benchmarks/results.jsonl`, which records the machine, the git
-commit, CPU load during each timing and every raw measurement. A public library whose final inertia differs from ours
+commit, sampled background CPU load, and median/minimum/maximum timings. A public library whose final inertia differs from ours
 by more than 0.01% is marked *different work* and excluded, rather than quietly counted as a win.
 
 ## Where the speed comes from
 
-Not from approximating: every point goes to the center with the smallest float32 distance, verified against a float64
-reference. The gains are in how the work is laid out on the GPU.
+The assignment kernels evaluate nearest centers in float32, with finite-case validation against a float64
+reference. The gains are in how the work is laid out on the GPU. The optimization comparisons below are historical
+experiments recorded in `benchmarks/NOTES.md`, not fresh ablations in the September 19 verification.
 
 | Change | Effect |
 |---|---|
 | **One GPU thread per row** instead of one per 4,096-row block | 9–43× at large k × dims. GPUs run threads in lockstep, and a thread looping over thousands of rows throws that away. |
 | **Cache-local cluster totals** (rows sorted by cluster, summed in small blocks) | GIST1M totals: 4.16 s → 0.053 s. That step had been 89% of a pass. |
-| **Metal SIMD-group matrix instructions** for distances | 3× at high dims, and IEEE-accurate — unlike the Neural Accelerator matmul behind MLX's `@` and PyTorch MPS, which is exact on integers but drifts ~12,000× float32 epsilon on real data. |
+| **Metal SIMD-group matrix instructions** for distances | Historical high-dimensional experiments measured a ~3× gain. The default path refines candidate distances directly; the notes describe precision problems observed with the tested alternative matmul paths. |
 | **Greedy k-means++ seeding on the GPU** | Initialization 18.1 s → 0.2 s at k=1024, and roughly 10× fewer iterations to converge. |
-| **Unified memory** | 32 GB of data with no host-to-GPU copy, which is why sampling stops being necessary here. |
+| **GPU-generated input** | The billion-row CLI creates data on the GPU, avoiding a NumPy input copy. NumPy input through the public API can require additional storage. |
 
 `benchmarks/NOTES.md` is the full record, including what *didn't* work: cache tiling (1.4×, so cache misses weren't
 the cause), branch-free argmin (no effect), triangle-inequality pruning (78% of centers survive at 960 dims), and a
@@ -134,19 +196,29 @@ matmul hybrid abandoned on precision grounds.
 
 ## Accuracy
 
-`tests/accuracy.py` checks, for every combination of code paths: each point's label against a float64 reference
-(exact, up to float32 resolution), cluster centers against float64 accumulation (~1e-13 relative), and empty-cluster
-relocation step by step against scikit-learn's own implementation. Cases include overlapping clusters, duplicate
-points, duplicate centers, k larger than the number of true clusters, 960 dimensions, large coordinate offsets, and
-data split across several GPU buffers. 16/16 pass.
+`tests/accuracy.py` compares assignment paths and deterministic accumulation paths against a float64 reference;
+it also tests rows/atomic accumulation where supported. Labels must be optimal within the stated float32-scale
+tolerance; center and inertia errors must be within 1e-6 under the suite's metrics. Empty-cluster relocation is
+checked against an independent reference, with one case also checked against scikit-learn. The multi-buffer
+test's configuration wiring was repaired on September 19. These finite tests are evidence, not a proof for all inputs.
+The repaired suite passed **16/16 cases** on the measured M5 Max; the verification directory contains the full log.
 
 ## Demos on real public data
+
+**Fresh business-workflow measurement:** January 2015 NYC taxi transactions, 12.59M retained rows × 6 features,
+eight clusters: **0.134 s for public `KMeans.fit`, including labels**, and **1.414 s including local file loading,
+filtering, feature construction and standardization**. This single M5 Max run excludes downloads, imports and
+report generation; file-cache state was not controlled. See the verification report for stage timings. It is not
+a MacBook Air projection.
 
 ```bash
 python3 scripts/get_data.py taxi && .venv/bin/python demos/taxi_segments.py --k 8 --months 8
 ```
 
-| Demo | Data | Clustered in |
+Historical demo measurements below exclude data loading and preparation and predate the API's eager label
+calculation. They should not be read as current complete workflow timings.
+
+| Demo | Data | Historical clustering time |
 |---|---|---|
 | `demos/taxi_segments.py` | 98.5M NYC taxi trips (TLC, 2015) | 0.67 s |
 | `demos/satellite_landcover.py` | 96M Sentinel-2 pixels over New York | 0.70 s |
@@ -155,9 +227,14 @@ python3 scripts/get_data.py taxi && .venv/bin/python demos/taxi_segments.py --k 
 ![Unsupervised land cover from one Sentinel-2 scene](docs/landcover.png)
 
 Land cover from 96M pixels with no labels at all: three vegetation densities, two water classes, built-up and bare
-ground, each identifiable from its own vegetation and water index. 0.7 seconds on a laptop.
+ground, interpreted using vegetation and water indices. These are unsupervised interpretations, not validated
+land-cover classifications.
 
 ## API
+
+The file workflow is a convenience layer. You can continue to control data preparation, seeding, iteration counts,
+restarts, and array placement directly through the API; see `mlx_kmeans/core.py` for individual Lloyd passes and
+the Metal kernels. Benchmark initialization, full fitting, and individual passes separately when assessing gains.
 
 ```python
 KMeans(n_clusters=8, n_init=1, max_iter=300, tol=1e-4, random_state=None,
@@ -168,7 +245,8 @@ KMeans(n_clusters=8, n_init=1, max_iter=300, tol=1e-4, random_state=None,
 ```
 
 `X` is anything array-like — NumPy array, pandas DataFrame, list of rows — or a list of MLX arrays for data larger
-than one GPU buffer. Empty clusters are relocated exactly as scikit-learn does.
+than one GPU buffer. Empty-cluster relocation follows scikit-learn's approach, but pairing order can differ when
+several clusters are empty.
 
 **Picking k.** Passes are cheap enough to sweep instead of guess:
 
@@ -178,7 +256,8 @@ for k in range(2, 21):
 ```
 
 **Restarts.** `n_init=10` runs ten starts and keeps the best; the data stays on the GPU between them, so ten starts
-cost roughly ten passes, not ten uploads. Worth it — on clustered data the worst start can be 2× worse than the best.
+cost roughly ten complete training runs, including initialization and each run's iterations. Different starts can
+reach different local minima.
 
 **Embeddings.** `spherical=True` re-normalises centers each iteration, which is the right objective for L2-normalised
 vectors compared by cosine similarity (what FAISS calls `spherical=True`).

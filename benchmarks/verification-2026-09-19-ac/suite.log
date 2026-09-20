@@ -1,0 +1,48 @@
+== geo-trips: 10,000,000 rows, 4 dims, k=256 (synthetic)
+   ours: kmeans.py metal            0.0107 s/pass (min 0.0106, max 0.0107)  inertia 3.921102e+07
+   scikit-learn lloyd (CPU)         0.2439 s/pass (min 0.2438, max 0.2501)  inertia 3.921101e+07
+   scikit-learn elkan (CPU)         0.4095 s/pass (min 0.4081, max 0.4153)  inertia 3.921102e+07
+   faiss (CPU)                      0.0713 s/pass (min 0.0699, max 0.0719)  inertia 3.921103e+07
+   fast-pytorch-kmeans (MPS GPU)    1.0864 s/pass (min 1.0739, max 1.1199)  inertia 3.921101e+07
+== satellite: 10,000,000 rows, 12 dims, k=32 (synthetic)
+   ours: kmeans.py metal            0.0096 s/pass (min 0.0094, max 0.0098)  inertia 1.200187e+08
+   scikit-learn lloyd (CPU)         0.0776 s/pass (min 0.0766, max 0.0789)  inertia 1.200187e+08
+   scikit-learn elkan (CPU)         0.1012 s/pass (min 0.1010, max 0.1016)  inertia 1.200187e+08
+   faiss (CPU)                      0.1300 s/pass (min 0.1298, max 0.1323)  inertia 1.200187e+08
+   fast-pytorch-kmeans (MPS GPU)    0.2716 s/pass (min 0.1100, max 0.2720)  inertia 1.200187e+08
+== logs: 10,000,000 rows, 32 dims, k=256 (synthetic)
+   ours: kmeans.py metal            0.0709 s/pass (min 0.0709, max 0.0711)  inertia 3.379386e+08
+   scikit-learn lloyd (CPU)         0.3030 s/pass (min 0.3023, max 0.3139)  inertia 3.379386e+08
+   scikit-learn elkan (CPU)         0.4475 s/pass (min 0.4425, max 0.4510)  inertia 3.379386e+08
+   faiss (CPU)                      1.4175 s/pass (min 1.4155, max 1.4193)  inertia 3.379386e+08
+   fast-pytorch-kmeans (MPS GPU)    FAILED RuntimeError: MPS backend out of memory (MPS allocated: 25.48 GiB, other allocations: 2.41 GiB, max allowed: 32.26 GiB). Tried to allocate 9.75 GiB on shared pool. Use PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 to disabl
+== single-cell: 2,000,000 rows, 50 dims, k=64 (synthetic)
+   ours: kmeans.py metal            0.0106 s/pass (min 0.0106, max 0.0109)  inertia 9.996670e+07
+   scikit-learn lloyd (CPU)         0.0306 s/pass (min 0.0305, max 0.0308)  inertia 9.996670e+07
+   scikit-learn elkan (CPU)         0.0501 s/pass (min 0.0461, max 0.0515)  inertia 9.996670e+07
+   faiss (CPU)                      0.0498 s/pass (min 0.0483, max 0.0508)  inertia 9.996670e+07
+   fast-pytorch-kmeans (MPS GPU)    0.0345 s/pass (min 0.0344, max 0.0351)  inertia 9.996670e+07
+== sift-k1024: 1,000,000 rows, 128 dims, k=1024 (sift)
+   ours: kmeans.py metal            0.0576 s/pass (min 0.0576, max 0.0579)  inertia 5.112253e+10
+   scikit-learn lloyd (CPU)         0.1933 s/pass (min 0.1918, max 0.1942)  inertia 5.112257e+10
+   scikit-learn elkan (CPU)         0.5651 s/pass (min 0.5545, max 0.5724)  inertia 5.112254e+10
+   faiss (CPU)                      0.7522 s/pass (min 0.7488, max 0.7544)  inertia 5.112251e+10
+   fast-pytorch-kmeans (MPS GPU)    0.1981 s/pass (min 0.1970, max 0.2153)  inertia 5.112252e+10
+== gist-k1024: 1,000,000 rows, 960 dims, k=1024 (gist)
+   ours: kmeans.py metal            0.3135 s/pass (min 0.3091, max 0.3185)  inertia 1.123837e+06
+   scikit-learn lloyd (CPU)         1.0826 s/pass (min 1.0816, max 1.1139)  inertia 1.123836e+06
+   scikit-learn elkan (CPU)         3.3791 s/pass (min 3.2191, max 3.5358)  inertia 1.123837e+06
+   faiss (CPU)                      1.6911 s/pass (min 1.6905, max 1.6915)  inertia 1.123838e+06
+   fast-pytorch-kmeans (MPS GPU)    0.6976 s/pass (min 0.6932, max 0.7054)  inertia 1.123838e+06
+== small-8: 100,000 rows, 8 dims, k=8 (synthetic)
+   ours: kmeans.py metal            0.0009 s/pass (min 0.0007, max 0.0011)  inertia 8.002630e+05
+   scikit-learn lloyd (CPU)         0.0011 s/pass (min 0.0010, max 0.0011)  inertia 8.002630e+05
+   scikit-learn elkan (CPU)         0.0017 s/pass (min 0.0016, max 0.0018)  inertia 8.002630e+05
+   faiss (CPU)                      0.0010 s/pass (min 0.0010, max 0.0010)  inertia 8.002630e+05
+   fast-pytorch-kmeans (MPS GPU)    0.0034 s/pass (min 0.0026, max 0.0039)  inertia 8.002630e+05
+== small-32: 100,000 rows, 32 dims, k=64 (synthetic)
+   ours: kmeans.py metal            0.0035 s/pass (min 0.0027, max 0.0035)  inertia 3.197940e+06
+   scikit-learn lloyd (CPU)         0.0016 s/pass (min 0.0015, max 0.0016)  inertia 3.197940e+06
+   scikit-learn elkan (CPU)         0.0030 s/pass (min 0.0029, max 0.0030)  inertia 3.197940e+06
+   faiss (CPU)                      0.0035 s/pass (min 0.0035, max 0.0035)  inertia 3.197940e+06
+   fast-pytorch-kmeans (MPS GPU)    0.0046 s/pass (min 0.0037, max 0.0046)  inertia 3.197940e+06
