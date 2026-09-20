@@ -130,8 +130,12 @@ def kmeans_pp_init(parts, rows, k, rng, sample=None):
     200k-row sample costs 2.2 s and a 20k-row one 0.4 s, with final inertia differing by <0.03% on SIFT1M and GIST1M
     (on synthetic blobs the run-to-run spread from local minima, 10-30%, dwarfs any difference).
 
-    The k sequential rounds run on the GPU with only the chosen row index crossing back each round; doing them in
-    NumPy costs ~10 s at k=1024 (and is why scikit-learn's own k-means++ takes minutes on SIFT1M).
+    The k sequential rounds run entirely on the GPU, and nothing crosses back to the host until the last one:
+    each round's work is small, so forcing a sync per round made seeding latency-bound rather than work-bound
+    (k round trips at ~0.14 ms each - 16 ms of a 19 ms fit at k=64 on 1k rows). Leaving the rounds lazy lets MLX
+    pipeline them for the same centers bit for bit, 2-4x faster, at a bounded ~90 MB of extra working memory.
+    Doing the rounds in NumPy instead costs ~10 s at k=1024 (and is why scikit-learn's own k-means++ takes
+    minutes on SIFT1M); it only wins below a few thousand sample rows, which is not worth a second code path.
     """
     mx = _mx()
     if sample is None:
@@ -155,7 +159,6 @@ def kmeans_pp_init(parts, rows, k, rng, sample=None):
         best = mx.argmin(mins.sum(0))                      # candidate that lowers total d2 the most
         d2 = mins[:, best]
         picks.append(cand[best][None])
-        mx.eval(d2, picks[-1])
     return np.array(S[mx.concatenate(picks)], dtype=np.float32)
 
 
