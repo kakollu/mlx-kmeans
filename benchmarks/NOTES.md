@@ -214,6 +214,9 @@ before that change took 8 iterations and finished at 1.271e10, 59% worse.
 
 ## Small-data losses are latency, not arithmetic (September 20, 2026)
 
+Measured on battery power, not the AC conditions the September 19 suite used. The mechanism and the
+ratios are what matter here and both are robust to that; the absolute times are an upper bound.
+
 Prompted by a 10k-row smoke test where scikit-learn finished a complete fit in 33 ms against our 95 ms. A single
 case is noise; the question was whether a fixed per-call cost existed, since that compounds when a caller clusters
 many small datasets in a loop. Two fixed costs were found, both round-trip latency rather than work.
@@ -222,8 +225,9 @@ many small datasets in a loop. Two fixed costs were found, both round-trip laten
 as for 3M (16-26 ms), and cutting the sample tenfold at fixed k=64 moved it from 13.9 ms to 14.3 ms, i.e. not at
 all. Against a measured bare MLX round trip of 142 us, the cost was one round trip per cluster. The `mx.eval` per
 round was removed; MLX then pipelines the rounds. Seeding is 2-4x faster (k=256 on 1M rows: 60 -> 14 ms; k=1024 on
-GIST-shaped data: 0.49 -> 0.26 s) and complete fits 1.1-1.9x faster, for a bounded ~90 MB of extra working memory
-that does not grow with k. Centers are bit-identical across 5 shapes x 3 seeds at k=8..1024, since only the timing
+GIST-shaped data: 0.49 -> 0.26 s), for a bounded ~90 MB of extra working memory that does not grow with k. The
+saving is a fixed few tens of ms per fit, so complete fits measured 1.1-1.9x faster between 1k and 100k rows and
+the gain fades to a few percent at millions of rows - at SIFT1M's ~2.5 s training the 0.23 s saved is ~1.1x. Centers are bit-identical across 5 shapes x 3 seeds at k=8..1024, since only the timing
 of evaluation changed.
 
 Two alternatives were measured and rejected: running the rounds in NumPy on the host wins only below a few

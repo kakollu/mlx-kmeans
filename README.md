@@ -69,12 +69,14 @@ than by behaviour: the meter only records a tip when the fare is paid by card.
 clusters took 3.51 ms/pass here versus 1.59 ms for scikit-learn. A 100k × 8, k=8 case was roughly tied with FAISS.
 The crossover depends on shape, not just row count.
 
-The reason is latency, not arithmetic. A GPU round trip costs about 0.14 ms on this machine, and a Lloyd pass
+The reason is latency, not arithmetic (measured September 20 on battery power). A GPU round trip costs about
+0.14 ms on this machine, and a Lloyd pass
 here spends roughly 0.9 ms on fixed per-pass cost before it touches any data — crossing back to the host for the
 float64 center update and the convergence check. That floor is flat in row count, so it is invisible at 10M rows
 and decisive at 10k. Work only overtakes it above roughly 300k rows at 32 features, after which a pass grows at
-about 2 ns per row. Seeding used to add a second, larger fixed cost of one round trip per cluster; that one is
-fixed (see *Where the speed comes from*), but the per-pass floor remains. **If you cluster many small datasets in
+about 2 ns per row. Seeding used to add a second fixed cost of one round trip per cluster — the larger of the two
+at high k, the smaller at low k, where a few iterations of the pass floor outweigh it — and that one is now
+removed (see *Where the speed comes from*). The per-pass floor remains. **If you cluster many small datasets in
 a loop, you pay this floor on every iteration — measure before assuming the GPU helps.**
 
 ## What your Mac can handle
@@ -207,7 +209,7 @@ experiments recorded in `benchmarks/NOTES.md`, not fresh ablations in the Septem
 | **Cache-local cluster totals** (rows sorted by cluster, summed in small blocks) | GIST1M totals: 4.16 s → 0.053 s. That step had been 89% of a pass. |
 | **Metal SIMD-group matrix instructions** for distances | Historical high-dimensional experiments measured a ~3× gain. The default path refines candidate distances directly; the notes describe precision problems observed with the tested alternative matmul paths. |
 | **Greedy k-means++ seeding on the GPU** | Initialization 18.1 s → 0.2 s at k=1024, and roughly 10× fewer iterations to converge. |
-| **Seeding without a host sync per round** | Each of the k rounds does little work, so waiting for it made seeding cost k GPU round trips regardless of data size — 16 ms of a 19 ms fit at k=64 on 1k rows. Leaving the rounds unevaluated lets MLX pipeline them: 2–4× faster seeding, complete fits 1.1–1.9× faster, and the centers are bit-identical across k=8–1024 because only the timing of evaluation changed. |
+| **Seeding without a host sync per round** | Each of the k rounds does little work, so waiting for it made seeding cost k GPU round trips regardless of data size — 16 ms of a 19 ms fit at k=64 on 1k rows. Leaving the rounds unevaluated lets MLX pipeline them: 2–4× faster seeding, and the centers are bit-identical across k=8–1024 because only the timing of evaluation changed. What it saves is a fixed few tens of milliseconds per fit, so complete fits measured 1.1–1.9× faster between 1k and 100k rows and the gain fades to a few percent at millions of rows, where the fit is long enough that seeding was never the problem. |
 | **GPU-generated input** | The billion-row CLI creates data on the GPU, avoiding a NumPy input copy. NumPy input through the public API can require additional storage. |
 
 `benchmarks/NOTES.md` is the full record, including what *didn't* work: cache tiling (1.4×, so cache misses weren't
@@ -251,7 +253,8 @@ ground, interpreted using vegetation and water indices. These are unsupervised i
 land-cover classifications.
 
 Measured on September 20 with the complete current API, labels included: **95,992,216 pixels × 6 features into 8
-classes in 0.9 s**, 16 iterations. Reading the four band files took 5.8 s — clustering the whole scene is now six
+classes in 0.9 s**, 16 iterations. *These September 20 figures were taken on battery power, unlike the AC-power
+suite above; treat the ratios as sound and the absolute times as a floor, since battery runs are not faster.* Reading the four band files took 5.8 s — clustering the whole scene is now six
 times quicker than loading it, which is the point at which the algorithm stops being what limits you. On a matched
 10M-pixel slice, scikit-learn took 2.5 s against 0.12 s here. Reproduce with:
 
