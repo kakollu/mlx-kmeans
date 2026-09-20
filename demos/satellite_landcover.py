@@ -49,11 +49,25 @@ def load():
     return feats, valid, shape, time.perf_counter() - t
 
 
-def colour_for(center):
-    """A plausible colour for a class from its own reflectance, so the map reads like the ground."""
-    b, g, r = center[0], center[1], center[2]
-    scale = 3.2 / max(b + g + r, 1e-6)
-    return [int(np.clip(v * scale * 255, 0, 255)) for v in (r, g, b)]
+# A land-cover map is read, not admired: colour carries the class, so the ramps are the conventional ones
+# (water blue, vegetation green, bare tan, built-up red-grey) and each kind darkens with the index that defines
+# it. Colouring each class by its own mean reflectance instead - the obvious thing - washes the map out to pastel,
+# because averaging a cluster of real pixels lands near mid-grey whatever the cover type is.
+RAMPS = {"water": [(24, 68, 130), (72, 132, 190), (140, 186, 224)],
+         "dense vegetation": [(16, 74, 34), (30, 110, 48), (58, 145, 70)],
+         "vegetation": [(104, 170, 74), (140, 192, 96)],
+         "bare / low vegetation": [(186, 170, 110), (214, 200, 148)],
+         "built-up / paved": [(158, 66, 58), (196, 118, 104)]}
+
+
+def assign_colours(classes):
+    """Darkest step of a kind's ramp to its most extreme member, so the map ranks within a kind as well as across."""
+    for kind, ramp in RAMPS.items():
+        members = [c for c in classes if c["kind"] == kind]
+        key = (lambda c: -c["ndwi"]) if kind == "water" else (lambda c: -c["ndvi"])
+        for rank, c in enumerate(sorted(members, key=key)):
+            c["colour"] = list(ramp[min(rank, len(ramp) - 1)])
+    return classes
 
 
 def main():
@@ -79,7 +93,8 @@ def main():
                 else "bare / low vegetation" if ndvi > 0.15 else "built-up / paved")
         classes.append(dict(id=int(i), pixels=int(counts[i]), share=float(counts[i] / len(labels)),
                             km2=float(counts[i] * 100 / 1e6), ndvi=float(ndvi), ndwi=float(ndwi),
-                            brightness=float(centers[i][:3].mean()), kind=kind, colour=colour_for(centers[i])))
+                            brightness=float(centers[i][:3].mean()), kind=kind))
+    assign_colours(classes)
     classes.sort(key=lambda c: -c["pixels"])
 
     # classified image, downsampled so the page stays small

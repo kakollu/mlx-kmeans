@@ -250,6 +250,21 @@ Land cover from 96M pixels with no labels at all: three vegetation densities, tw
 ground, interpreted using vegetation and water indices. These are unsupervised interpretations, not validated
 land-cover classifications.
 
+Measured on September 20 with the complete current API, labels included: **95,992,216 pixels × 6 features into 8
+classes in 0.9 s**, 16 iterations. Reading the four band files took 5.8 s — clustering the whole scene is now six
+times quicker than loading it, which is the point at which the algorithm stops being what limits you. On a matched
+10M-pixel slice, scikit-learn took 2.5 s against 0.12 s here. Reproduce with:
+
+```bash
+.venv/bin/python scripts/get_data.py sentinel
+.venv/bin/python demos/satellite_landcover.py --k 8 --compare
+```
+
+Nothing in the run knows what a city or a river is. The separation of Manhattan and the outer boroughs from the
+Hudson Valley forest is the clustering finding it in six numbers per pixel. The names in the legend are assigned
+afterwards from each cluster's own NDVI and NDWI, and the three vegetation classes split by canopy density rather
+than by species — k=8 is a choice, and a different k tells a different story, so vary it before drawing conclusions.
+
 ## API
 
 The file workflow is a convenience layer. You can continue to control data preparation, seeding, iteration counts,

@@ -121,17 +121,54 @@ def fig_scaling():
 
 
 def fig_landcover():
-    """Downsample the classified Sentinel-2 scene for the README."""
-    src = ROOT / "demos/satellite_classes.png"
-    if not src.exists():
+    """Classified Sentinel-2 scene beside a legend, so the colours can be read without the JSON."""
+    src, res = ROOT / "demos/satellite_classes.png", ROOT / "demos/satellite_results.json"
+    if not (src.exists() and res.exists()):
         return False
     try:
-        from PIL import Image
+        from PIL import Image, ImageDraw, ImageFont
     except ImportError:
         return False
-    im = Image.open(src)
-    im.thumbnail((900, 900))
-    im.save(DOCS / "landcover.png", optimize=True)
+    d = json.loads(res.read_text())
+    im = Image.open(src).convert("RGB")
+    im.thumbnail((820, 820))
+
+    def font(size, bold=False):
+        for p in ["/System/Library/Fonts/Supplemental/Helvetica.ttc", "/System/Library/Fonts/Helvetica.ttc"]:
+            try:
+                return ImageFont.truetype(p, size, index=1 if bold else 0)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    pad, legend_w, head = 22, 320, 92
+    W, H = im.width + legend_w + pad * 3, max(im.height, 430) + head + pad * 2
+    fig = Image.new("RGB", (W, H), PAPER)
+    draw = ImageDraw.Draw(fig)
+    draw.text((pad, pad), "Land cover of the New York scene, found without labels", INK, font=font(22, True))
+    draw.text((pad, pad + 32),
+              f'Sentinel-2, 10 m pixels · {d["pixels"]:,} pixels × {d["dims"]} features clustered into '
+              f'{d["k"]} classes in {d["fit_s"]:.1f} s', INK3, font=font(14))
+    draw.text((pad, pad + 54), f'{d["machine"]} · k-means assigns every pixel; the names below are read off each '
+              f"cluster's own NDVI and NDWI", INK3, font=font(14))
+    fig.paste(im, (pad, head + pad))
+
+    x, y = pad * 2 + im.width, head + pad + 4
+    draw.text((x, y), "CLASSES BY AREA", INK2, font=font(12, True))
+    y += 26
+    for c in d["classes"]:
+        draw.rounded_rectangle([x, y, x + 26, y + 26], 4, fill=tuple(c["colour"]))
+        draw.text((x + 38, y - 1), f'{c["share"]*100:.1f}%   {c["km2"]:,.0f} km²', INK, font=font(14, True))
+        draw.text((x + 38, y + 15), f'{c["kind"]}  ·  NDVI {c["ndvi"]:+.2f}', INK3, font=font(11))
+        y += 38
+    y += 6
+    veg = sum(c["share"] for c in d["classes"] if "vegetation" in c["kind"])
+    built = sum(c["share"] for c in d["classes"] if "built" in c["kind"])
+    draw.line([x, y, x + legend_w - pad, y], fill=RULE, width=1)
+    draw.text((x, y + 12), f"{veg*100:.0f}% vegetated, {built*100:.0f}% built-up", INK, font=font(14, True))
+    draw.text((x, y + 32), "Three vegetation classes separate by", INK3, font=font(11))
+    draw.text((x, y + 46), "canopy density, not by species.", INK3, font=font(11))
+    fig.save(DOCS / "landcover.png", optimize=True)
     return True
 
 
