@@ -88,11 +88,15 @@ git clone https://github.com/kakollu/mlx-kmeans.git
 cd mlx-kmeans
 python3 -m venv .venv
 .venv/bin/python -m pip install '.[benchmark]'
-.venv/bin/python air_bench.py --plan
 .venv/bin/python air_bench.py --cleanup-after
 ```
 
-The plan makes no network request and runs no clustering. The benchmark:
+**The last command runs the benchmark.** It prints both complete clustering times in one table, states which
+finished faster, and compares clustering error on the same data. An MLX loss is reported as a loss.
+The result is specific to your machine and this workload; an M5 Max advantage does not imply an Air advantage.
+
+Optional: `air_bench.py --plan` only previews the memory budget; it does **not** run anything. Power and memory
+details are saved in the report; add `--details` to also print them. The benchmark:
 
 - Chooses up to five million valid taxi transactions using installed RAM, currently available memory, and MLX's
   recommended GPU working set. It budgets at most 25% of RAM, 40% of available memory, or 2 GiB, whichever is lower
@@ -101,8 +105,10 @@ The plan makes no network request and runs no clustering. The benchmark:
   It does not download SIFT, GIST, embeddings, or a whole year of taxi records. The complete compressed month is
   stored on disk; only a RAM-sized prefix of valid rows is processed, in batches. This is a benchmark sample,
   not a representative sample for business analysis.
-- Measures loading, feature preparation, and complete fitting with labels. It optionally compares scikit-learn's
-  complete fitting time; initialization and stopping differ, so this is not an equal-work kernel comparison.
+- Measures loading, feature preparation, and complete fitting with labels. Both methods receive the **same rows
+  and features**. Their own initialization and stopping rules are included in the complete fitting time, so different
+  iteration counts are expected. This answers which finished sooner for this run. Clustering error is calculated
+  for both with the same float64 metric outside the timing; lower is better.
 - Saves a timestamped JSON report in `benchmarks/local-*.json` with the actual chip, RAM, power settings, row count,
   iterations and timings. This measures the Air itself rather than projecting from the M5 Max.
 
@@ -111,6 +117,11 @@ Plug in power and close heavy apps for comparable results. You can lower the wor
 ```bash
 .venv/bin/python air_bench.py --rows 1000000 --memory-mib 512 --cleanup-after
 ```
+
+For an additional controlled check, run `.venv/bin/python air_bench.py --controlled --cleanup-after`.
+This also compares **one Lloyd update plus final labels from identical starting centers**, using the median of three
+warmed runs in alternating order. It excludes initialization and GPU input conversion and includes scikit-learn's
+internal fit preparation. This diagnostic is separate from the complete training result; it cannot replace it.
 
 Omit `--cleanup-after` to retain the file for repeat runs; the cached file is integrity-checked before reuse.
 Clean it up later with `.venv/bin/python air_bench.py --cleanup`. Cleanup removes only this script's owned files

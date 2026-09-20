@@ -161,6 +161,99 @@ def capture(*args):
     return subprocess.check_output(args, text=True).strip()
 
 
+def inertia_for_labels(X, centers, labels):
+    """Common float64 squared-distance metric, outside the timed fit and without a full-table copy."""
+    import numpy as np
+    total = 0.0
+    for start in range(0, len(X), 65_536):
+        block = X[start:start+65_536].astype(np.float64)
+        block -= np.asarray(centers,dtype=np.float64)[labels[start:start+65_536]]
+        total += float(np.sum(block*block,dtype=np.float64))
+    return total
+
+
+def timing_verdict(mlx_s, sklearn_s):
+    if mlx_s <= 0 or sklearn_s <= 0:
+        raise ValueError('Timings must be positive.')
+    if abs(mlx_s-sklearn_s) <= .01*min(mlx_s,sklearn_s):
+        return 'Result: effectively tied in this run (within 1%).'
+    if mlx_s > sklearn_s:
+        return f'Result: scikit-learn was faster; MLX took {(mlx_s/sklearn_s-1)*100:.0f}% longer.'
+    return f'Result: MLX was faster; scikit-learn took {(sklearn_s/mlx_s-1)*100:.0f}% longer.'
+
+
+def print_results(report):
+    print(f"\nClustering {report['rows']:,} taxi rows, 6 features, 8 groups (lower time is better)")
+    print(f"{'Method':<18} {'Fit + labels':>14} {'Iterations':>12}")
+    print(f"{'MLX':<18} {report['mlx_fit_including_labels_s']:>12.3f} s {report['iterations']:>12}")
+    sk = report.get('sklearn',{})
+    if 'fit_s' in sk:
+        print(f"{'scikit-learn':<18} {sk['fit_s']:>12.3f} s {sk['iterations']:>12}")
+        print(timing_verdict(report['mlx_fit_including_labels_s'],sk['fit_s']))
+        ours, theirs = report['mlx_inertia_float64'], sk['inertia_float64']
+        if max(ours,theirs) == 0:
+            print('Clustering error: both zero.')
+        elif theirs == 0:
+            print('Clustering error: scikit-learn is zero; MLX is higher.')
+        else:
+            difference = (ours/theirs-1)*100
+            direction = 'higher' if difference >= 0 else 'lower'
+            print(f'Clustering error: MLX is {abs(difference):.2f}% {direction} (lower error is better).')
+        print('Both used the SAME data. Times include their own initialization, training and labels.')
+        print('Iteration counts can differ because each method finds its own stopping point.')
+    else:
+        print('scikit-learn comparison:',sk.get('error',sk.get('skipped','disabled')))
+    print(f"Shared file loading + preparation: {report['load_s']+report['prepare_s']:.3f} s (excluded above).")
+    print('One run on this workload; results can vary. This does not establish a winner for all datasets.')
+
+
+def controlled_comparison(X):
+    """Optional one-update + final-label comparison, shared centers, warmup, three alternating repeats."""
+    import numpy as np
+    from sklearn.cluster import KMeans as SK
+    from mlx_kmeans import core
+    mx = core._mx()
+    parts = [mx.array(X)]
+    mx.eval(parts)
+    centers = core.kmeans_pp_init(parts,len(X),8,np.random.default_rng(0))
+
+    def mlx_run():
+        C, _, _ = core.lloyd_step(parts,centers)
+        _, _, _, labels = core.assign_mlx(parts,C,return_labels=True)
+        return C, labels
+
+    def sklearn_run():
+        m = SK(n_clusters=8,init=centers.copy(),n_init=1,max_iter=1,tol=0,algorithm='lloyd').fit(X)
+        return m.cluster_centers_, m.labels_
+
+    functions = {'mlx':mlx_run,'sklearn':sklearn_run}
+    times = {name:[] for name in functions}
+    for fn in functions.values():
+        fn()
+    final = {}
+    for repeat in range(3):
+        for name in (['mlx','sklearn'] if repeat%2 == 0 else ['sklearn','mlx']):
+            t = time.perf_counter()
+            final[name] = functions[name]()
+            times[name].append(time.perf_counter()-t)
+    scores = {name:inertia_for_labels(X,*value) for name,value in final.items()}
+    record = dict(description='same data and centers; one Lloyd update plus final labels; GPU input conversion '
+                  'and initialization excluded; sklearn fit includes its internal preparation',
+                  raw_seconds=times,median_seconds={name:float(np.median(t)) for name,t in times.items()},
+                  inertia_float64=scores)
+    print('\nControlled check: same starting centers, ONE update + labels (median of 3 warmed runs).')
+    print(f"MLX {record['median_seconds']['mlx']*1000:.3f} ms; "
+          f"scikit-learn {record['median_seconds']['sklearn']*1000:.3f} ms.")
+    delta = abs(scores['mlx']-scores['sklearn'])/max(scores.values()) if max(scores.values()) else 0
+    print(f'Final clustering error differs by {delta*100:.4f}%.')
+    if delta <= 1e-4:
+        print(timing_verdict(record['median_seconds']['mlx'],record['median_seconds']['sklearn']))
+    else:
+        print('Quality differs by more than 0.01%; do not interpret these times as a same-result speedup.')
+    print('This isolates one update, not the complete training time reported above.')
+    return record
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
@@ -170,12 +263,16 @@ def main():
     parser.add_argument('--rows', type=int, default=5_000_000, help='maximum retained rows (default 5M; reduced to memory budget)')
     parser.add_argument('--memory-mib', type=int, help='lower the automatic working-memory budget')
     parser.add_argument('--no-compare', action='store_true', help='skip the optional sklearn comparison')
+    parser.add_argument('--controlled', action='store_true', help='also compare one update using identical starting centers')
+    parser.add_argument('--details', action='store_true', help='print power and memory details (always saved in JSON)')
     args = parser.parse_args()
     if args.cleanup:
         cleanup()
         return
     if args.rows < 10_000 or (args.memory_mib is not None and args.memory_mib <= 0):
         parser.error('--rows must be at least 10000; --memory-mib must be positive')
+    if args.controlled and args.no_compare:
+        parser.error('--controlled requires the scikit-learn comparison; omit --no-compare')
     if platform.system() != 'Darwin' or platform.machine() != 'arm64':
         parser.error('The benchmark requires an Apple Silicon Mac.')
     try:
@@ -195,14 +292,15 @@ def main():
                        power=capture('pmset','-g','batt'), power_settings=capture('pmset','-g','custom'))
     environment['source_sha256'] = {name: file_hash(ROOT/name) for name in
                                     ['air_bench.py','mlx_kmeans/core.py','mlx_kmeans/estimator.py']}
-    print(environment['chip'], f'— {mem.total/GIB:.0f} GiB RAM, {mem.available/GIB:.1f} GiB currently available')
-    print(environment['power'])
-    print(f"Plan: up to {plan['rows']:,} valid taxi rows, 6 features, 8 clusters. "
-          f"Estimated working memory {plan['estimated_working_bytes']/MIB:.0f} MiB; "
-          f"input {plan['input_bytes']/MIB:.0f} MiB.")
-    print('Conservative estimate, not a peak-memory guarantee. Close heavy apps for comparable timings.')
-    print('One monthly file, at most 256 MiB on disk. No SIFT, GIST, embeddings, or other months downloaded.')
+    print(f"{environment['chip']} — testing up to {plan['rows']:,} taxi rows, 6 features, 8 groups.",flush=True)
+    if args.details or args.plan:
+        print(environment['power'])
+        print(f"RAM {mem.total/GIB:.0f} GiB; available {mem.available/GIB:.1f} GiB. "
+              f"Estimated working memory {plan['estimated_working_bytes']/MIB:.0f} MiB; "
+              f"input {plan['input_bytes']/MIB:.0f} MiB.")
+        print('Memory is a conservative estimate, not a guarantee. One monthly download, at most 256 MiB.')
     if args.plan:
+        print('Preview only: no benchmark has run. Run it with: python air_bench.py --cleanup-after')
         return
     # Keep MLX's own allocator bounded as well; CPU allocations still rely on the conservative row plan.
     mx.set_memory_limit(plan['memory_budget_bytes'])
@@ -224,6 +322,7 @@ def main():
         X -= mean
         X /= std
         prepare_s = time.perf_counter()-t
+        print('Running MLX clustering...',flush=True)
         t = time.perf_counter()
         model = KMeans(n_clusters=8, random_state=0).fit(X)
         fit_s = time.perf_counter()-t
@@ -233,9 +332,8 @@ def main():
                       features=FEATURES, clusters=8, seed=0, iterations=model.n_iter_,
                       download_or_cache_check_s=download_s, load_s=load_s, prepare_s=prepare_s,
                       mlx_fit_including_labels_s=fit_s, cluster_counts=counts,
+                      mlx_inertia_float64=inertia_for_labels(X,model.cluster_centers_,model.labels_),
                       centroids_original_units=(model.cluster_centers_*std+mean).tolist())
-        print(f'MLX: {len(X):,} rows, {model.n_iter_} iterations, fit + labels {fit_s:.3f} s; '
-              f'load + prepare + fit {load_s+prepare_s+fit_s:.3f} s.', flush=True)
         del model
         mx.clear_cache()
         if not args.no_compare:
@@ -243,23 +341,31 @@ def main():
                 import sklearn
                 from sklearn.cluster import KMeans as SK
                 # Same data, default greedy sklearn seeding; different stopping rules. This is workflow timing.
+                print('Running scikit-learn clustering...',flush=True)
                 t = time.perf_counter()
                 sk = SK(n_clusters=8,n_init=1,max_iter=300,random_state=0).fit(X)
                 elapsed = time.perf_counter()-t
-                report['sklearn'] = dict(version=sklearn.__version__,fit_s=elapsed,iterations=sk.n_iter_)
-                print(f'scikit-learn: fit + labels {elapsed:.3f} s, {sk.n_iter_} iterations. '
-                      'Different initialization/stopping; not an equal-work speed ratio.')
+                report['sklearn'] = dict(version=sklearn.__version__,fit_s=elapsed,iterations=sk.n_iter_,
+                                         inertia_float64=inertia_for_labels(X,sk.cluster_centers_,sk.labels_))
+                del sk
             except ImportError:
                 report['sklearn'] = dict(skipped='not installed')
             except (ValueError, MemoryError, RuntimeError) as exc:
                 report['sklearn'] = dict(error=str(exc))
                 print(f'scikit-learn comparison failed: {exc}; preserving the MLX result.')
+        print_results(report)
+        if args.controlled:
+            try:
+                report['controlled'] = controlled_comparison(X)
+            except (ImportError, ValueError, MemoryError, RuntimeError) as exc:
+                report['controlled'] = dict(error=str(exc))
+                print(f'Controlled check unavailable: {exc}. The complete-fit result above is preserved.')
         report['process_peak_rss_bytes'] = __import__('resource').getrusage(__import__('resource').RUSAGE_SELF).ru_maxrss
         report['power_at_end'] = capture('pmset','-g','batt')
         out = ROOT/'benchmarks'/('local-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')+'.json')
         out.parent.mkdir(exist_ok=True)
         out.write_text(json.dumps(report,indent=2))
-        print(f'Report saved: {out}\nShare this JSON to compare measured Macs. One run; caches and thermals are uncontrolled.')
+        print(f'\nFull report (including power/memory details): {out}')
     finally:
         if args.cleanup_after:
             cleanup()

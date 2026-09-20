@@ -1,5 +1,6 @@
 """Safety checks for planning, bounded loading, downloads, and narrowly scoped cleanup."""
 import hashlib
+import contextlib
 import io
 import json
 from pathlib import Path
@@ -19,6 +20,35 @@ class Response(io.BytesIO):
 
 
 class AirBenchTests(unittest.TestCase):
+    def test_report_explains_slower_mlx_without_disqualifying_comparison(self):
+        report = dict(rows=5_000_000,iterations=15,mlx_fit_including_labels_s=2.575,
+                      mlx_inertia_float64=100.,load_s=.1,prepare_s=.2,
+                      sklearn=dict(fit_s=2.013,iterations=40,inertia_float64=101.))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            b.print_results(report)
+        text = output.getvalue()
+        self.assertIn('MLX took 28% longer',text)
+        self.assertIn('SAME data',text)
+        self.assertIn('0.99% lower',text)
+        self.assertNotIn('not an equal-work',text)
+        self.assertIn('effectively tied',b.timing_verdict(1,1.005))
+
+    def test_common_quality_metric_and_controlled_check(self):
+        import numpy as np
+        X=np.random.default_rng(5).normal(size=(100,6)).astype(np.float32)
+        centers=X[:8].copy()
+        labels=np.zeros(100,dtype=np.int64)
+        expected=float(((X.astype(np.float64)-centers[0])**2).sum())
+        self.assertAlmostEqual(b.inertia_for_labels(X,centers,labels),expected)
+        with contextlib.redirect_stdout(io.StringIO()):
+            result=b.controlled_comparison(X)
+        for name in ['mlx','sklearn']:
+            self.assertEqual(len(result['raw_seconds'][name]),3)
+            self.assertGreater(result['median_seconds'][name],0)
+        values=result['inertia_float64']
+        self.assertLess(abs(values['mlx']/values['sklearn']-1),1e-4)
+
     def test_memory_plans(self):
         for ram in [8,16,24,128]:
             p = b.plan_rows(ram*b.GIB,ram*b.GIB//2,ram*b.GIB*.7)
