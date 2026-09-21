@@ -200,7 +200,7 @@ def assign_numpy(parts, C, chunk=2_000_000):
 #             recomputes those candidates exactly. ~3x faster than pairs at high dims and still exact. Needs dims and
 #             k to be multiples of 8 (tail rows fall back to the rows kernel).
 #    GPUs run many threads in lockstep; the original design (one thread per 4096-row block, branchy argmin)
-#    was 9-40x slower at large k * dims.
+#    was 9-43x slower at large k * dims.
 #    Apple's Neural Accelerator matmul (what MLX's @ operator and PyTorch MPS use) is another ~4x faster than tiles,
 #    but has no float32 error bound: exact on integers, up to ~12000x eps on fractional data. It is only used by the
 #    opt-in fast path (see _NEAREST_FAST), never by the default exact paths.
