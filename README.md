@@ -95,6 +95,46 @@ need additional memory. Start with a representative subset on your Air and measu
 No Air runtime or speedup is established by the M5 Max results. `python3 quick_bench.py` measures your own Mac;
 also time `.fit()` on your actual data, since per-pass timings exclude initialization and data preparation.
 
+### Benchmark without administrator access
+
+`no_admin_bench.sh` is for an Apple Silicon Mac where you can use Terminal but do not have Homebrew, Git, Python,
+or an administrator password. It downloads a private Python toolchain inside the repository, installs only the two
+required packages, runs `quick_bench.py --big`, and saves a timestamped text report under `benchmarks/`. It does not
+use `sudo` or change the shell profile. Internet access to GitHub, Astral, and Python package downloads is required;
+a managed Mac can still block downloads or execution.
+
+If Git is available:
+
+```bash
+git clone https://github.com/kakollu/mlx-kmeans.git
+cd mlx-kmeans
+./no_admin_bench.sh
+```
+
+Without Git, download the public repository as a ZIP using tools included with macOS:
+
+```bash
+cd /tmp
+curl -L https://github.com/kakollu/mlx-kmeans/archive/refs/heads/main.zip -o mlx-kmeans.zip
+ditto -x -k mlx-kmeans.zip .
+cd mlx-kmeans-main
+./no_admin_bench.sh
+```
+
+Copy the printed `benchmarks/no-admin-*.txt` report before leaving a temporary machine. Afterwards, this removes
+only the script-owned Python, environment, tools, and download cache; it deliberately preserves the report:
+
+```bash
+./no_admin_bench.sh --cleanup
+```
+
+This benchmark sizes its largest case from MLX's recommended GPU working set. It measures time per k-means pass,
+not complete convergence or maximum safe capacity. To test the existing billion-row regression after setup:
+
+```bash
+.no-admin-bench/venv/bin/python -m mlx_kmeans --rows 1000000000 --dims 8 --k 16
+```
+
 ### Run a simple benchmark on your MacBook Air
 
 ```bash
