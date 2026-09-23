@@ -97,11 +97,12 @@ also time `.fit()` on your actual data, since per-pass timings exclude initializ
 
 ### Benchmark without administrator access
 
-`no_admin_bench.sh` is for an Apple Silicon Mac where you can use Terminal but do not have Homebrew, Git, Python,
-or an administrator password. It downloads a private Python toolchain inside the repository, installs only the two
-required packages, runs `quick_bench.py --big`, and saves a timestamped text report under `benchmarks/`. It does not
-use `sudo` or change the shell profile. Internet access to GitHub, Astral, and Python package downloads is required;
-a managed Mac can still block downloads or execution.
+`no_admin_bench.sh` is for an Apple Silicon Mac where you can use Terminal but do not have Homebrew, Git, or an
+administrator password. It uses an available Python 3.9+ when possible. If Python is absent or unusable, it downloads
+a private fallback inside the repository. It installs the required packages, runs `quick_bench.py --big`, and saves
+a timestamped text report under `benchmarks/`. It does not use `sudo` or change the shell profile. Internet access to
+GitHub and Python package downloads is required; the fallback also needs access to Astral. A managed Mac can still
+block downloads or execution.
 
 If Git is available:
 
@@ -111,7 +112,7 @@ cd mlx-kmeans
 ./no_admin_bench.sh
 ```
 
-Without Git, download the public repository as a ZIP using tools included with macOS:
+If Python is available but Git is not, download the public repository as a ZIP using tools included with macOS:
 
 ```bash
 cd /tmp
