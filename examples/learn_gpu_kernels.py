@@ -238,10 +238,107 @@ First, proof that the race is real. 1,000,000 threads each do out[0] += 1.0f:"""
     data so the memory system stops fighting you.""")
 
 
+# ---------------------------------------------------------------------------------------------------------------
+def lesson5():
+    rule(5, "Memory layout: measure it, do not trust the textbook")
+    print("""
+Standard advice: threads in a lockstep group should read ADJACENT addresses so the hardware can merge them
+into one wide transaction ("coalescing"). Our distance kernel reads X[i*D + j] - row-major - so adjacent
+threads start D floats apart, which the advice says is wrong. Column-major (X[j*N + i]) is the coalesced
+version. Same arithmetic, same bytes; only the layout differs.""")
+
+    aos = """
+        uint i = thread_position_in_grid.x, xi = i * D;
+        float s = 0;
+        for (uint j = 0; j < D; j++) { float t = X[xi + j] - C[j]; s += t * t; }
+        out[i] = s;
+    """
+    soa = """
+        uint i = thread_position_in_grid.x;
+        float s = 0;
+        for (uint j = 0; j < D; j++) { float t = X[j * N + i] - C[j]; s += t * t; }
+        out[i] = s;
+    """
+    ka = mx.fast.metal_kernel(name="l5_aos", input_names=["X", "C"], output_names=["out"], source=aos)
+    kb = mx.fast.metal_kernel(name="l5_soa", input_names=["X", "C"], output_names=["out"], source=soa)
+    n = 8_000_000
+    print(f"\n    {n:,} rows, squared distance to one centre")
+    print(f'\n    {"dims":>5}{"row-major":>12}{"col-major":>12}{"ratio":>8}{"GB/s row":>10}{"GB/s col":>10}')
+    for d in (6, 32, 128):
+        rng = np.random.default_rng(0)
+        Xr = rng.standard_normal((n, d)).astype(np.float32)
+        Xa, Xb = mx.array(Xr), mx.array(np.ascontiguousarray(Xr.T))
+        C = mx.array(rng.standard_normal(d).astype(np.float32))
+        mx.eval(Xa, Xb, C)
+        fa = lambda: mx.eval(ka(inputs=[Xa, C], template=[("D", d)], grid=(n, 1, 1), threadgroup=(64, 1, 1),
+                                output_shapes=[(n,)], output_dtypes=[mx.float32])[0])
+        fb = lambda: mx.eval(kb(inputs=[Xb, C], template=[("D", d), ("N", n)], grid=(n, 1, 1),
+                                threadgroup=(64, 1, 1), output_shapes=[(n,)], output_dtypes=[mx.float32])[0])
+        ta, tb, byt = timed(fa, 11), timed(fb, 11), n * d * 4
+        print(f"    {d:>5}{ta*1e3:>10.2f} ms{tb*1e3:>10.2f} ms{tb/ta:>8.2f}{byt/ta/1e9:>10.0f}{byt/tb/1e9:>10.0f}")
+    print("""
+    Column-major helps far less than the advice implies. At small D the ratio moves around between runs
+    (measured anywhere from 0.76 to 1.00 at 6 dims) because the effect is within noise; at 128 dims it is a
+    consistent ~18%. The reason is the cache line: at 6 dims a row is 24 bytes, so one 128-byte line already
+    serves several neighbouring threads and the reads were effectively coalesced whatever you did. At 128
+    dims a row is 512 bytes, neighbouring threads share nothing, and the layout finally matters.
+
+    Run this twice before believing any single number here - that habit is the point.
+
+    Note the GB/s column - this kernel is running at a large fraction of the machine's memory bandwidth. That
+    is the real lesson: it is memory-bound, so no amount of arithmetic cleverness will help. Find out which
+    resource you have saturated before optimising anything.""")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+def lesson6():
+    rule(6, "Threadgroup memory, barriers, and the contention that decides everything")
+    print("""
+Threadgroup memory is on-chip scratch shared by the threads of ONE threadgroup - your node-local memory,
+with threadgroup_barrier as MPI_Barrier over that group. It is far faster than device memory.
+
+But the tier is not what decides performance. Contention is. Below, every version uses the same threadgroup
+memory, the same barriers and the same arithmetic. The ONLY difference is how many distinct atomic addresses
+the 256 threads spread their additions across:""")
+
+    src = """
+        threadgroup atomic_float tile[SLOTS];
+        uint lid = thread_position_in_threadgroup.x, b = threadgroup_position_in_grid.x;
+        for (uint e = lid; e < SLOTS; e += TG) atomic_store_explicit(&tile[e], 0.0f, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);        // nobody adds before the zeroing lands
+        uint start = b * BS, end = min(start + BS, uint(N));
+        for (uint i = start + lid; i < end; i += TG)
+            atomic_fetch_add_explicit(&tile[lid % SLOTS], v[i], memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);        // everyone done before we read the total
+        float s = 0;
+        if (lid == 0) { for (uint e = 0; e < SLOTS; e++) s += atomic_load_explicit(&tile[e], memory_order_relaxed);
+                        out[b] = s; }
+    """
+    N, TG, BS = 16_000_000, 256, 8192
+    v = mx.array(np.ones(N, dtype=np.float32)); mx.eval(v)
+    nb = -(-N // BS)
+    print(f"\n    summing {N:,} ones, {TG} threads per group")
+    print(f'\n    {"slots":>6}{"time":>12}{"threads/slot":>14}   correct')
+    for slots in (1, 4, 16, 64, 256):
+        k = mx.fast.metal_kernel(name=f"l6_{slots}", input_names=["v"], output_names=["out"], source=src)
+        args = dict(template=[("BS", BS), ("N", N), ("TG", TG), ("SLOTS", slots)], grid=(nb * TG, 1, 1),
+                    threadgroup=(TG, 1, 1), output_shapes=[(nb,)], output_dtypes=[mx.float32], init_value=0)
+        f = lambda: mx.eval(k(inputs=[v], **args)[0])
+        r = np.array(k(inputs=[v], **args)[0])
+        print(f"    {slots:>6}{timed(f, 11)*1e3:>9.2f} ms{TG//slots:>14}   {r.sum() == N}")
+    print("""
+    Three orders of magnitude, from one line of indexing. With one slot the 256 threads serialise completely;
+    the atomic is correct but it has turned a parallel machine back into a sequential one.
+
+    This is why mlx_kmeans/core.py's _ATOMIC_SRC spreads its additions over k*(dims+2) slots rather than one,
+    and why the biggest win in the whole project (lesson 4c: 4.16 s -> 0.053 s) was removing contention rather
+    than optimising arithmetic. When a GPU kernel is inexplicably slow, count how many threads are fighting
+    over each address before you look at anything else.""")
+
 def main():
     print(__doc__)
     print(f"Device: {mx.default_device()}")
-    for fn in (lesson1, lesson2, lesson3, lesson4):
+    for fn in (lesson1, lesson2, lesson3, lesson4, lesson5, lesson6):
         fn()
     print("""
 ================================================================================
@@ -250,7 +347,7 @@ Where to go next in this repo
     mlx_kmeans/core.py   _ROWS_SRC        lesson 1 + 2 + 3, the real distance kernel
                          _ACCUMULATE_SRC  lesson 4(b), private buffers
                          _SEGMENT_SRC     lesson 4(c), sorted segments - the one that won
-                         _ATOMIC_SRC      threadgroup atomics + a barrier (MPI_Barrier for a node)
+                         _ATOMIC_SRC      lesson 6, threadgroup atomics spread over k*(dims+2) slots
                          _DOT_TILES_SRC   simdgroup matrix instructions, 32 threads cooperating on an 8x8 tile
 
 Things that bite people coming from OpenMP:
