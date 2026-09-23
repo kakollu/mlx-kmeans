@@ -242,3 +242,42 @@ per row thereafter. This is why the recorded 100k x 32, k=64 per-pass loss repro
 (2.2 ms against scikit-learn's 1.2 ms) - seeding is not part of a per-pass number. Removing this floor means
 keeping the center update and convergence test on the GPU, which would move float64 accumulation and
 scikit-learn-exact empty-cluster relocation off the host; not attempted, as correctness ranks above speed here.
+
+## Re-testing the tuning after the GPU-teaching experiments (September 23, 2026, battery)
+
+Writing `examples/learn_gpu_kernels.py` produced three hypotheses about the production kernels. All three
+were measured on the M5 Max. One was already shipped; the other two were wrong, and the existing constants
+are correct. Times are on battery, so the ratios are the quotable part.
+
+**Confirmed and shipped: lazy k-means++ seeding.** A/B against the pre-fix implementation taken from git
+(ed9eb4b), not from memory: 10k x 32 k=64, 17.6 -> 4.0 ms (4.40x); 1M x 32 k=256, 60.2 -> 13.7 ms (4.39x);
+1M x 128 k=1024, 247.5 -> 66.6 ms (3.71x). Centres bit-identical in every case.
+
+**Rejected: column-major (SoA) input layout.** The standard coalescing argument says X[i*D+j] is the wrong
+layout. Measured on an 8M-row distance kernel: 128 dims gives a consistent ~18%, but 32 dims gives 0.92-0.99
+and 6 dims moves between 0.76 and 1.00 across runs, i.e. inside noise. A 24-byte row means one 128-byte cache
+line already serves several neighbouring threads. The `rows` path only runs below 64 dims, where the effect is
+noise, and the high-dimensional path is `tiles`, which already transposes the centres. Converting would also
+cost a full transpose of the input. Not worth it.
+
+**Rejected: more accumulation blocks.** ACC_MAX_BLOCKS caps `blocks` at 4096 threads, which at 10M rows is
+2442 rows per thread - the very pattern that cost 9-43x in the assignment kernel. Raising it makes things
+much worse, because the per-block buffers must be zero-filled and then reduced:
+
+| blocks | rows/thread | 10M x 6 k=8 | 10M x 12 k=32 |
+|---:|---:|---:|---:|
+| 4,096 (shipped) | 2,442 | 3.80 ms | 6.83 ms |
+| 16,384 | 611 | 5.89 ms (0.65x) | 13.75 ms (0.50x) |
+| 65,536 | 153 | 23.98 ms (0.16x) | 28.64 ms (0.24x) |
+| 262,144 | 39 | 92.13 ms (0.04x) | 80.00 ms (0.09x) |
+
+The existing value is optimal. Note also that block count changes how the Kahan compensation splits, so
+results are not bit-identical across block counts - another reason not to make it adaptive casually.
+
+**Where the remaining headroom is, and why it is not free.** Against a measured 540 GB/s streaming ceiling:
+the satellite-shaped assignment pass runs at 38% of it and accumulation at 16%, so neither is bandwidth-bound.
+The gap is the compensated summation and the scattered per-thread writes, i.e. the price of determinism.
+Measured directly, the opt-in `atomic` path is 2.2-4.3x faster than the deterministic default
+(10M x 6 k=8: 3.87 -> 1.79 ms; 10M x 12 k=32: 6.93 -> 1.60 ms; 2M x 50 k=64: 9.53 -> 3.68 ms), consistent
+with the 1.7-4.5x already documented. The SIFT-shaped `tiles` assignment sits at 2% of the bandwidth ceiling
+because it is compute-bound, which is the correct regime for it.
