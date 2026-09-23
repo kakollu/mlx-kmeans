@@ -21,3 +21,6 @@ google_chat.txt
 
 # Results produced by the included CSV example
 examples/customers-clusters-*/
+
+# Jupyter autosaves
+.ipynb_checkpoints/
