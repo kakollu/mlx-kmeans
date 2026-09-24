@@ -88,13 +88,28 @@ a loop, you pay this floor on every iteration — measure before assuming the GP
 
 **Measured machine: 128 GB M5 Max MacBook Pro, on AC power.** The timings below apply to this machine.
 
-**MacBook Air: planning estimates only; not benchmarked here.** A million transactions with 20 numeric features
-occupy 80 MB as float32; ten million occupy 800 MB. These are input sizes, not peak memory requirements or tested
-Air capacity limits. Loading tables, standardizing features, making copies, storing labels, and GPU workspace all
-need additional memory. Start with a representative subset on your Air and measure the complete workflow.
+**MacBook Air: measured, not estimated.** On September 24 the benchmark was run on six Apple Silicon machines
+in an Apple Store, each printing a fingerprint of the code it executed so the runs can be tied to a revision.
+A 16 GB M5 MacBook Air clustered **37 million rows by 32 features into 1,024 clusters at 1.90 s per pass**, and
+ten million rows by twelve features in 26.5 ms. An A18 Pro MacBook with five GPU cores and 8 GB still reached
+16.7 million rows.
 
-No Air runtime or speedup is established by the M5 Max results. `python3 quick_bench.py` measures your own Mac;
-also time `.fit()` on your actual data, since per-pass timings exclude initialization and data preparation.
+| Machine | GPU cores | RAM | 10M × 12, k=32 | Largest case it chose |
+|---|---:|---:|---:|---|
+| M5 Max, MacBook Pro | 40 | 128 GB | 0.0071 s | 200M rows (capped) |
+| M5 Pro, MacBook Pro | 20 | 48 GB | 0.0112 s | 117M rows |
+| M5 Max, Mac Studio | 32 | 36 GB | 0.0082 s | 87.8M rows |
+| M5 Pro, Mac mini | 16 | 24 GB | 0.0133 s | 55.5M rows |
+| **M5, MacBook Air** | 10 | 16 GB | **0.0265 s** | **37.0M rows** |
+| A18 Pro, MacBook | 5 | 8 GB | 0.0542 s | 16.7M rows |
+
+These were retail display units: unknown thermal state, no power or background-load control, one run each.
+They show the library runs across the range and roughly how fast, not a controlled cross-machine study — small
+shapes in particular are noisy enough that a 20-core machine beat a 32-core one on them. Full numbers and
+caveats: [benchmarks/MACHINES-2026-09-24.md](benchmarks/MACHINES-2026-09-24.md).
+
+`python3 quick_bench.py` measures your own Mac the same way. Also time `.fit()` on your actual data, since
+per-pass timings exclude initialization and data preparation.
 
 ### Benchmark without administrator access
 

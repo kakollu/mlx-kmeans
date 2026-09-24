@@ -111,6 +111,8 @@ Loading, cleaning, feature preparation and export contribute to complete workflo
 alone does not establish that total time.
 
 Only this M5 Max was measured. **MacBook Air estimates are planning estimates, not benchmark results.**
+*(Superseded on September 24: six machines including an M5 MacBook Air were measured directly — see
+`MACHINES-2026-09-24.md`. The paragraph below stands as the position on the date of this verification.)*
 One million rows × 20 float32 features is 80 MB of input; ten million is 800 MB. This arithmetic excludes table
 storage, preprocessing copies, labels, and GPU workspace. It is not a claim that a particular Air can fit or finish
 a workload within a particular time. No quarter-speed extrapolation or larger CPU-relative advantage is asserted.
