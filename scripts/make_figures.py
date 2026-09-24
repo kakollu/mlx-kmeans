@@ -47,16 +47,16 @@ def latest_results():
 
 
 def fig_speedup(res):
-    """Horizontal paired bars: our pass time vs the fastest public library that matches our clustering."""
+    """Horizontal paired bars: our pass time vs the fastest compared library that matches our clustering."""
     rowh, top, left, right, W = 62, 76, 210, 300, 900   # right margin holds the value label + ratio
     H = top + rowh * len(res) + 34
     longest = max(v[1] for v in res.values())
     track = W - left - right
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" '
-           f'aria-label="k-means seconds per pass, this library versus the fastest public library">',
+           f'aria-label="k-means seconds per pass, this library versus the fastest compared library">',
            f'<rect width="{W}" height="{H}" fill="{PAPER}"/>',
            text(24, 34, "Seconds per k-means pass, same data and same result", 17, INK, weight=700),
-           text(24, 55, "Apple M5 Max · each public library is the fastest one whose clustering matches ours", 12, INK3)]
+           text(24, 55, "Apple M5 Max · each bar is the fastest compared library whose clustering matches ours", 12, INK3)]
     for i, (cfg, (ours, pub, lib)) in enumerate(res.items()):
         y = top + i * rowh
         name, shape = LABELS[cfg].split("<br>")

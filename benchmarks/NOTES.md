@@ -350,3 +350,42 @@ Not shipped: a correct-but-slower path behind a flag is maintenance cost with no
 untried is a scan that keeps all 32 lanes busy - one lane per (row, centre) entry of the 8x8 tile, with the
 per-row running minimum reduced through simd shuffles instead of eight lanes scanning serially. That removes
 the idle-lane problem the measurements point at, and is the form a future attempt should take.
+
+## Looking for redundant work between iterations (September 24, 2026, AC power)
+
+Three candidates for precomputing what a pass redoes. One is worth building, one is not, one is marginal.
+
+**|x|^2 caching: measured, rejected.** `_MARGIN_SRC` recomputes |x|^2 from X on every pass although it never
+changes while the centers move. Handing it in precomputed made the margin kernel 1.06-1.17x faster in isolation,
+which did not survive end to end: over 10 Lloyd iterations it measured 1.02x, 1.02x, 0.99x and 0.97x on four
+tiles-path shapes. The margin kernel already reads X for the exact recompute, so X is hot in cache and the |x|^2
+loop is nearly free. The plumbing (an optional per-fit cache threaded through lloyd_step, _gpu_pass and _nearest)
+was written, verified bit-identical, measured and then reverted rather than carried as unused complexity with a
+cache-invalidation surface.
+
+**Bound-based pruning (Hamerly/Elkan): real but much smaller than it first looks.** Points that keep their
+cluster need no distances at all, and assignments settle quickly - measured churn per iteration falls to 3-6% by
+iteration five (500k x 128 k=256: 37.1, 12.8, 9.2, 7.7, 6.6, 5.7, 5.1, 4.5, 4.1%). That number is misleading.
+What matters is not how many points keep their cluster but how many can be *proven* to keep it, and a faithful
+float64 Hamerly simulation gives a far weaker result - the share still needing a full k-distance scan, averaged
+over ten iterations:
+
+| Shape | still needs a full scan | implied ceiling |
+|---|---:|---:|
+| 4 dims, k=32 | 48.3% | ~2.1x |
+| 12 dims, k=32 | 61.2% | ~1.6x |
+| 48 dims, k=64 | 81.4% | ~1.2x |
+| 128 dims, k=256 | 89.3% | ~1.1x |
+| 960 dims, k=64 | 89.0% | ~1.1x |
+
+Effectiveness collapses with dimension, which agrees with the existing finding that triangle-inequality pruning
+is useless at 960 dims. Two further costs specific to this implementation: the work becomes irregular, and with
+threads in lockstep one point needing a full scan makes its whole simdgroup pay unless the survivors are
+compacted first; and it adds two floats of state per row (8 GB at a billion rows). So the honest prospect is
+perhaps 1.3-1.6x on 4-12 dimensional data after compaction, in exactly the regime where this library is already
+strongest, and nothing at high dimensions. Worth building for the low-dimensional case; not a general answer.
+
+**Transposing the centers on the host: marginal.** `_tiles_nearest` does `mx.array(np.ascontiguousarray(
+np.array(Cm).T))` every pass, which is a GPU-to-host round trip. On GPU via `mx.contiguous(Cm.T)` it is 5.6x
+faster at k=1024, d=960 (0.933 -> 0.168 ms) and identical, but *slower* at d=128 (0.090 -> 0.147 ms), and even
+the 0.933 ms is 0.4% of a 233 ms GIST pass. Not worth a size-dependent branch on these numbers.

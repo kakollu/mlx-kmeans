@@ -277,7 +277,9 @@ def report():
         "other processes used more than four cores are flagged. Ours (latest run) is compared against each public "
         "library's **best valid time ever recorded** for the config, so slow or failed public runs can't inflate our lead.",
         "",
-        f"**Publish target:** ours at least {PUBLISH_TARGET}x faster than the fastest valid public implementation on every config.",
+        f"**Publish target:** ours at least {PUBLISH_TARGET}x faster on every config than the fastest of the "
+        f"widely used libraries compared here (scikit-learn, FAISS, fast-pytorch-kmeans). Other Apple Silicon "
+f"k-means implementations exist and are not in this set.",
         "",
         "| Config | Problem | Shape | Ours s/pass | Fastest valid public | Its s/pass | Ours vs it |",
         "|---|---|---|---|---|---|---|",
