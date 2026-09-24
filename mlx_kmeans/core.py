@@ -226,6 +226,23 @@ _ROWS_SRC = """
     }
     labels[i] = bl; best_d[i] = best;
 """
+# The loop above re-reads the row from cache once per center: k*D loads where D would do. Holding the row in
+# registers first is the same arithmetic in the same order - bit-identical output - and measured 1.0-3.2x faster
+# across d=4..96, k=8..1024, with the gain growing with k. Above ~96 dims the array spills and it turns into a
+# 1.7x loss, so `_rows_kernel` only uses this below ROWS_REG_MAX_DIMS; the tail rows of the high-dimensional
+# tiles/pairs paths keep the original.
+_ROWS_REG_SRC = """
+    uint i = thread_position_in_grid.x, xi = (row0[0] + i) * D;
+    float xv[D];
+    for (uint j = 0; j < D; j++) xv[j] = X[xi + j];
+    float best = INFINITY; uint bl = 0;
+    for (uint c = 0; c < K; c++) {
+        float s = 0;
+        for (uint j = 0; j < D; j++) { float t = xv[j] - C[c * D + j]; s += t * t; }
+        bool lt = s < best; best = select(best, s, lt); bl = select(bl, c, lt);
+    }
+    labels[i] = bl; best_d[i] = best;
+"""
 _PAIRS_SRC = """
     uint i = thread_position_in_grid.y, c = thread_position_in_grid.x;
     uint xi = (row0[0] + i) * D, ci = c * D;
@@ -285,32 +302,58 @@ _DOT_TILES16_SRC = """
 # bounds the relative error of a D-term dot product and of |c|^2 (Higham), and sum|x_j c_j| <= (|x|^2+|c|^2)/2 leaves
 # slack for the subtraction. So the truly nearest center c* satisfies approx_c* <= amin + E_cmin + E_c*: only centers
 # inside that window can win, and each gets an exact distance.
+# The obvious form scans the dot row twice: once for the minimum, once to apply the bound. The row is the
+# largest thing this kernel reads, so the second scan is expensive. Instead, one scan carries the running minimum
+# and records every center passing the RUNNING bound - never tighter than the final one, so the recorded list is a
+# superset of the true candidates. The list is then filtered by the final bound, leaving the same ~1 center per row
+# to recompute exactly. Output is bit-identical to the two-scan form; measured 1.34-1.56x faster.
+# MARGIN_CANDIDATES only has to be large enough to make overflow rare (measured ~7 survive the running bound);
+# a row that overflows falls back to a second scan, so correctness never depends on it.
 _MARGIN_SRC = """
     uint i = thread_position_in_grid.x, xi = (row0[0] + i) * D, di = i * K;
     float xsq = 0;
     for (uint j = 0; j < D; j++) xsq += X[xi + j] * X[xi + j];
+    float g3 = 3 * gamma[0];
     float amin = INFINITY; uint cmin = 0;
+    uint cand[M]; uint nc = 0; bool overflow = false;
     for (uint c = 0; c < K; c++) {
         float a = csq[c] - 2 * dot[di + c];
         bool lt = a < amin; amin = select(amin, a, lt); cmin = select(cmin, c, lt);
+        if (a <= amin + g3 * (xsq + csq[cmin]) + g3 * (xsq + csq[c])) {
+            if (nc < M) { cand[nc] = c; nc++; } else { overflow = true; }
+        }
     }
-    float g3 = 3 * gamma[0];
     float bound = amin + g3 * (xsq + csq[cmin]);
     float best = INFINITY; uint bl = 0;
-    for (uint c = 0; c < K; c++) {
-        if (csq[c] - 2 * dot[di + c] > bound + g3 * (xsq + csq[c])) continue;
-        float s = 0;
-        for (uint j = 0; j < D; j++) { float t = X[xi + j] - C[c * D + j]; s += t * t; }
-        bool lt = s < best; best = select(best, s, lt); bl = select(bl, c, lt);
+    if (overflow) {
+        for (uint c = 0; c < K; c++) {
+            if (csq[c] - 2 * dot[di + c] > bound + g3 * (xsq + csq[c])) continue;
+            float s = 0;
+            for (uint j = 0; j < D; j++) { float t = X[xi + j] - C[c * D + j]; s += t * t; }
+            bool lt = s < best; best = select(best, s, lt); bl = select(bl, c, lt);
+        }
+    } else {
+        for (uint t = 0; t < nc; t++) {
+            uint c = cand[t];
+            if (csq[c] - 2 * dot[di + c] > bound + g3 * (xsq + csq[c])) continue;
+            float s = 0;
+            for (uint j = 0; j < D; j++) { float q = X[xi + j] - C[c * D + j]; s += q * q; }
+            bool lt = s < best; best = select(best, s, lt); bl = select(bl, c, lt);
+        }
     }
     labels[i] = bl; best_d[i] = best;
 """
 # Outputs are zero-filled by MLX (init_value=0); zeroing k*(dims+2) slots per thread inside the kernel cost more
 # than the accumulation itself on small inputs (0.98 ms of a 1.6 ms pass at 100k x 32, k=64).
+# Threads stride through the rows rather than each taking a contiguous block. Same work and the same thread ->
+# row mapping run to run, but adjacent threads now read adjacent rows instead of addresses BS*D*4 apart (58 KB at
+# 10M rows), so the loads coalesce: measured 1.16-1.19x at low dims and 2.48x at 1M x 128, k=1024. The summation
+# order per cluster changes, so totals differ from the contiguous version in the last bits (1e-12 relative or
+# better, with Kahan compensation unchanged); the path stays deterministic.
 _ACCUMULATE_SRC = """
     uint b = thread_position_in_grid.x, W = D + 2;
-    uint start = b * BS, end = min(start + BS, n_rows[0]), base = b * K * W;
-    for (uint i = start; i < end; i++) {
+    uint base = b * K * W;
+    for (uint i = b; i < n_rows[0]; i += NB) {
         uint o = base + labels[i] * W, xi = i * D;
         sums[o] += 1;                                   // exact: at most 2^24 rows per block
         KAHAN_ADD(sums[o + 1], comp[o + 1], best_d[i]);
@@ -360,7 +403,10 @@ _REDUCE_SRC = """
     total[e] = s; total_comp[e] = c;
 """
 _kernels = {}
-PAIRS_MIN_DIMS = 40                     # dims from which the pairs/tiles paths beat the rows path (measured)
+PAIRS_MIN_DIMS = 64                     # dims from which the pairs path beats the rows path (measured)
+TILES_MIN_DIMS = 40                     # ...and the dims from which tiles beats rows, which is lower
+MARGIN_CANDIDATES = 24                  # per-row candidate slots before falling back to a second scan
+ROWS_REG_MAX_DIMS = 96                  # above this the per-thread row array spills registers (measured)
 TILES_MIN_K = 64                        # ...and the k from which tiles beats pairs (measured; below it pairs wins
                                         # by a lot at high dims - 960 dims, k=32: pairs 36.6 ms vs tiles 51.8 ms)
 TILE_THREADGROUP = 512                  # threads per threadgroup in the tiles path (measured best)
@@ -390,7 +436,9 @@ def _u32(v):
 
 def _rows_kernel(x, Cm, r0, m, k, d):
     mx = _mx()
-    kern = _kernel("kmeans_rows", ["X", "C", "row0"], ["labels", "best_d"], _ROWS_SRC)
+    kern = (_kernel("kmeans_rows_reg", ["X", "C", "row0"], ["labels", "best_d"], _ROWS_REG_SRC)
+            if d <= ROWS_REG_MAX_DIMS else
+            _kernel("kmeans_rows", ["X", "C", "row0"], ["labels", "best_d"], _ROWS_SRC))
     return kern(inputs=[x, Cm, _u32(r0)], template=[("D", d), ("K", k)], grid=(m, 1, 1), threadgroup=(64, 1, 1),
                 output_shapes=[(m,), (m,)], output_dtypes=[mx.uint32, mx.float32])
 
@@ -414,7 +462,8 @@ def _tiles_nearest(x, Cm, n, k, d):
         dot = dot_k(inputs=[x, Ct, _u32(r0)], template=[("D", d), ("K", k)],
                     grid=((m // step) * (k // step) * 32, 1, 1), threadgroup=(TILE_THREADGROUP, 1, 1),
                     output_shapes=[(m * k,)], output_dtypes=[mx.float32])[0]
-        lab, bst = margin(inputs=[x, Cm, csq, dot, _u32(r0), gamma], template=[("D", d), ("K", k)],
+        lab, bst = margin(inputs=[x, Cm, csq, dot, _u32(r0), gamma],
+                          template=[("D", d), ("K", k), ("M", MARGIN_CANDIDATES)],
                           grid=(m, 1, 1), threadgroup=(64, 1, 1),
                           output_shapes=[(m,), (m,)], output_dtypes=[mx.uint32, mx.float32])
         mx.eval(lab, bst)                    # bound memory: one dot chunk alive at a time
@@ -519,7 +568,7 @@ def _accumulate_blocks(x, labels, best, k):
     bs = -(-n // nb)
     nb = -(-n // bs)
     acc = _kernel("kmeans_accumulate", ["X", "labels", "best_d", "n_rows"], ["sums", "comp"], _ACCUMULATE_SRC, _KAHAN)
-    sums, comp = acc(inputs=[x, labels, best, _u32(n)], template=[("D", d), ("K", k), ("BS", bs)],
+    sums, comp = acc(inputs=[x, labels, best, _u32(n)], template=[("D", d), ("K", k), ("NB", nb)],
                      grid=(nb, 1, 1), threadgroup=(min(nb, 64), 1, 1), init_value=0,
                      output_shapes=[(nb * k * w,), (nb * k * w,)], output_dtypes=[mx.float32, mx.float32])
     red = _kernel("kmeans_reduce", ["sums", "comp", "n_blocks"], ["total", "total_comp"], _REDUCE_SRC, _KAHAN)
@@ -534,15 +583,16 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
     mx = _mx()
     k, d = C.shape
     if method == "auto":
-        # Measured on 2M-10M rows: the rows kernel wins below ~40 dims at every k; above that the choice turns on
-        # k, not on dims. The old rule used dims alone, so it sent 48-dim data to rows (1.6x slower than tiles at
-        # k=128) and sent small-k high-dim data to tiles (1.6x slower than pairs at 64 dims, k=8).
-        if d < PAIRS_MIN_DIMS:
-            method = "rows"
-        elif k >= TILES_MIN_K and d % 8 == 0 and k % 8 == 0:
+        # Two separate thresholds, both measured. Tiles beats rows from ~40 dims once k >= 64 (48 dims, k=256:
+        # 46.4 vs 25.7 ms). Pairs beats tiles at small k from ~64 dims (64 dims, k=8: 2.7 vs 1.5 ms; 960 dims,
+        # k=32: 50.4 vs 36.1 ms). Between them - 40 to 63 dims with k < 64 - rows and pairs trade places
+        # unpredictably with row count, so that region stays on rows rather than chasing noise.
+        if k >= TILES_MIN_K and d >= TILES_MIN_DIMS and d % 8 == 0 and k % 8 == 0:
             method = "tiles"
-        else:
+        elif d >= PAIRS_MIN_DIMS:
             method = "pairs"
+        else:
+            method = "rows"
     Cm = mx.array(C)
     tot = np.zeros((k, d + 2), dtype=np.float64)
     nearest = []
