@@ -120,21 +120,23 @@ a timestamped text report under `benchmarks/`. It does not use `sudo` or change 
 GitHub and Python package downloads is required; the fallback also needs access to Astral. A managed Mac can still
 block downloads or execution.
 
-If Git is available:
-
-```bash
-git clone https://github.com/kakollu/mlx-kmeans.git
-cd mlx-kmeans
-./no_admin_bench.sh
-```
-
-If Python is available but Git is not, download the public repository as a ZIP using tools included with macOS:
+Download it as a ZIP. `curl` and `ditto` ship with macOS, so this needs no install of any kind — and on a Mac
+without developer tools, typing `git` triggers a multi-minute Xcode Command Line Tools download you do not need
+(measured: about five minutes on a store machine):
 
 ```bash
 cd /tmp
 curl -L https://github.com/kakollu/mlx-kmeans/archive/refs/heads/main.zip -o mlx-kmeans.zip
 ditto -x -k mlx-kmeans.zip .
 cd mlx-kmeans-main
+./no_admin_bench.sh
+```
+
+If you already have Git, a clone works the same way:
+
+```bash
+git clone https://github.com/kakollu/mlx-kmeans.git
+cd mlx-kmeans
 ./no_admin_bench.sh
 ```
 
