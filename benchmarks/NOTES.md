@@ -324,3 +324,29 @@ current pair - roughly 2.5x on the assignment step at SIFT-like shapes, and less
 the matmul dominates anyway. Not attempted yet: it needs a new simdgroup kernel that keeps 8x8 tiles in
 threadgroup memory, carries a per-row running minimum across centre blocks, and recomputes exact distances
 inline. Correctness must be checked against the existing path before it could replace it.
+
+### Implemented and rejected: the fused kernel is correct but slower (September 24, 2026, battery)
+
+Three variants were written and validated against `_tiles_nearest`. All produce **bit-identical labels and
+bit-identical distances** on every shape tested, confirming the running-bound exactness argument above holds
+in practice. None is faster.
+
+| Variant | 1M x 128 k=1024 | 200k x 960 k=1024 | 200k x 64 k=256 |
+|---|---:|---:|---:|
+| v1, one simdgroup streams all centres | 0.93x | 0.41x | 0.87x |
+| v2, centre slice per simdgroup (SG=4/8/16) | 0.79 / 0.65 / 0.50x | 0.43 / 0.39 / 0.33x | 0.61 / 0.48 / 0.39x |
+| v3, B centre-blocks batched per scan (B=4..32) | **0.97** / 0.95 / 0.90 / 0.73x | 0.42x | 0.86x |
+
+The estimated 2.5x did not appear, and the reason is utilisation rather than bandwidth. The shipped pair
+lets each kernel run at its own peak: `_DOT_TILES_SRC` is a dense matmul with no divergence and no barriers,
+and `_MARGIN_SRC` is a simple streaming scan. Fusing them interleaves the two, so 24 of 32 lanes idle behind
+a barrier during every scan phase, and the matmul never reaches the throughput it has on its own. That loss
+exceeds the 2.1 ms of intermediate traffic the fusion saves per chunk.
+
+v2 is the clearest evidence: adding simdgroups made it monotonically worse, so the limit was never a shortage
+of parallel work. v3 recovers most of the gap by batching (0.97x at SIFT with B=4) but does not cross 1.0x.
+
+Not shipped: a correct-but-slower path behind a flag is maintenance cost with no benefit. What remains
+untried is a scan that keeps all 32 lanes busy - one lane per (row, centre) entry of the 8x8 tile, with the
+per-row running minimum reduced through simd shuffles instead of eight lanes scanning serially. That removes
+the idle-lane problem the measurements point at, and is the form a future attempt should take.
