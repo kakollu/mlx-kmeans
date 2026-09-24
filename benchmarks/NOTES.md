@@ -281,3 +281,46 @@ Measured directly, the opt-in `atomic` path is 2.2-4.3x faster than the determin
 (10M x 6 k=8: 3.87 -> 1.79 ms; 10M x 12 k=32: 6.93 -> 1.60 ms; 2M x 50 k=64: 9.53 -> 3.68 ms), consistent
 with the 1.7-4.5x already documented. The SIFT-shaped `tiles` assignment sits at 2% of the bandwidth ceiling
 because it is compute-bound, which is the correct regime for it.
+
+## FlashAttention-style fusion of the tiles path: analysis (September 24, 2026, battery)
+
+FlashAttention's central trick is not tiling for its own sake - it is never materialising the large
+intermediate matrix, keeping blocks on-chip and carrying running statistics instead. Our `tiles` assignment
+path does materialise one: `_DOT_TILES_SRC` writes an (m x k) dot matrix to device memory and `_MARGIN_SRC`
+reads it straight back. So the technique applies here directly. Measured, per chunk:
+
+| Workload | dot kernel (writes m x k) | margin kernel (reads it) | intermediate traffic/pass | vs input X |
+|---|---:|---:|---:|---:|
+| SIFT1M 1M x 128, k=1024 | 3.63 ms, 537 MB | 3.10 ms, 537 MB | 8.6 GB | **16.8x** |
+| GIST 1M x 960, k=1024 | 25.11 ms, 537 MB | 5.75 ms, 537 MB | 8.6 GB | 2.2x |
+
+At SIFT-like shapes the intermediate is 16.8x the actual data. GIST is less affected because its matmul is
+genuinely expensive, so the write is a smaller share.
+
+**The cheap version does not work.** Shrinking the chunk so the dot matrix becomes cache-resident is a
+one-constant change, and it is monotonically worse: at SIFT, 32768 rows gives 0.86x, 8192 gives 0.70x and
+2048 gives 0.28x (labels identical throughout). The cause is the per-chunk launch and sync: at chunk 2048
+there are 488 launch/sync pairs, and at the measured ~0.14 ms round trip that is ~137 ms of the 178 ms.
+Tiling alone cannot help while the two kernels remain separate - which is the argument for real fusion,
+since one kernel removes the intermediate and the per-chunk syncs together.
+
+**A fused pass can stay provably exact.** The obstacle is that the pruning bound needs the global minimum,
+which a streaming kernel does not have. The resolution is the same one FlashAttention uses for the softmax
+maximum: carry a running statistic. Test each centre against the *running* bound, which is always looser than
+the final bound, and compute its exact distance immediately. The set examined is therefore a superset of the
+true candidate set, so the nearest centre is always evaluated exactly. Measured cost of that looseness:
+
+| Workload | survivors/row, final bound | survivors/row, running bound | share of k |
+|---|---:|---:|---:|
+| 128d, k=1024 | 1.00 | 6.7 | 0.65% |
+| 960d, k=1024 | 1.07 | - | 0.10% |
+| 64d, k=256 | 1.00 | - | 0.39% |
+
+6.7 exact distances per row against a matmul of 1024 centres is roughly 0.6% extra arithmetic.
+
+**Expected payoff.** The dot kernel's 537 MB write is ~1.07 ms of its 3.63 ms at ~500 GB/s, so the matmul
+itself is ~2.5 ms. A fused kernel should cost about that plus the ~0.6% extra, against 6.73 ms for the
+current pair - roughly 2.5x on the assignment step at SIFT-like shapes, and less at GIST-like ones where
+the matmul dominates anyway. Not attempted yet: it needs a new simdgroup kernel that keeps 8x8 tiles in
+threadgroup memory, carries a per-row running minimum across centre blocks, and recomputes exact distances
+inline. Correctness must be checked against the existing path before it could replace it.
