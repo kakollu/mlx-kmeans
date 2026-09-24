@@ -38,25 +38,56 @@ class KMeans:
     def from_centers(cls, centers, **kwargs):
         """A fitted model from centers you saved earlier: KMeans.from_centers(np.load("centers.npy"))."""
         centers = np.ascontiguousarray(centers, dtype=np.float32)
+        if not np.isfinite(centers).all():
+            raise ValueError("centers contain NaN or infinity")
         model = cls(n_clusters=len(centers), **kwargs)
         model.cluster_centers_ = centers
         return model
+
+    @staticmethod
+    def _explain_nonfinite(parts):
+        """Say why a pass came back non-finite, then raise. Only called once something has already failed.
+
+        The kernels accumulate a squared distance in float32, so a NaN or infinity in the data, or coordinates
+        large enough for sum((x - c)^2) to overflow, used to surface as nan centers rather than as an error.
+        Every such case makes the first pass's inertia non-finite, which costs nothing to notice; this runs
+        only then, and one reduction distinguishes the three. max(|x|) is nan if any value is NaN and inf if
+        any is infinite, and its size decides the overflow case: the worst a pass can produce is sum over dims
+        of (2*max)^2, so the largest safe magnitude is sqrt(float32_max / (4 * dims)).
+        """
+        mx = core._mx()
+        d = parts[0].shape[1]
+        peak = max(float(mx.max(mx.abs(p))) for p in parts)
+        if not np.isfinite(peak):
+            raise ValueError(
+                "input contains NaN or infinity, which would produce nan centers rather than an error. "
+                "Drop or impute those rows first (the file workflow's missing='drop' does this).")
+        limit = float(np.sqrt(np.finfo(np.float32).max / (4.0 * d)))
+        if peak > limit:
+            raise ValueError(
+                f"largest coordinate is {peak:.3e}, above the {limit:.3e} this many dimensions allow: "
+                f"a squared distance would overflow float32 and return nan. Standardise the features "
+                f"(see the README) or rescale before fitting.")
+        raise ValueError("clustering produced a non-finite result, but the input values look usable; "
+                         "please report this with the data shape and dtype.")
 
     @staticmethod
     def _parts(X):
         """-> list of MLX arrays, one per slice of the data."""
         mx = core._mx()
         if isinstance(X, list) and X and type(X[0]).__module__.startswith("mlx"):
-            return X                                      # already slices on the GPU
-        if type(X).__module__.startswith("mlx"):
-            return [X]
-        if not isinstance(X, np.ndarray):
-            X = np.asarray(X.to_numpy() if hasattr(X, "to_numpy") else X)   # pandas/polars/lists
-        X = np.ascontiguousarray(X, dtype=np.float32)
-        if X.ndim != 2 or not all(X.shape):
-            raise ValueError(f"expected a nonempty 2-D (rows, dims) array, got shape {X.shape}")
-        per = core.slice_rows(X.shape[1])
-        return [mx.array(X[s:s + per]) for s in range(0, len(X), per)]
+            parts = X                                     # already slices on the GPU
+        elif type(X).__module__.startswith("mlx"):
+            parts = [X]
+        else:
+            if not isinstance(X, np.ndarray):
+                X = np.asarray(X.to_numpy() if hasattr(X, "to_numpy") else X)   # pandas/polars/lists
+            X = np.ascontiguousarray(X, dtype=np.float32)
+            if X.ndim != 2 or not all(X.shape):
+                raise ValueError(f"expected a nonempty 2-D (rows, dims) array, got shape {X.shape}")
+            per = core.slice_rows(X.shape[1])
+            parts = [mx.array(X[s:s + per]) for s in range(0, len(X), per)]
+        return parts
 
     @staticmethod
     def _normalise(C):
@@ -71,6 +102,8 @@ class KMeans:
         prev = None
         for it in range(self.max_iter):
             C, inertia, n_empty = core.lloyd_step(parts, C, accumulate=self.accumulate)
+            if not np.isfinite(inertia):            # free: the data, not the algorithm, is the usual cause
+                self._explain_nonfinite(parts)
             if self.spherical:
                 C = self._normalise(C)
             if self.verbose:
@@ -107,8 +140,12 @@ class KMeans:
 
     def predict(self, X):
         """Cluster index for every row of X (any array-like)."""
-        return core.assign_mlx(self._parts(X), self.cluster_centers_, return_labels=True,
-                               accumulate=self.accumulate)[3]
+        parts = self._parts(X)
+        _, _, inertia, labels = core.assign_mlx(parts, self.cluster_centers_, return_labels=True,
+                                                accumulate=self.accumulate)
+        if not np.isfinite(inertia):
+            self._explain_nonfinite(parts)
+        return labels
 
     def fit_predict(self, X, y=None):
         return self.fit(X).labels_
