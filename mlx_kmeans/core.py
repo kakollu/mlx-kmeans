@@ -253,6 +253,34 @@ _DOT_TILES_SRC = """
     }
     simdgroup_store(acc, dot + rt * 8 * K + c0, K);
 """
+# Same arithmetic with 2x2 register blocking: one simdgroup owns a 16x16 output block, so each X tile and each
+# center tile it loads feeds two accumulators instead of one. That halves the tile loads per multiply-accumulate,
+# which is what the 8x8 version is short of - measured 9.5 -> 12.7 TFLOP/s at 128 dims and 10.0 -> 14.5 at 960,
+# against 14.4 and 36.8 for MLX's `@` (which is not usable here: ~6600x eps against this kernel's ~6x).
+# Each output element still accumulates over D in the same order, so results are bit-identical to the 8x8 path.
+_DOT_TILES16_SRC = """
+    uint sg = thread_position_in_grid.x / 32;
+    uint tiles_c = K / 16;
+    uint rt = sg / tiles_c, ct = sg % tiles_c;
+    uint xrow = (row0[0] + rt * 16) * D, c0 = ct * 16;
+    simdgroup_float8x8 a0, a1, b0, b1;
+    simdgroup_float8x8 acc00 = simdgroup_float8x8(0.0f), acc01 = simdgroup_float8x8(0.0f);
+    simdgroup_float8x8 acc10 = simdgroup_float8x8(0.0f), acc11 = simdgroup_float8x8(0.0f);
+    for (uint kk = 0; kk < D; kk += 8) {
+        simdgroup_load(a0, X  + xrow + kk, D);
+        simdgroup_load(a1, X  + xrow + 8 * D + kk, D);
+        simdgroup_load(b0, Ct + kk * K + c0, K);
+        simdgroup_load(b1, Ct + kk * K + c0 + 8, K);
+        simdgroup_multiply_accumulate(acc00, a0, b0, acc00);
+        simdgroup_multiply_accumulate(acc01, a0, b1, acc01);
+        simdgroup_multiply_accumulate(acc10, a1, b0, acc10);
+        simdgroup_multiply_accumulate(acc11, a1, b1, acc11);
+    }
+    simdgroup_store(acc00, dot + (rt * 16)     * K + c0,     K);
+    simdgroup_store(acc01, dot + (rt * 16)     * K + c0 + 8, K);
+    simdgroup_store(acc10, dot + (rt * 16 + 8) * K + c0,     K);
+    simdgroup_store(acc11, dot + (rt * 16 + 8) * K + c0 + 8, K);
+"""
 # In float32, |c|^2 - 2 x.c is off by at most E_c = 3 * gamma_D * (|x|^2 + |c|^2), where gamma_D = D*eps/(1-D*eps)
 # bounds the relative error of a D-term dot product and of |c|^2 (Higham), and sum|x_j c_j| <= (|x|^2+|c|^2)/2 leaves
 # slack for the subtraction. So the truly nearest center c* satisfies approx_c* <= amin + E_cmin + E_c*: only centers
@@ -332,7 +360,9 @@ _REDUCE_SRC = """
     total[e] = s; total_comp[e] = c;
 """
 _kernels = {}
-PAIRS_MIN_DIMS = 64                     # dims from which the pairs/tiles paths beat the rows path (measured)
+PAIRS_MIN_DIMS = 40                     # dims from which the pairs/tiles paths beat the rows path (measured)
+TILES_MIN_K = 64                        # ...and the k from which tiles beats pairs (measured; below it pairs wins
+                                        # by a lot at high dims - 960 dims, k=32: pairs 36.6 ms vs tiles 51.8 ms)
 TILE_THREADGROUP = 512                  # threads per threadgroup in the tiles path (measured best)
 DIST_BYTES = 512 << 20                  # largest (rows x k) float32 distance chunk in the pairs path
 ACC_BYTES = 256 << 20                   # budget for per-block accumulation buffers
@@ -371,15 +401,18 @@ def _tiles_nearest(x, Cm, n, k, d):
     csq = (Cm * Cm).sum(1)
     Ct = mx.array(np.ascontiguousarray(np.array(Cm).T))
     gamma = mx.array([d * eps / (1 - d * eps)], dtype=mx.float32)
-    dot_k = _kernel("kmeans_dot_tiles", ["X", "Ct", "row0"], ["dot"], _DOT_TILES_SRC)
+    # The blocked kernel needs whole 16-row tiles and k a multiple of 16; otherwise fall back to 8x8 tiles.
+    step = 16 if k % 16 == 0 else 8
+    dot_k = (_kernel("kmeans_dot_tiles16", ["X", "Ct", "row0"], ["dot"], _DOT_TILES16_SRC) if step == 16
+             else _kernel("kmeans_dot_tiles", ["X", "Ct", "row0"], ["dot"], _DOT_TILES_SRC))
     margin = _kernel("kmeans_margin", ["X", "C", "csq", "dot", "row0", "gamma"], ["labels", "best_d"], _MARGIN_SRC)
-    chunk = max(8, (DIST_BYTES // (4 * k)) // 8 * 8)
-    whole = n // 8 * 8                       # simdgroup tiles cover whole 8-row tiles; tail rows use the rows kernel
+    chunk = max(step, (DIST_BYTES // (4 * k)) // step * step)
+    whole = n // step * step                 # simdgroup tiles cover whole tiles; tail rows use the rows kernel
     labels, best = [], []
     for r0 in range(0, whole, chunk):
         m = min(chunk, whole - r0)
         dot = dot_k(inputs=[x, Ct, _u32(r0)], template=[("D", d), ("K", k)],
-                    grid=((m // 8) * (k // 8) * 32, 1, 1), threadgroup=(TILE_THREADGROUP, 1, 1),
+                    grid=((m // step) * (k // step) * 32, 1, 1), threadgroup=(TILE_THREADGROUP, 1, 1),
                     output_shapes=[(m * k,)], output_dtypes=[mx.float32])[0]
         lab, bst = margin(inputs=[x, Cm, csq, dot, _u32(r0), gamma], template=[("D", d), ("K", k)],
                           grid=(m, 1, 1), threadgroup=(64, 1, 1),
@@ -501,10 +534,15 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
     mx = _mx()
     k, d = C.shape
     if method == "auto":
+        # Measured on 2M-10M rows: the rows kernel wins below ~40 dims at every k; above that the choice turns on
+        # k, not on dims. The old rule used dims alone, so it sent 48-dim data to rows (1.6x slower than tiles at
+        # k=128) and sent small-k high-dim data to tiles (1.6x slower than pairs at 64 dims, k=8).
         if d < PAIRS_MIN_DIMS:
             method = "rows"
+        elif k >= TILES_MIN_K and d % 8 == 0 and k % 8 == 0:
+            method = "tiles"
         else:
-            method = "tiles" if d % 8 == 0 and k % 8 == 0 else "pairs"
+            method = "pairs"
     Cm = mx.array(C)
     tot = np.zeros((k, d + 2), dtype=np.float64)
     nearest = []
