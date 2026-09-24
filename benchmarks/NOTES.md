@@ -389,3 +389,86 @@ strongest, and nothing at high dimensions. Worth building for the low-dimensiona
 np.array(Cm).T))` every pass, which is a GPU-to-host round trip. On GPU via `mx.contiguous(Cm.T)` it is 5.6x
 faster at k=1024, d=960 (0.933 -> 0.168 ms) and identical, but *slower* at d=128 (0.090 -> 0.147 ms), and even
 the 0.933 ms is 0.4% of a 233 ms GIST pass. Not worth a size-dependent branch on these numbers.
+
+## Things that did not work, and the limits that remain (September 24, 2026, AC power)
+
+Four algorithm-level attempts, all measured, none adopted. Recorded because each is a natural idea and the
+next person will have it too.
+
+**FlashAttention-style fusion of the tiles path.** The path materialises an (m x k) dot matrix and reads it
+straight back - 8.6 GB of intermediate traffic per pass at SIFT shape against 0.51 GB of input. Three fused
+variants were written and all produce bit-identical labels and distances, confirming the running-bound
+exactness argument. None is faster: 0.97x at best (batched centre blocks), 0.41x at GIST shape. Fusing
+interleaves a dense matmul with a scan that idles 24 of 32 lanes, and that utilisation loss exceeds the
+2.1 ms per chunk the fusion saves. Adding simdgroups made it monotonically worse, so parallelism was never
+the limit. Untried: a scan keeping all 32 lanes busy, reducing the per-row minimum through simd shuffles.
+
+**Deterministic on-chip accumulation in fixed-point integers.** Float threadgroup atomics are 2.5-3.5x
+faster than the compensated device-memory path at small k*(dims+2), but they are not reproducible: five fits
+from the same data and seed gave five different answers on every shape tested (inertia spread 1e-10 to
+9e-07). Integer addition is exact and order-independent, so integer atomics are deterministic by
+construction - and that part worked, giving identical results across runs. It fails on range. 64-bit
+threadgroup atomics are not supported on this hardware (`atomic_ulong` aborts the process), and 32 bits must
+be split between the value and headroom for the block size, so precision and speed trade directly against
+each other:
+
+| block size | bits for value | time | vs default | accuracy vs float64 |
+|---:|---:|---:|---:|---:|
+| 4096 | 19 | 2.20 ms | 2.62x | 7.7e-06 |
+| 1024 | 21 | 3.18 ms | 1.82x | 6.5e-06 |
+| 256 | 23 | 13.33 ms | 0.43x | 6.3e-07 |
+| 64 | 25 | 55.52 ms | 0.10x | 5.1e-07 |
+
+Where it is fast it is inaccurate; where it is accurate it is slow, and even the accurate end is 10x worse
+than the float atomics it would replace and six orders worse than the compensated default. With 64-bit
+atomics there would be ~40 bits for the value, giving Kahan-level accuracy at on-chip speed; that is the
+design that would work and this machine cannot run it.
+
+**Bound-based pruning: Hamerly and Yinyang.** Assignments settle quickly - churn falls to 3-6% by iteration
+five - but what matters is how many points can be *proven* unchanged. Hamerly proves few, and fewer as
+dimension rises (11% at 4 dims, 52% at 12, 89% at 128 and 960). Yinyang is much better because it keeps a
+lower bound per group of centres rather than one overall: 26.2% of the n*k distances survive at 4 dims k=256,
+49.3% at 128 dims k=1024, and it keeps improving with iteration (15% by the eighth). That is a real
+reduction in work, and it is exact.
+
+It still loses on this machine, for opposite reasons at the two ends:
+
+| config | distance work | bound I/O | survives | net |
+|---|---:|---:|---:|---:|
+| geo 10M x 4, k=256 | 2.8 ms | 4.5 ms | 26% | -2.4 ms |
+| satellite 10M x 12, k=32 | 1.0 ms | 0.7 ms | 75% | -0.4 ms |
+| logs 10M x 32, k=256 | 22.3 ms | 4.5 ms | 64% | **+3.5 ms** |
+| SIFT 1M x 128, k=1024 | 18.3 ms | 1.8 ms | 49% | -5.0 ms |
+| GIST 1M x 960, k=1024 | 137.5 ms | 1.8 ms | 49% | -25.8 ms |
+
+At low dimensions the n*(k/10) lower bounds cost more to read and write than the distances they remove -
+pruning only pays when a distance is expensive per point, and at 4 dims it is nearly free. At high
+dimensions the pruned work is irregular and cannot use the simdgroup matmul, dropping from 14.3 to about
+6 TFLOP/s, so Yinyang must prune more than 58% merely to break even and it prunes 51%. Only `logs` nets
+positive, and by 1.2x on the pass. The general lesson is that the hardware has moved the crossover: doing
+more arithmetic at the matmul rate beats doing less of it irregularly, by a factor of 2.4x here.
+
+## Input limits, measured
+
+Behaviour on degenerate input, worth knowing before trusting a result:
+
+| Input | Behaviour |
+|---|---|
+| k > rows | raises ValueError |
+| 1-D input | raises ValueError |
+| k == rows, k = 1, single row | correct, inertia 0 where expected |
+| all points identical, zero-variance column | correct |
+| float64 or integer input | converted, correct |
+| k up to 65,536 | works |
+| **NaN in the data** | **silently returns nan, no error** |
+| **inf in the data** | **silently returns nan, no error** |
+| **coordinates above ~1e18** | **silently returns nan**: squared distances overflow float32 above ~1.8e19 |
+
+The last three are the gap. Values up to 1e15 are fine (inertia 5.0e33), so the failure is confined to
+genuinely extreme magnitudes, but it is silent in all three cases - a caller gets nan centres rather than an
+error. Standardising the features, which the file workflow does by default and the README recommends for
+other reasons, avoids all three.
+
+Capacity per GPU slice, set by uint32 indexing in the kernels (row * dims must fit): 100M rows up to 42
+dims, 33.5M at 128 dims, 4.47M at 960 dims. Above that the data is held as several slices, which the API
+accepts as a list of MLX arrays; the billion-row regression uses this.
