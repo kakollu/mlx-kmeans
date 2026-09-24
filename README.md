@@ -120,11 +120,10 @@ a timestamped text report under `benchmarks/`. It does not use `sudo` or change 
 GitHub and Python package downloads is required; the fallback also needs access to Astral. A managed Mac can still
 block downloads or execution.
 
-**If the Mac is not yours, ask first.** Not needing an administrator password is not the same as being allowed:
-a borrowed laptop, a work or university machine, or a retail display unit may have a policy against downloading
-and running software, whatever the file permissions say. Downloading a ZIP and executing it is more than browsing.
-Run `./no_admin_bench.sh --cleanup` and delete the folder when you are done, and take the report with you rather
-than leaving it behind.
+**On a machine that is not yours.** A store display Mac is there to be tried, and running the work you actually
+care about is a fairer test than a spec sheet — that is the case this script was written for. Leave it as you
+found it: `./no_admin_bench.sh --cleanup`, delete the folder, and take the report with you. A borrowed laptop or
+a work or university machine is a different matter, since those are not there to be evaluated; ask first.
 
 Download it as a ZIP. `curl` and `ditto` ship with macOS, so this needs no install of any kind — and on a Mac
 without developer tools, typing `git` triggers a multi-minute Xcode Command Line Tools download you do not need
