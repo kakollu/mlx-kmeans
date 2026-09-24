@@ -9,9 +9,12 @@ Start with the [file guide](docs/USING_YOUR_FILES.md), [notebook](examples/clust
 [examples/satellite_landcover.ipynb](examples/satellite_landcover.ipynb) — 96M satellite pixels clustered into
 land-cover classes, with saved outputs so it reads without running.
 
-On a 128 GB M5 Max, six measured workloads showed **2.2–8.1× faster passes** than the fastest of the libraries
-compared here — scikit-learn, FAISS and fast-pytorch-kmeans — with matching final inertia.
-See [benchmark conditions and results](benchmarks/VERIFICATION-2026-09-19.md).
+On a 128 GB M5 Max, six measured workloads showed **2.8–9.4× faster passes** than the fastest of the libraries
+compared here — scikit-learn, FAISS and fast-pytorch-kmeans — with matching final inertia. Per-config numbers are
+in [BENCHMARKS.md](BENCHMARKS.md); conditions and an independent rerun are in
+[benchmarks/VERIFICATION-2026-09-19.md](benchmarks/VERIFICATION-2026-09-19.md), which measured 2.2–8.1× before the
+September 24 kernel work. Seven Apple Silicon machines have now been measured:
+[benchmarks/MACHINES-2026-09-24.md](benchmarks/MACHINES-2026-09-24.md).
 
 For a local file, after installing `.[files]`:
 
