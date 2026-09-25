@@ -16,11 +16,12 @@ class KMeans:
     want for text/image embeddings compared by cosine similarity - give it L2-normalised rows.
 
     exact=False allows an approximate assignment: distances from a matmul in the expanded form, argmin taken
-    on trust. It changes nothing below 256 dimensions - there the exact paths are faster as well as exact -
-    so the flag is ignored. Above it the gain grows with dimension: 1.97x at 256, 1.96x at 384, 2.16x at 960,
-    because MLX's matmul reaches hardware these kernels cannot, at about 630x the error. Where the data's
-    norms allow it (|x||c| well inside float16's range - true of normalised embeddings, not of raw SIFT) the
-    multiply runs in float16 for another ~1.4x: GIST1M fits 2.68x faster than exact. Labels stop being provably optimal - about 0.15% of rows get a different
+    on trust. Where the exact paths are faster as well as exact the flag is ignored, and where that is depends
+    on the data: if its norms let the multiply run in float16 (|x||c| well inside float16's range - true of
+    normalised embeddings, not of raw SIFT) the approximate path wins from 64 dimensions (1.14x at 64, 1.34x
+    at 96, 2.68x on a GIST1M fit at 960); if not, it wins from 256 (1.97x at 256, 2.16x at 960 in fp32).
+    Below those the flag does nothing. The reason is that MLX's matmul reaches hardware these kernels cannot,
+    at about 630x the error. Labels stop being provably optimal - about 0.15% of rows get a different
     centre in a pass, costing 1e-7 of the distance - and inertia_ is still the TRUE inertia of the labels
     returned, so an approximate run stays comparable with an exact one. On GIST1M at k=1024 it fits 2.68x
     faster for 0.003% more inertia and recall@10 through a FAISS IVF index that is the same to within noise

@@ -889,25 +889,32 @@ def _accumulate_sorted_dist(x, labels, k, Cm):
 # product x.c must stay well inside it: |x.c| <= |x||c| (Cauchy-Schwarz), and the guard requires that bound
 # under a quarter of the range. SIFT fails it (|x|^2 ~ 2.6e5, every row overflows, 99.9% of labels garbage);
 # GIST passes with room to spare (bound ~55). Accumulation always reads the original float32 X.
+APPROX_MIN_DIMS_FP16 = 64               # ...but when the data admits the fp16 multiply the crossover is much
+                                        # lower: measured approx ahead from 64 dims (1.14x at k=64 and 256,
+                                        # 1.01x at 1024; 1.26x at 80; 1.34x at 96) and behind at 48 and below.
+                                        # On data that refuses fp16 - SIFT - the cascade still wins at 128
+                                        # (21.1 against 24.4 ms), so the 256 threshold stands there.
 APPROX_FP16_LIMIT = 65504.0 / 4
 APPROX_FP16_ACCUMULATE = True           # sum the new centres from the fp16 copy too (sums stay float32, compensated)
 _approx_state = {}
 
 
 def _approx_prepare(parts):
-    """-> (float16 copies of the slices, max |x|^2), built once per dataset and kept."""
+    """-> per-dataset state: max |x|^2 (computed once), float16 copies (built on first use, kept)."""
     mx = _mx()
     key = (id(parts[0]), tuple(p.shape for p in parts))
     st = _approx_state.get(key)
     if st is None:
         _approx_state.clear()                           # one dataset at a time; the copies are large
-        xsqmax = max(float(mx.max(mx.sum(p * p, axis=1))) for p in parts)
-        halves = None
-        if np.isfinite(xsqmax):
-            halves = [p.astype(mx.float16) for p in parts]
-            mx.eval(halves)
-        st = _approx_state[key] = {"xsqmax": xsqmax, "half": halves}
+        st = _approx_state[key] = {"xsqmax": max(float(mx.max(mx.sum(p * p, axis=1))) for p in parts),
+                                   "half": None}
     return st
+
+
+def _approx_fp16_ok(st, C):
+    """Cauchy-Schwarz: |x.c| <= |x||c| must sit well inside float16's range for the product to be usable."""
+    return np.isfinite(st["xsqmax"]) and \
+        np.sqrt(st["xsqmax"] * float(np.einsum("ij,ij->i", C, C).max())) < APPROX_FP16_LIMIT
 
 
 def _approx_nearest(x, Cm, n, k, d):
@@ -1377,12 +1384,17 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
     """One assignment pass -> (float64 totals (k, d+2), [(labels, best) per slice] as MLX arrays)."""
     mx = _mx()
     k, d = C.shape
-    if method == "approx" and d < APPROX_MIN_DIMS:
-        method = "auto"           # below the crossover the exact kernels are faster as well as exact
+    if method == "approx":
+        # Two crossovers, because the fp16 multiply is ~1.4x faster than fp32 and moves where the
+        # approximate path starts to pay: 64 dims if the data admits fp16, 256 if it does not.
+        st = _approx_prepare(parts) if d >= APPROX_MIN_DIMS_FP16 else None
+        use_half = st is not None and _approx_fp16_ok(st, C)
+        if d < (APPROX_MIN_DIMS_FP16 if use_half else APPROX_MIN_DIMS):
+            method = "auto"       # below the crossover the exact kernels are faster as well as exact
     if method == "approx" and accumulate == "auto":
-        st = _approx_prepare(parts)
-        csqmax = float(np.einsum("ij,ij->i", C, C).max())      # float32 is plenty for a guard with 4x margin
-        use_half = st["half"] is not None and np.sqrt(st["xsqmax"] * csqmax) < APPROX_FP16_LIMIT
+        if use_half and st["half"] is None:
+            st["half"] = [p.astype(mx.float16) for p in parts]
+            mx.eval(st["half"])
         Cm = mx.array(C)
         csq = (Cm * Cm).sum(1)
         Ct = mx.contiguous(Cm.T)
