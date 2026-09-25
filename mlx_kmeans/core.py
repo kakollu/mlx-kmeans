@@ -466,6 +466,9 @@ TILES1_DIMS = (32, 96)                  # dims it is worth using over. Below 32 
                                         # the multiply it replaces, and zero-padding a short row wastes a
                                         # growing share of the tile (2x at 4 dims); above 96 the row tiles
                                         # spill out of registers and it loses 3x.
+TILES1_RELOAD_DIMS = 224                # ...and how far the same path reaches once the row tiles are
+                                        # re-read from cache instead of held in registers. Past this the
+                                        # re-reads cost more than the n x k matrix they avoid (0.87x at 256).
 TILES1_MIN_K = 64                       # ...and the k from which it wins consistently (measured; at k=32 it
                                         # ranges from 0.55x to 2.07x across dims, which is not worth picking)
 TILES1_MAX_FALLBACK = 0.10              # simdgroup fallback rate past which this path stops being worth it. A
@@ -683,6 +686,33 @@ def _tiles1_src(r):
 """)
 
 
+def _tiles1_reload_src(r):
+    """The same kernel with the row tiles re-read from X inside the centre loop, not held in registers.
+
+    Holding them across the whole centre loop is what caps the register version at 96 dims. Re-reading
+    costs one extra pair of simdgroup_loads per centre tile, but a 16 x dims row block is only kilobytes
+    and stays in cache, which this machine serves at ~2 TB/s against 400-480 GB/s for DRAM - so it is
+    nearly free, and the cap disappears. Measured against the materialising tiles path: 1.49x at 128 dims,
+    1.30x at 160, 1.29x at 192, then 0.87x at 256, where the re-reads finally cost more than the n x k
+    matrix they avoid.
+
+    Staging the block in threadgroup memory instead was tried and is worse - 0.78x at 192 dims, 0.31x at
+    480 - because the register file is far larger than the 32 KB of threadgroup memory, so that trades a
+    plentiful resource for a scarce one and occupancy collapses as dimension grows.
+
+    Needs dims to be a multiple of 8: there is nowhere to stage a ragged tile once per centre tile.
+    """
+    body = _tiles1_src(r)
+    body = body.replace('    simdgroup_float8x8 a0[DK], a1[DK];\n    for (uint kk = 0; kk < DFULL; kk++) {\n        simdgroup_load(a0[kk], X + xrow + kk * 8, D);\n        simdgroup_load(a1[kk], X + xrow + 8 * D + kk * 8, D);\n    }\n    if (DFULL < DK) {                              // ragged last tile: stage it zero-padded on chip\n        for (uint e = lane; e < 128; e += 32) {\n            uint r = e / 8, j = DFULL * 8 + (e % 8);\n            T[e] = (j < D) ? X[xrow + r * D + j] : 0.0f;\n        }\n        simdgroup_barrier(mem_flags::mem_threadgroup);\n        simdgroup_load(a0[DFULL], T, 8);\n        simdgroup_load(a1[DFULL], T + 64, 8);\n        simdgroup_barrier(mem_flags::mem_threadgroup);\n    }\n', "")
+    body = body.replace('        for (uint kk = 0; kk < DK; kk++) {\n            simdgroup_load(b0, Ct + kk * 8 * KP + c0, KP);', '        for (uint kk = 0; kk < DK; kk++) {\n            simdgroup_load(b0, Ct + kk * 8 * KP + c0, KP);'.replace(
+        "            simdgroup_load(b0,",
+        "            simdgroup_load(ar0, X + xrow + kk * 8, D);\n"
+        "            simdgroup_load(ar1, X + xrow + 8 * D + kk * 8, D);\n"
+        "            simdgroup_load(b0,"))
+    body = body.replace("simdgroup_float8x8 b0, b1;", "simdgroup_float8x8 b0, b1, ar0, ar1;")
+    return body.replace("a0[kk]", "ar0").replace("a1[kk]", "ar1")
+
+
 def _tiles1_nearest(x, Cm, n, k, d, flags=None):
     """Nearest centre with no materialised distance matrix -> (labels, best). Exact.
 
@@ -706,8 +736,10 @@ def _tiles1_nearest(x, Cm, n, k, d, flags=None):
     if kp > k:
         csq = mx.concatenate([csq, mx.full((kp - k,), float("inf"), dtype=mx.float32)])
     gamma = mx.array([dp * eps / (1 - dp * eps)], dtype=mx.float32)
-    kern = _kernel(f"kmeans_tiles1_{TILES1_KEEP}", ["X", "Ct", "C", "csq", "csqmax", "row0", "gamma"],
-                   ["labels", "best_d", "fb"], _tiles1_src(TILES1_KEEP), _SCORE_HDR)
+    reload = d > TILES1_DIMS[1]
+    kern = _kernel(f"kmeans_tiles1_{TILES1_KEEP}_{int(reload)}",
+                   ["X", "Ct", "C", "csq", "csqmax", "row0", "gamma"], ["labels", "best_d", "fb"],
+                   _tiles1_reload_src(TILES1_KEEP) if reload else _tiles1_src(TILES1_KEEP), _SCORE_HDR)
     whole = n // 16 * 16                     # whole row tiles here; the tail goes to the rows kernel
     labels, best = [], []
 
@@ -1231,7 +1263,8 @@ def _tiles1_ok(d, k):
 
     Dimensions and k need not be multiples of anything - the kernel pads both, exactly.
     """
-    return TILES1_DIMS[0] <= d <= TILES1_DIMS[1] and k >= TILES1_MIN_K
+    top = TILES1_RELOAD_DIMS if d % 8 == 0 else TILES1_DIMS[1]
+    return TILES1_DIMS[0] <= d <= top and k >= TILES1_MIN_K
 
 
 def _gpu_pass(parts, C, method="auto", accumulate="auto"):
