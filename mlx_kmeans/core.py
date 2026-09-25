@@ -432,6 +432,9 @@ _REDUCE_SRC = """
 _kernels = {}
 PAIRS_MIN_DIMS = 64                     # dims from which the pairs path beats the rows path (measured)
 TILES_MIN_DIMS = 40                     # ...and the dims from which tiles beats rows, which is lower
+FUSED_MAX_KW = 128                      # k*(dims+2) past which the fused kernel loses (measured)
+FUSED_ROWS_PER_BLOCK = 4096             # rows per threadgroup; 512-65536 all measured within 25%
+TG_FLOATS = 8192                        # threadgroup memory on Apple Silicon, in float32 slots
 MARGIN_CANDIDATES = 24                  # per-row candidate slots before falling back to a second scan
 ROWS_REG_MAX_DIMS = 96                  # above this the per-thread row array spills registers (measured)
 TILES_MIN_K = 64                        # ...and the k from which tiles beats pairs (measured; below it pairs wins
@@ -605,6 +608,73 @@ def _accumulate_blocks(x, labels, best, k):
     return (np.array(total, dtype=np.float64) + np.array(total_comp, dtype=np.float64)).reshape(k, w)
 
 
+# Assigning and accumulating in one kernel. The two-kernel form reads X twice and every row does a
+# read-modify-write into a device-memory buffer; both disappear if each thread keeps its own compensated
+# slots in threadgroup memory. No atomics, so it stays deterministic, and labels are identical.
+#
+# The cost is capacity: a thread needs k*(dims+2) slots in each of two arrays, so the threads per group are
+# TG_FLOATS/2 divided by that. Measured on 10M rows, gain against a full lloyd_step by k*(dims+2):
+# 16-32 -> ~6x, 64 -> 2.4-2.9x, 96 -> 1.85x, 128 -> 1.1-1.3x, 256 -> 0.79x, 448 -> 0.57x. Past ~128 the
+# group is too thin to fill the GPU and the per-group zeroing, which does not shrink with the work, takes
+# over. Row count, label skew (98% in one cluster still gave 2.97x) and block size barely matter.
+_FUSED_SRC = """
+    threadgroup float sums[TG * KW];
+    threadgroup float comp[TG * KW];
+    uint lid = thread_position_in_threadgroup.x, b = threadgroup_position_in_grid.x, W = D + 2;
+    for (uint e = 0; e < KW; e++) { sums[lid * KW + e] = 0.0f; comp[lid * KW + e] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint start = b * BS, end = min(start + BS, uint(N));
+    for (uint i = start + lid; i < end; i += TG) {
+        uint xi = i * D;
+        float xv[D];
+        for (uint j = 0; j < D; j++) xv[j] = X[xi + j];
+        float best = INFINITY; uint bl = 0;
+        for (uint c = 0; c < K; c++) {
+            float s = 0;
+            for (uint j = 0; j < D; j++) { float t = xv[j] - C[c * D + j]; s += t * t; }
+            bool lt = s < best; best = select(best, s, lt); bl = select(bl, c, lt);
+        }
+        labels[i] = bl; best_d[i] = best;
+        uint o = lid * KW + bl * W;
+        sums[o] += 1.0f;                                   // exact: counts stay well inside 2^24
+        KAHAN_ADD(sums[o + 1], comp[o + 1], best);
+        for (uint j = 0; j < D; j++) KAHAN_ADD(sums[o + 2 + j], comp[o + 2 + j], xv[j]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = lid; e < KW; e += TG) {
+        float s = 0.0f, c = 0.0f;
+        for (uint t = 0; t < TG; t++) { KAHAN_ADD(s, c, sums[t * KW + e]); KAHAN_ADD(s, c, comp[t * KW + e]); }
+        out[b * KW + e] = s + c;
+    }
+"""
+_fused_broken = set()          # (dims, k) this GPU would not compile; probed by trying, once each
+
+
+def _fused_plan(d, k):
+    """-> (threads per group, rows per block) if one kernel can do this shape here, else None."""
+    kw = k * (d + 2)
+    if kw > FUSED_MAX_KW or d > ROWS_REG_MAX_DIMS or (d, k) in _fused_broken:
+        return None
+    tg = min(64, (TG_FLOATS // 2 // kw) // 8 * 8)
+    return (tg, FUSED_ROWS_PER_BLOCK) if tg >= 8 else None
+
+
+def _fused_pass(x, Cm, k, tg, bs):
+    """Assignment and accumulation in one read of X -> (totals (k, d+2) float64, labels, best)."""
+    mx = _mx()
+    n, d = x.shape
+    w, kw = d + 2, k * (d + 2)
+    nb = -(-n // bs)
+    kern = _kernel(f"kmeans_fused_{d}_{k}_{tg}", ["X", "C"], ["out", "labels", "best_d"], _FUSED_SRC, _KAHAN)
+    out, labels, best = kern(inputs=[x, Cm],
+                             template=[("D", d), ("K", k), ("KW", kw), ("TG", tg), ("BS", bs), ("N", n)],
+                             grid=(nb * tg, 1, 1), threadgroup=(tg, 1, 1), init_value=0,
+                             output_shapes=[(nb * kw,), (n,), (n,)],
+                             output_dtypes=[mx.float32, mx.uint32, mx.float32])
+    tot = np.array(out, dtype=np.float64).reshape(nb, k, w).sum(0)
+    return tot, labels, best
+
+
 def _gpu_pass(parts, C, method="auto", accumulate="auto"):
     """One assignment pass -> (float64 totals (k, d+2), [(labels, best) per slice] as MLX arrays)."""
     mx = _mx()
@@ -623,7 +693,17 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
     Cm = mx.array(C)
     tot = np.zeros((k, d + 2), dtype=np.float64)
     nearest = []
+    plan = _fused_plan(d, k) if accumulate == "auto" and method == "rows" else None
     for x in parts:
+        if plan is not None:
+            try:
+                part, labels, best = _fused_pass(x, Cm, k, *plan)
+                tot += part
+                nearest.append((labels, best))
+                continue
+            except Exception:                 # a GPU that will not take the threadgroup allocation
+                _fused_broken.add((d, k))
+                plan = None
         labels, best = _nearest(x, Cm, method)
         tot += _accumulate(x, labels, best, k, accumulate)
         nearest.append((labels, best))
