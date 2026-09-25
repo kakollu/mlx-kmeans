@@ -187,3 +187,24 @@ Side finding: at identical centres the fused kernel's labels differ from exact o
 against ~2,000 for MLX's fp32 matmul path at the same scale - fp16 inputs with fp32 accumulation in a custom
 kernel are about four times *more* accurate than MLX's matmul, consistent with the ~5,900 x eps error measured
 for it earlier. Slower, but more faithful.
+
+### Correction, later the same day: the approximate path was not at its endpoint
+
+Satya pushed back on "the current MLX matmul plus fused argmin is the endpoint" - the external comparison
+showed a whole iteration on GIST done in 26.1 ms against our approximate path's 41.4, and that path has no
+exactness constraint to hide behind. Decomposing it stage by stage found two things:
+
+- the pass read X three times: once for the multiply, once for a separate "distance to chosen centre" kernel,
+  once for accumulation. The distance is now computed inside the sorted accumulator, where the row is being
+  read anyway and the centre is fixed per segment. One pass gone.
+- **fp16 had been wrongly rejected.** The earlier 1.06x measurement converted all of X to fp16 inside the call,
+  every iteration - 5.5 ms of a 41 ms pass, eating most of the 1.44x the multiply gained. Converted once per
+  dataset and kept, fp16 delivers: 49 against 34 TFLOP/s on GIST.
+
+GIST 500k x 960, k=1024, per pass: 41.1 -> 27.3 ms (1.51x). Full fit 2.68x faster than exact (was 1.61x),
+recall@10 92.43% against 92.44% exact. The guard is Cauchy-Schwarz on the norms; SIFT correctly refuses fp16.
+
+So the endpoint claim was wrong, and the reason is worth keeping: the rejection rested on one measurement
+whose setup charged a one-time cost to every iteration. The fused-kernel conclusion above still stands - the
+custom-instruction ceiling is real - but "we cannot write a faster multiply" is not the same as "the path
+around the multiply is done".

@@ -487,8 +487,9 @@ CASCADE_MAX_SURVIVORS = 0.15            # survivor fraction past which pruning c
 _cascade_state = {}                     # per dataset: variance order, prefix buffer, last pass's labels
 APPROX_MIN_DIMS = 256                   # dims from which giving up exactness buys anything at all. Below it
                                         # the exact paths win outright - the prefix-pruning cascade at 128
-                                        # dims (0.75x) and 192 (0.91x) - and above it the approximate path
-                                        # pulls ahead: 1.81x at 256, 1.92x at 384, 2.26x at 960. This moved
+                                        # dims (0.76x) and 192 (0.95x) - and above it the approximate path
+                                        # pulls ahead: 1.97x at 256, 1.96x at 384, 2.16x at 960 in fp32, and
+                                        # more where the fp16 guard passes (GIST: 2.68x on a fit). This moved
                                         # down from 384 when the approximate path stopped walking the n x k
                                         # product four times; it is a property of both paths, so it has to
                                         # be re-measured whenever either changes.
@@ -794,7 +795,7 @@ _APPROX_ARGMIN_SRC = """
     uint i = thread_position_in_grid.x / 32, lane = thread_position_in_grid.x % 32, di = i * K;
     float amin = INFINITY; uint cmin = 0;
     for (uint c = lane; c < K; c += 32) {
-        float a = csq[c] - 2 * dot[di + c];
+        float a = csq[c] - 2 * (float)dot[di + c];
         bool lt = a < amin; amin = select(amin, a, lt); cmin = select(cmin, c, lt);
     }
     float g = simd_min(amin);
@@ -802,6 +803,111 @@ _APPROX_ARGMIN_SRC = """
     cc = simd_min(cc);
     if (lane == 0) labels[i] = cc;
 """
+
+
+def _approx_labels(xin, Ct, csq, n, k):
+    """Chunked matmul + one fused argmin pass -> labels. xin/Ct may be float32 or float16."""
+    mx = _mx()
+    per = max(1, DIST_BYTES // (xin.dtype.size * k))     # an fp16 product is half the bytes: half the chunks
+    amin = _kernel("kmeans_approx_argmin", ["dot", "csq"], ["labels"], _APPROX_ARGMIN_SRC)
+    labels = []
+    for r0 in range(0, n, per):
+        m = min(per, n - r0)
+        lab = amin(inputs=[xin[r0:r0 + m] @ Ct, csq], template=[("K", k)], grid=(m * 32, 1, 1),
+                   threadgroup=(256, 1, 1), output_shapes=[(m,)], output_dtypes=[mx.uint32])[0]
+        mx.eval(lab)                          # bound memory: one chunk of the product alive at a time
+        labels.append(lab)
+    return labels[0] if len(labels) == 1 else mx.concatenate(labels)
+
+
+# The sorted accumulator, but computing each row's distance to its centre on the way through instead of
+# taking it as input. A segment is one cluster, so the centre is fixed for the whole segment and cache-
+# resident; the row is being read anyway. This removes the separate distance pass the approximate path used
+# to make - a whole extra read of X, 4.7 ms of a 41 ms pass on GIST.
+_SEGMENT_DIST_SRC = """
+    uint s = thread_position_in_grid.x / 32, lid = thread_position_in_grid.x % 32;
+    const uint W = D + 2, DPD = (D + 31) / 32;
+    uint ci = seg_cluster[s] * D;
+    float acc[DPL], carry[DPL];
+    for (uint c = 0; c < DPL; c++) { acc[c] = 0.0f; carry[c] = 0.0f; }
+    for (uint p = seg_start[s]; p < seg_end[s]; p++) {
+        uint r = perm[p], xi = r * D;
+        float dd = 0;
+        for (uint c = 0; c < DPD; c++) {
+            uint j = lid + c * 32;
+            if (j < D) { float q = (float)X[xi + j] - C[ci + j]; dd += q * q; }
+        }
+        dd = simd_sum(dd);
+        if (lid == 0) best_out[r] = dd;
+        for (uint c = 0; c < DPL; c++) {
+            uint e = lid + c * 32;
+            if (e < W) {
+                float v = (e >= 2) ? (float)X[xi + e - 2] : ((e == 0) ? 1.0f : dd);
+                KAHAN_ADD(acc[c], carry[c], v);
+            }
+        }
+    }
+    for (uint c = 0; c < DPL; c++) {
+        uint e = lid + c * 32;
+        if (e < W) { sums[s * W + e] = acc[c]; comp[s * W + e] = carry[c]; }
+    }
+"""
+
+
+def _accumulate_sorted_dist(x, labels, k, Cm):
+    """Sorted accumulation that also returns each row's distance to its centre -> (totals, best)."""
+    mx = _mx()
+    n, d = x.shape
+    w = d + 2
+    perm = mx.argsort(labels).astype(mx.uint32)
+    counts = np.array(mx.zeros((k,), dtype=mx.uint32).at[labels].add(mx.array(1, dtype=mx.uint32))).astype(np.int64)
+    offs = np.concatenate([[0], np.cumsum(counts)])
+    nseg = -(-counts // SEGMENT_ROWS)
+    seg_first = np.concatenate([[0], np.cumsum(nseg)])
+    seg_cluster = np.repeat(np.arange(k), nseg)
+    starts = offs[seg_cluster] + (np.arange(len(seg_cluster)) - seg_first[seg_cluster]) * SEGMENT_ROWS
+    ends = np.minimum(starts + SEGMENT_ROWS, offs[seg_cluster + 1])
+    ns = len(starts)
+    seg = _kernel("kmeans_segments_dist", ["X", "C", "perm", "seg_start", "seg_end", "seg_cluster"],
+                  ["sums", "comp", "best_out"], _SEGMENT_DIST_SRC, _KAHAN)
+    sums, comp, best = seg(inputs=[x, Cm, perm, mx.array(starts.astype(np.uint32)), mx.array(ends.astype(np.uint32)),
+                                   mx.array(seg_cluster.astype(np.uint32))],
+                           template=[("D", d), ("DPL", -(-w // 32))], grid=(ns * 32, 1, 1), threadgroup=(256, 1, 1),
+                           output_shapes=[(ns * w,), (ns * w,), (n,)],
+                           output_dtypes=[mx.float32, mx.float32, mx.float32])
+    red = _kernel("kmeans_segment_reduce", ["sums", "comp", "seg_first"], ["total", "total_comp"], _SEGMENT_REDUCE_SRC, _KAHAN)
+    total, total_comp = red(inputs=[sums, comp, mx.array(seg_first.astype(np.uint32))], template=[("W", w)],
+                            grid=(w, k, 1), threadgroup=(32, 8, 1),
+                            output_shapes=[(k * w,), (k * w,)], output_dtypes=[mx.float32, mx.float32])
+    tot = (np.array(total, dtype=np.float64) + np.array(total_comp, dtype=np.float64)).reshape(k, w)
+    return tot, best
+
+
+# float16 for the approximate multiply: MLX's matmul runs at ~49 TFLOP/s in fp16 against ~34 in fp32 on GIST.
+# X is converted ONCE per dataset and kept (converting per call costs 5.5 ms and eats the gain - an earlier
+# test did exactly that and wrongly concluded fp16 was worth only 6%). fp16 tops out at 65504, so the
+# product x.c must stay well inside it: |x.c| <= |x||c| (Cauchy-Schwarz), and the guard requires that bound
+# under a quarter of the range. SIFT fails it (|x|^2 ~ 2.6e5, every row overflows, 99.9% of labels garbage);
+# GIST passes with room to spare (bound ~55). Accumulation always reads the original float32 X.
+APPROX_FP16_LIMIT = 65504.0 / 4
+APPROX_FP16_ACCUMULATE = True           # sum the new centres from the fp16 copy too (sums stay float32, compensated)
+_approx_state = {}
+
+
+def _approx_prepare(parts):
+    """-> (float16 copies of the slices, max |x|^2), built once per dataset and kept."""
+    mx = _mx()
+    key = (id(parts[0]), tuple(p.shape for p in parts))
+    st = _approx_state.get(key)
+    if st is None:
+        _approx_state.clear()                           # one dataset at a time; the copies are large
+        xsqmax = max(float(mx.max(mx.sum(p * p, axis=1))) for p in parts)
+        halves = None
+        if np.isfinite(xsqmax):
+            halves = [p.astype(mx.float16) for p in parts]
+            mx.eval(halves)
+        st = _approx_state[key] = {"xsqmax": xsqmax, "half": halves}
+    return st
 
 
 def _approx_nearest(x, Cm, n, k, d):
@@ -1273,6 +1379,24 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
     k, d = C.shape
     if method == "approx" and d < APPROX_MIN_DIMS:
         method = "auto"           # below the crossover the exact kernels are faster as well as exact
+    if method == "approx" and accumulate == "auto":
+        st = _approx_prepare(parts)
+        csqmax = float(np.einsum("ij,ij->i", C, C).max())      # float32 is plenty for a guard with 4x margin
+        use_half = st["half"] is not None and np.sqrt(st["xsqmax"] * csqmax) < APPROX_FP16_LIMIT
+        Cm = mx.array(C)
+        csq = (Cm * Cm).sum(1)
+        Ct = mx.contiguous(Cm.T)
+        if use_half:
+            Ct = Ct.astype(mx.float16)
+        tot = np.zeros((k, d + 2), dtype=np.float64)
+        nearest = []
+        for j, x in enumerate(parts):
+            xin = st["half"][j] if use_half else x
+            lab = _approx_labels(xin, Ct, csq, x.shape[0], k)
+            part, best = _accumulate_sorted_dist(xin if APPROX_FP16_ACCUMULATE else x, lab, k, Cm)
+            tot += part
+            nearest.append((lab, best))
+        return tot, nearest
     casc = None
     forced = method == "cascade"                     # by name: used by the accuracy suite
     if (method == "auto" or forced) and _cascade_ok(d, k):

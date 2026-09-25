@@ -746,6 +746,16 @@ TFLOP/s unit regardless of type. MLX reaches 36-52 TFLOP/s through hardware cust
 address, which settles the high-dimensional question for this library: fusion cannot recover the multiply
 throughput it gives up, at any precision.
 
+## The approximate path had a third of its time in avoidable passes (September 25, 2026)
+
+At 960 dims the `exact=False` pass read X three times - multiply, a separate kernel for the distance to the
+chosen centre, and accumulation - and the fp16 multiply had been rejected on a test that converted X every
+call. Fixing both: GIST 500k x 960, k=1024, 41.1 -> 27.3 ms a pass, 2.68x on a full fit against exact (was
+1.61x), recall@10 unchanged (92.43% vs 92.44%). fp16 is gated by a Cauchy-Schwarz bound on |x||c| against a
+quarter of float16's range; SIFT fails it and stays fp32, as it must - every SIFT row's |x|^2 overflows.
+
+The correction to the record: "fp16 is worth 6%" was a measurement of my test harness, not of fp16.
+
 ## Input limits, measured
 
 Behaviour on degenerate input, worth knowing before trusting a result:
