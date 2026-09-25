@@ -854,13 +854,82 @@ _SEGMENT_DIST_SRC = """
 """
 
 
+# Rows grouped by label without a comparison sort. Labels are uint32 below k, so mx.argsort - O(n log n),
+# 6 ms at 10M rows - was the wrong tool; it was 22% of the logs step. Three kernels, deterministic and
+# stable (rows of one label keep ascending order, which is what the segment kernels' summation order rests
+# on): per-block histograms via threadgroup atomics (counts only, so order cannot matter), a scan over
+# blocks per label, and a sequential per-block scatter. Measured against mx.argsort: 1.2x at 2M rows k=64,
+# 4.7x at 10M k=256, 6.0x at 20M k=32. The per-label totals come out of the scan for free, replacing the
+# scatter-add that computed counts before.
+_CSORT_HIST_SRC = """
+    threadgroup atomic_uint h[K];
+    uint lid = thread_position_in_threadgroup.x, b = threadgroup_position_in_grid.x;
+    for (uint c = lid; c < K; c += TG) atomic_store_explicit(&h[c], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint start = b * BS, end = min(start + BS, n_rows[0]);
+    for (uint i = start + lid; i < end; i += TG) atomic_fetch_add_explicit(&h[labels[i]], 1u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint c = lid; c < K; c += TG) hist[b * K + c] = atomic_load_explicit(&h[c], memory_order_relaxed);
+"""
+_CSORT_SCAN_SRC = """
+    uint c = thread_position_in_grid.x;
+    uint run = 0;
+    for (uint b = 0; b < NB; b++) { uint v = hist[b * K + c]; off[b * K + c] = run; run += v; }
+    total[c] = run;
+"""
+_CSORT_SCATTER_SRC = """
+    threadgroup uint cnt[TGB * K];
+    uint lid = thread_position_in_threadgroup.x, g = threadgroup_position_in_grid.x;
+    uint bl = lid, b = g * TGB + bl;                  // TGB blocks per threadgroup, one thread walks each
+    for (uint e = lid; e < TGB * K; e += TG) {
+        uint bb = g * TGB + e / K, c = e % K;
+        cnt[e] = (bb < NB) ? off[bb * K + c] + base[c] : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (bl < TGB && b < NB) {
+        uint start = b * BS, end = min(start + BS, n_rows[0]);
+        for (uint i = start; i < end; i++) {
+            uint c = labels[i];
+            uint p = cnt[bl * K + c]; cnt[bl * K + c] = p + 1;
+            perm[p] = i;
+        }
+    }
+"""
+CSORT_ROWS_PER_BLOCK = 4096
+CSORT_MAX_K = 2048                      # the scatter keeps TGB*K counters in threadgroup memory
+
+
+def _group_by_label(labels, n, k):
+    """-> (perm uint32, counts int64): rows ordered by label, ascending within a label, and how many each."""
+    mx = _mx()
+    if k > CSORT_MAX_K:
+        perm = mx.argsort(labels).astype(mx.uint32)
+        counts = np.array(mx.zeros((k,), dtype=mx.uint32).at[labels].add(mx.array(1, dtype=mx.uint32)))
+        return perm, counts.astype(np.int64)
+    bs = CSORT_ROWS_PER_BLOCK
+    nb = -(-n // bs)
+    h = _kernel("kmeans_csort_hist", ["labels", "n_rows"], ["hist"], _CSORT_HIST_SRC)
+    hist = h(inputs=[labels, _u32(n)], template=[("K", k), ("BS", bs), ("TG", 256)],
+             grid=(nb * 256, 1, 1), threadgroup=(256, 1, 1), output_shapes=[(nb * k,)], output_dtypes=[mx.uint32])[0]
+    sc = _kernel("kmeans_csort_scan", ["hist"], ["off", "total"], _CSORT_SCAN_SRC)
+    off, total = sc(inputs=[hist], template=[("K", k), ("NB", nb)], grid=(k, 1, 1), threadgroup=(min(k, 256), 1, 1),
+                    output_shapes=[(nb * k,), (k,)], output_dtypes=[mx.uint32, mx.uint32])
+    base = (mx.cumsum(total) - total).astype(mx.uint32)
+    tgb = min(256, max(1, (TG_FLOATS // k)))          # counters must fit the 32 KB of threadgroup memory
+    st = _kernel("kmeans_csort_scatter", ["labels", "off", "base", "n_rows"], ["perm"], _CSORT_SCATTER_SRC)
+    perm = st(inputs=[labels, off, base, _u32(n)],
+              template=[("K", k), ("NB", nb), ("BS", bs), ("TGB", tgb), ("TG", 256)],
+              grid=(-(-nb // tgb) * 256, 1, 1), threadgroup=(256, 1, 1),
+              output_shapes=[(n,)], output_dtypes=[mx.uint32])[0]
+    return perm, np.array(total).astype(np.int64)
+
+
 def _accumulate_sorted_dist(x, labels, k, Cm):
     """Sorted accumulation that also returns each row's distance to its centre -> (totals, best)."""
     mx = _mx()
     n, d = x.shape
     w = d + 2
-    perm = mx.argsort(labels).astype(mx.uint32)
-    counts = np.array(mx.zeros((k,), dtype=mx.uint32).at[labels].add(mx.array(1, dtype=mx.uint32))).astype(np.int64)
+    perm, counts = _group_by_label(labels, n, k)
     offs = np.concatenate([[0], np.cumsum(counts)])
     nseg = -(-counts // SEGMENT_ROWS)
     seg_first = np.concatenate([[0], np.cumsum(nseg)])
@@ -1262,8 +1331,7 @@ def _accumulate_sorted(x, labels, best, k):
     mx = _mx()
     n, d = x.shape
     w = d + 2
-    perm = mx.argsort(labels).astype(mx.uint32)
-    counts = np.array(mx.zeros((k,), dtype=mx.uint32).at[labels].add(mx.array(1, dtype=mx.uint32))).astype(np.int64)
+    perm, counts = _group_by_label(labels, n, k)
     offs = np.concatenate([[0], np.cumsum(counts)])
     nseg = -(-counts // SEGMENT_ROWS)                      # segments per cluster (0 for an empty cluster)
     seg_first = np.concatenate([[0], np.cumsum(nseg)])
