@@ -737,6 +737,15 @@ The pattern across all four: this library is no longer losing time to things tha
 better constants or better instructions. What is left is either at a hardware ceiling (the 15.7 TFLOP/s
 multiply) or below the noise floor of the measurements.
 
+## Low-precision simdgroup matrices do not raise the ceiling (September 25, 2026)
+
+Tested at Codex's suggestion (`meta/ai/CODEX.md`), as the kill switch for a low-precision fused assignment
+kernel: the no-load ceiling of `simdgroup_multiply_accumulate` is 15.8 TFLOP/s in fp32, 16.0 in fp16, 15.9 for
+fp16 or bf16 inputs into fp32 accumulators, and 14.1 in bf16 throughout. The instruction is a single ~16
+TFLOP/s unit regardless of type. MLX reaches 36-52 TFLOP/s through hardware custom Metal kernels cannot
+address, which settles the high-dimensional question for this library: fusion cannot recover the multiply
+throughput it gives up, at any precision.
+
 ## Input limits, measured
 
 Behaviour on degenerate input, worth knowing before trusting a result:
