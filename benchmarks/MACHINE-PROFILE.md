@@ -4,18 +4,58 @@ Everything here was measured on this machine (M5 Max, 40 GPU cores, 128 GB, macO
 in `NOTES.md`, not taken from a specification. The point of collecting it in one place is that several
 numbers we had been assuming were wrong, and the wrong ones sent work in wrong directions for a day.
 
+## The shape of the machine
+
+`applegpu_g17s`, 40 GPU cores, 128 GB unified memory of which Metal will recommend 112.5 GB as a working
+set, 80.6 GB largest single buffer. Three facts about it explain almost every result in `NOTES.md`.
+
+**1. There are two multipliers, and a custom kernel can only reach the slower one.** A loop of
+`simdgroup_multiply_accumulate` with no memory traffic at all saturates at **15.7 TFLOP/s**. MLX's `@` on
+the same shapes reaches 17-36 TFLOP/s in fp32 and 28-52 in fp16/bf16 - above that ceiling, so it is not
+running the same instruction. Nothing written in Metal will match `mx.matmul` on throughput; the gap has to
+be closed by doing less work or moving less memory, not by writing a better multiply.
+
+**2. Memory is a cliff, not a slope.** Read bandwidth against working-set size, with the total bytes read
+held constant so dispatch cost cancels:
+
+| Working set | 128 KB | 512 KB | 2 MB | 8 MB | 32 MB | 128 MB | 512 MB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GB/s | 1328 | 1954 | **2163** | 1772 | 1192 | 485 | 407 |
+
+On-chip it is **about 2 TB/s**; past roughly 32 MB it falls to **~400-480 GB/s**. That is a 4-5x cliff, and
+it is the single most useful number here. It is why never materialising the n x k distance matrix was worth
+1.2-1.8x (that matrix is gigabytes, so every byte of it is DRAM traffic), why re-reading the centre table
+costs nothing (it is kilobytes and lives above the cliff), and why keeping segment totals in registers
+instead of device memory was worth 5.6x.
+
+**3. Every round trip to the host costs 150 microseconds.** An `eval` of a trivial op, a one-float readback
+and a one-kernel dispatch all measure 147-161 us. Building an MLX op in Python costs 1 us. So the floor on a
+Lloyd pass is set by how many times it synchronises, not by the host language - which is why rewriting in
+C++ would buy ~0% (measured 0-1% of a step at scale, and the remaining fixed cost is round trips).
+
+The corollary of 2 and 3 together is worth stating, because it cost a day to learn the hard way: **cache
+blocking only pays inside a kernel.** Shrinking a chunked kernel's working set into the 2 TB/s region makes
+it slower, not faster (161.9 ms to 361.1 ms as chunks go 512 MB to 8 MB), because each chunk costs another
+150 us dispatch. The same blocking done inside one kernel is what the fused paths do, and it wins.
+
 ## Arithmetic ceilings
 
 | What | Measured | How |
 |---|---:|---|
 | `simdgroup_multiply_accumulate`, fp32 | **15.7 TFLOP/s** | loop with no loads, 8+ independent accumulators, swept over simdgroup count and threadgroup size |
 | ...with 1 / 2 / 4 accumulators | 3.0 / 7.4 / 9.1 | the unit is pipelined; 8 chains are needed to fill it |
-| Scalar fp32, as the distance kernel uses it | ~9.0 of ~11 | direct form, 98.3 GFLOP in 10.9 ms |
+| Scalar fp32, as the distance kernel uses it | 9.0 achieved | direct form, 98.3 GFLOP in 10.9 ms, and shown issue-bound by the MAC-count ablation |
 | MLX `@`, fp32, 128 dims | 17.2 | 262144 x 128 @ 128 x 1024 |
 | MLX `@`, fp32, 960 dims | 36.2 | 65536 x 960 @ 960 x 1024 |
 | MLX `@`, fp16 / bf16, 128 dims | 28.2 / 30.0 | |
 | MLX `@`, fp16 / bf16, 960 dims | 52.1 / 52.2 | |
 | Irregular gather-and-score (per-row candidate lists) | 2.3-2.7 | the reason pruning schemes struggle here |
+
+The raw scalar ALU peak is deliberately absent: every synthetic FMA-chain loop written to measure it
+returned 90-190 TFLOP/s, which is some six times any plausible figure for 40 cores, and the marginal rate
+disagreed with itself between iteration counts. The compiler collapses those loops. What can be defended is
+the achieved 9.0 above and the 15.7 simdgroup ceiling, both of which were confirmed by making the work scale
+and watching the time scale with it.
 
 **The single most important line:** MLX's matmul reaches 2-3x what `simdgroup_multiply_accumulate` can do,
 so a custom Metal kernel cannot match `mx.matmul` on throughput however well written. Our tile matmul at

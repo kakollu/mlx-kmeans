@@ -868,7 +868,9 @@ _CASCADE_MASK_SRC = """
             for (uint t = 0; t < 16; t++) {
                 uint c = c0 + t;
                 float a = xsq + csq[c] - 2 * T[lane * 16 + t];
-                if (!(a - g3 * (xsq + csq[c]) > u)) { bits |= (1u << t); nkeep++; }
+                // c >= K are padding, and carry csq = +inf so the bound below is inf - inf = NaN; NaN fails
+                // every comparison, so without this guard they would all survive and be scored out of range
+                if (c < K && !(a - g3 * (xsq + csq[c]) > u)) { bits |= (1u << t); nkeep++; }
             }
             word |= bits << ((ct & 1u) * 16);
             if (ct & 1u) { mask[i * (KP / 32) + (ct >> 1)] = word; word = 0; }
@@ -942,7 +944,8 @@ def _cascade_nearest(x, Cm, C, Xm, order, prev, n, k, d, m):
         k1 = _kernel(f"kmeans_cascade_mask_{m}", ["Xm", "Ct", "csq", "ub", "row0", "gamma"],
                      ["mask", "nsurv"], _CASCADE_MASK_SRC)
         mask, nsurv = k1(inputs=[Xm, mx.array(Ctp), mx.array(csq), ub, _u32(0), gamma],
-                         template=[("M", m), ("MP", mp), ("KP", kp), ("SGPG", TILES1_SIMDGROUPS)],
+                         template=[("M", m), ("MP", mp), ("K", k), ("KP", kp),
+                                   ("SGPG", TILES1_SIMDGROUPS)],
                          grid=((whole // 16) * 32, 1, 1), threadgroup=(TILES1_SIMDGROUPS * 32, 1, 1),
                          output_shapes=[(whole * (kp // 32),), (whole,)],
                          output_dtypes=[mx.uint32, mx.uint32])
