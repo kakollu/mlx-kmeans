@@ -448,6 +448,53 @@ dimensions the pruned work is irregular and cannot use the simdgroup matmul, dro
 positive, and by 1.2x on the pass. The general lesson is that the hardware has moved the crossover: doing
 more arithmetic at the matmul rate beats doing less of it irregularly, by a factor of 2.4x here.
 
+## Where the assignment kernels actually stand (September 24, 2026, AC power)
+
+Going after a 2x on the `logs` shape (10M x 32, k=256), where assignment is most of the pass. Four ideas
+measured before the one that worked, all on 4M x 32, k=256 against the 10.9 ms scalar rows kernel.
+
+| Idea | Result | Why |
+|---|---:|---|
+| float4 loads of the centre table | 1.01x | not load-issue bound, as assumed - the compiler already vectorises |
+| 2 rows per thread (reuse each centre load) | 0.81x | 64 floats per thread spills; helps only at 16 dims (1.10x) |
+| 4 and 8 rows per thread | 0.10x | spills badly |
+| expanded form, one FMA per dim | 1.26x | half the instructions, but then bound by the centre loads |
+
+The expanded-form number is the useful one, because it says the scalar path is nearly finished: the direct
+form does 98.3 GFLOP in 10.9 ms, which is **9.0 of about 11 TFLOP/s of scalar peak**. Halving the
+instruction count buys 1.26x, not 2x, because the kernel stops being ALU-bound and starts waiting on
+memory. There is no 2x left in a scalar kernel at this shape - only the matrix units are 4x faster.
+
+Two further things that cost a lot and would not be guessed from reading the code:
+
+**Arrays of simdgroup matrices spill when indexed in two dimensions.** Rewriting `a0[DK], a1[DK]` as
+`a[RK][DK]` - the same 16 matrices - turned a 16.0 ms kernel into 65.1 ms at 64 dims. Flat arrays with a
+single loop index are fine; two indices are not. This invalidated a whole table of measurements before it
+was noticed, and the only reason it was noticed is that the numbers disagreed with a previous run.
+
+**A candidate array indexed by a running count costs more than the multiply it protects.** `uint cand[M];
+... cand[nc] = c; nc++` is the obvious way to collect centres inside the error window, and it is what the
+margin kernel does. Because `nc` is a runtime value the array cannot live in registers, so it goes to
+scratch memory: 11.3 ms against 5.7 ms for the same kernel keeping a fixed number of candidates in named
+registers, on a multiply that costs 5.3 ms. In the margin kernel this is hidden because that kernel is
+memory-bound on the distance matrix it reads; in a fused kernel there is nothing to hide behind.
+
+### What the one-pass path does not cover
+
+It is exact wherever it runs, but it only runs on 16-96 dims with k a multiple of 16, which is one of the
+six suite configs (`logs`, 1.29x). The rest are out of range and each needs different work:
+
+| Config | Why it is excluded | What it would take |
+|---|---|---|
+| geo-trips 10M x 4 | 4 dims | zero-pad to 8 - but 8 dims measured 0.88x, so probably not worth it |
+| satellite 10M x 12 | 12 dims | pad to 16, but at k=32 that shape measured 0.38x |
+| single-cell 2M x 50 | 50 dims | pad to 56; d=48/k=64 measured 1.60x, so this one should pay |
+| sift 1M x 128 | above 96 dims | stage the row tiles in threadgroup memory instead of registers |
+| gist 1M x 960 | above 96 dims | not the bottleneck: at 960 dims the pass is 138 ms of multiply and only 18 ms of distance-matrix traffic, so fusing saves 8% - the lever there is GEMM efficiency (14.5 of 39.9 TFLOP/s), not fusion |
+
+Padding is exact rather than approximate: trailing zero dimensions add `+0.0f` terms at the end of each
+sum, which cannot change a float32 accumulator, so labels and distances stay bit-identical.
+
 ## Input limits, measured
 
 Behaviour on degenerate input, worth knowing before trusting a result:
