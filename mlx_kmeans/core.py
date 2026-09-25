@@ -187,7 +187,7 @@ def kmeans_pp_init(parts, rows, k, rng, sample=None):
         best = mx.argmin(mins.sum(0))                      # candidate that lowers total d2 the most
         d2 = mins[:, best]
         picks.append(cand[best][None])
-    return np.array(S[mx.concatenate(picks)], dtype=np.float32)
+    return _host(S[mx.concatenate(picks)], np.float32)
 
 
 # ---------------------------------------------------------------- assignment passes
@@ -528,6 +528,21 @@ SORTED_MIN_KW = 1024                    # k*(dims+2) from which sorting by label
 SORTED_MAX_ROWS = 2_000_000             # above this the argsort costs more than the buffers it saves...
 SORTED_ALWAYS_KW = 4096                 # ...unless the buffers are this large, where blocks is hopeless                    # use sorted accumulation when k * (dims + 2) >= this (measured crossover)
 SEGMENT_ROWS = 256                      # rows per GPU thread in sorted accumulation
+
+
+def _host(a, dtype=None):
+    """MLX array -> numpy, with the evaluation forced BEFORE numpy asks for the buffer.
+
+    Converting a lazy array lets numpy trigger the evaluation from inside its own C buffer request. If a
+    Metal error is raised there - a kernel that will not load, a threadgroup allocation the device refuses -
+    the C++ exception cannot propagate back through that frame and the process is terminated with SIGABRT
+    instead of a Python exception. Eight such aborts came out of one audit run. Evaluating explicitly first
+    turns every such failure into a catchable RuntimeError, which is also what makes the fallbacks in
+    _gpu_pass able to fall back at all.
+    """
+    mx = _mx()
+    mx.eval(a)
+    return np.array(a, dtype=dtype) if dtype is not None else np.array(a)
 
 
 def _kernel(name, inputs, outputs, src, header=""):
@@ -906,7 +921,7 @@ def _group_by_label(labels, n, k):
     mx = _mx()
     if k > CSORT_MAX_K:
         perm = mx.argsort(labels).astype(mx.uint32)
-        counts = np.array(mx.zeros((k,), dtype=mx.uint32).at[labels].add(mx.array(1, dtype=mx.uint32)))
+        counts = _host(mx.zeros((k,), dtype=mx.uint32).at[labels].add(mx.array(1, dtype=mx.uint32)))
         return perm, counts.astype(np.int64)
     bs = CSORT_ROWS_PER_BLOCK
     nb = -(-n // bs)
@@ -923,7 +938,7 @@ def _group_by_label(labels, n, k):
               template=[("K", k), ("NB", nb), ("BS", bs), ("TGB", tgb), ("TG", 256)],
               grid=(-(-nb // tgb) * 256, 1, 1), threadgroup=(256, 1, 1),
               output_shapes=[(n,)], output_dtypes=[mx.uint32])[0]
-    return perm, np.array(total).astype(np.int64)
+    return perm, _host(total).astype(np.int64)
 
 
 def _accumulate_sorted_dist(x, labels, k, Cm):
@@ -950,7 +965,7 @@ def _accumulate_sorted_dist(x, labels, k, Cm):
     total, total_comp = red(inputs=[sums, comp, mx.array(seg_first.astype(np.uint32))], template=[("W", w)],
                             grid=(w, k, 1), threadgroup=(32, 8, 1),
                             output_shapes=[(k * w,), (k * w,)], output_dtypes=[mx.float32, mx.float32])
-    tot = (np.array(total, dtype=np.float64) + np.array(total_comp, dtype=np.float64)).reshape(k, w)
+    tot = (_host(total, np.float64) + _host(total_comp, np.float64)).reshape(k, w)
     return tot, best
 
 
@@ -1312,7 +1327,7 @@ def _accumulate_lanes(x, labels, best, k):
     total, total_comp = red(inputs=[sums, comp, _u32(nb)], template=[("KW", kw)],
                             grid=(kw, 1, 1), threadgroup=(64, 1, 1),
                             output_shapes=[(kw,), (kw,)], output_dtypes=[mx.float32, mx.float32])
-    return (np.array(total, dtype=np.float64) + np.array(total_comp, dtype=np.float64)).reshape(k, w)
+    return (_host(total, np.float64) + _host(total_comp, np.float64)).reshape(k, w)
 
 
 def _accumulate_atomic(x, labels, best, k):
@@ -1326,7 +1341,7 @@ def _accumulate_atomic(x, labels, best, k):
                 template=[("D", d), ("KW", kw), ("BS", bs), ("TG", ATOMIC_THREADGROUP)],
                 grid=(nb * ATOMIC_THREADGROUP, 1, 1), threadgroup=(ATOMIC_THREADGROUP, 1, 1),
                 output_shapes=[(nb * kw,)], output_dtypes=[mx.float32])[0]
-    return np.array(sums, dtype=np.float64).reshape(nb, k, w).sum(0)
+    return _host(sums, np.float64).reshape(nb, k, w).sum(0)
 
 
 def _accumulate_sorted(x, labels, best, k):
@@ -1349,7 +1364,7 @@ def _accumulate_sorted(x, labels, best, k):
     total, total_comp = red(inputs=[sums, comp, mx.array(seg_first.astype(np.uint32))], template=[("W", w)],
                             grid=(w, k, 1), threadgroup=(32, 8, 1),
                             output_shapes=[(k * w,), (k * w,)], output_dtypes=[mx.float32, mx.float32])
-    return (np.array(total, dtype=np.float64) + np.array(total_comp, dtype=np.float64)).reshape(k, w)
+    return (_host(total, np.float64) + _host(total_comp, np.float64)).reshape(k, w)
 
 
 def _accumulate_blocks(x, labels, best, k):
@@ -1368,7 +1383,7 @@ def _accumulate_blocks(x, labels, best, k):
     total, total_comp = red(inputs=[sums, comp, _u32(nb)], template=[("KW", k * w)],
                             grid=(k * w, 1, 1), threadgroup=(64, 1, 1),
                             output_shapes=[(k * w,), (k * w,)], output_dtypes=[mx.float32, mx.float32])
-    return (np.array(total, dtype=np.float64) + np.array(total_comp, dtype=np.float64)).reshape(k, w)
+    return (_host(total, np.float64) + _host(total_comp, np.float64)).reshape(k, w)
 
 
 # Assigning and accumulating in one kernel. The two-kernel form reads X twice and every row does a
@@ -1434,7 +1449,8 @@ def _fused_pass(x, Cm, k, tg, bs):
                              grid=(nb * tg, 1, 1), threadgroup=(tg, 1, 1), init_value=0,
                              output_shapes=[(nb * kw,), (n,), (n,)],
                              output_dtypes=[mx.float32, mx.uint32, mx.float32])
-    tot = np.array(out, dtype=np.float64).reshape(nb, k, w).sum(0)
+    mx.eval(labels, best)
+    tot = _host(out, np.float64).reshape(nb, k, w).sum(0)
     return tot, labels, best
 
 
@@ -1454,6 +1470,9 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
     """One assignment pass -> (float64 totals (k, d+2), [(labels, best) per slice] as MLX arrays)."""
     mx = _mx()
     k, d = C.shape
+    bad = [p.shape[1] for p in parts if p.ndim != 2 or p.shape[1] != d]
+    if bad:
+        raise ValueError(f"data has {bad[0]} columns but the centers have {d}; fit and predict need the same features")
     if method == "approx":
         # Two crossovers, because the fp16 multiply is ~1.4x faster than fp32 and moves where the
         # approximate path starts to pay: 64 dims if the data admits fp16, 256 if it does not.
@@ -1491,7 +1510,7 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
         if st is None:
             m = _cascade_m(d)
             step = max(1, parts[0].shape[0] // 65536)
-            var = np.array(mx.var(parts[0][::step], axis=0))
+            var = _host(mx.var(parts[0][::step], axis=0))
             order = np.argsort(-var).astype(np.int64)
             _cascade_state.clear()                       # one dataset at a time; the buffers are large
             st = {"m": m, "order": order, "Xm": [_cascade_prefix(p, order, m) for p in parts],
@@ -1576,7 +1595,7 @@ def assign_mlx(parts, C, method="auto", return_labels=False, accumulate="auto"):
     tot, nearest = _gpu_pass(parts, C, method, accumulate)
     result = (tot[:, 2:], np.rint(tot[:, 0]).astype(np.int64), float(tot[:, 1].sum()))
     if return_labels:
-        result += (np.concatenate([np.array(lab).astype(np.int64) for lab, _ in nearest]),)
+        result += (np.concatenate([_host(lab).astype(np.int64) for lab, _ in nearest]),)
     return result
 
 
@@ -1593,11 +1612,11 @@ def lloyd_step(parts, C, method="auto", accumulate="auto"):
     sums, counts, inertia = tot[:, 2:], np.rint(tot[:, 0]).astype(np.int64), float(tot[:, 1].sum())
     empty = np.flatnonzero(counts == 0)
     if len(empty):
-        best = np.concatenate([np.array(b) for _, b in nearest])        # float32 distance to assigned center
+        best = np.concatenate([_host(b) for _, b in nearest])           # float32 distance to assigned center
         if best.max() > 0:
             far = np.argpartition(best, -len(empty))[-len(empty):]
             far = far[np.lexsort((far, -best[far]))]                    # farthest first, lower row index on ties
-            labels = np.concatenate([np.array(lab) for lab, _ in nearest]).astype(np.int64)
+            labels = np.concatenate([_host(lab) for lab, _ in nearest]).astype(np.int64)
             for new, f, row in zip(empty, far, take_rows(parts, far).astype(np.float64)):
                 old = labels[f]
                 sums[old] -= row

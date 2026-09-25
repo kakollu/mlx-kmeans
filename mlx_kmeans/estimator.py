@@ -160,6 +160,9 @@ class KMeans:
     def predict(self, X):
         """Cluster index for every row of X (any array-like)."""
         parts = self._parts(X)
+        if parts[0].shape[1] != self.cluster_centers_.shape[1]:
+            raise ValueError(f"X has {parts[0].shape[1]} features but this model was fitted with "
+                             f"{self.cluster_centers_.shape[1]}")
         _, _, inertia, labels = core.assign_mlx(parts, self.cluster_centers_, method=self._method,
                                                 return_labels=True, accumulate=self.accumulate)
         if not np.isfinite(inertia):
