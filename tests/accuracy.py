@@ -3,7 +3,7 @@
 
 For each case and each combination of nearest-center path (rows, pairs, tiles, tiles1 where dims and k
 allow)
-and accumulation (blocks, sorted):
+and accumulation (blocks, sorted, lanes where k*(dims+2) allows):
   1. Labels: every point's center is optimal in float64, up to float32 resolution:
          d64(x, label) <= d64(x, best) + 8 * eps32 * (|x|^2 + |c|^2)
      (points whose float64 distances to two centers differ by less than that are ties at float32 precision).
@@ -65,6 +65,8 @@ def check(name, X, C, slice_rows=None, dist_bytes=None):
     X64, C64 = X.astype(np.float64), C.astype(np.float64)
     ok = True
     combos = [("rows", "blocks"), ("rows", "sorted"), ("pairs", "blocks"), ("pairs", "sorted")]
+    if 2 * len(C) * (C.shape[1] + 2) <= km.core.TG_FLOATS:
+        combos += [("rows", "lanes")]
     if len(C) * (C.shape[1] + 2) <= km.core.ATOMIC_MAX_KW:
         combos += [("rows", "atomic")]
     if C.shape[1] % 8 == 0 and len(C) % 8 == 0:

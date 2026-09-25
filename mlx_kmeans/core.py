@@ -464,6 +464,13 @@ ACC_MIN_BLOCKS, ACC_MAX_BLOCKS = 1024, 4096   # more blocks = less work per thre
 ATOMIC_MAX_KW = 8192                    # k*(dims+2) floats must fit threadgroup memory (32 KB)
 ATOMIC_MAX_ROWS_PER_BLOCK = 4096        # rows summed in plain float32 per threadgroup; keeps the error ~1e-7
 ATOMIC_THREADGROUP = 256
+LANES_MAX_KW = TG_FLOATS // 2           # two k*(dims+2) tiles - the sums and their Kahan carries - on chip
+LANES_BLOCKS = 512                      # simdgroups to split the rows over. What matters is the block COUNT,
+                                        # not the rows per block: the best setting was ~500 blocks at 500k,
+                                        # 2M and 10M rows alike, i.e. enough to fill the GPU and no more,
+                                        # since every extra block re-zeroes and writes out a k*(dims+2) tile.
+LANES_MIN_ROWS = 256                    # ...but not so few rows each that the tile overhead dominates
+LANES_ROWS_AHEAD = 8                    # rows loaded before any is added, to overlap their loads
 SORTED_MIN_KW = 1024                    # k*(dims+2) from which sorting by label can beat per-block buffers
 SORTED_MAX_ROWS = 2_000_000             # above this the argsort costs more than the buffers it saves...
 SORTED_ALWAYS_KW = 4096                 # ...unless the buffers are this large, where blocks is hopeless                    # use sorted accumulation when k * (dims + 2) >= this (measured crossover)
@@ -727,11 +734,95 @@ def _accumulate(x, labels, best, k, method="auto"):
         # Between the two deterministic paths: sorting pays for itself when the per-block buffers are large
         # (k*(dims+2) >= 1024) but the argsort is O(n log n), so at many rows with a small k the blocks path wins -
         # measured at 10M rows: blocks 5.8 ms vs sorted 9.0 ms for k*w = 1536.
-        big_buffers = k * w >= SORTED_MIN_KW
-        method = "sorted" if big_buffers and (n <= SORTED_MAX_ROWS or k * w >= SORTED_ALWAYS_KW) else "blocks"
+        if 2 * k * w <= TG_FLOATS:
+            method = "lanes"                  # deterministic, compensated, and on chip - preferred where it fits
+        else:
+            big_buffers = k * w >= SORTED_MIN_KW
+            method = "sorted" if big_buffers and (n <= SORTED_MAX_ROWS or k * w >= SORTED_ALWAYS_KW) else "blocks"
+    if method == "lanes":
+        return _accumulate_lanes(x, labels, best, k)
     if method == "atomic":
         return _accumulate_atomic(x, labels, best, k)
     return _accumulate_sorted(x, labels, best, k) if method == "sorted" else _accumulate_blocks(x, labels, best, k)
+
+
+# Accumulation with the lanes spread across dimensions instead of rows.
+#
+# The other on-chip kernel (_ATOMIC_SRC) gives each lane a row, so all 32 lanes of a simdgroup race for the
+# same cluster slot and every add has to be atomic - which costs 1.8x here and, worse, fixes no summation
+# order, so it cannot be the default. Give each lane a DIMENSION and the 32 lanes of one row write 32
+# different addresses: no lane ever collides with another, no atomics, and rows are consumed in increasing
+# index order, so the result is the same on every run. Arithmetic throughput is unchanged - 32 floats per
+# instruction slot either way - and because each tile entry has exactly one writer, the Kahan carry can live
+# on chip beside it.
+#
+# One row at a time per simdgroup is latency-bound (the store address depends on a load of labels[i]), so
+# ROWS_AHEAD rows are loaded together and then added one at a time, in order: the loads overlap, the adds
+# stay sequential. Measured at 2M x 50, k=64: 4.8 ms unrolled once, 2.2 ms at 2, 3.0 ms at 8 with
+# compensation, against 4.6 ms for the sorted path - and 1.1e-16 against float64, where the sorted path is
+# 2.8e-14.
+#
+# The limit is threadgroup memory: two tiles of k*(dims+2) floats. Packing several simdgroups into one
+# threadgroup does not help, because N private tiles cost a core exactly what N threadgroups do (measured
+# 1.39 ms against 1.08 ms at k=32 - it is slower, not faster).
+_LANES_SRC_HEAD = """
+    threadgroup float tile[KW];
+    threadgroup float comp[KW];
+    uint lid = thread_position_in_threadgroup.x, b = threadgroup_position_in_grid.x, W = D + 2;
+    for (uint e = lid; e < KW; e += 32) { tile[e] = 0.0f; comp[e] = 0.0f; }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    uint start = min(b * BS, n_rows[0]), end = min(start + BS, n_rows[0]);
+"""
+_LANES_SRC_TAIL = """
+    for (uint i = stop; i < end; i++) {
+        uint o = labels[i] * W, xi = i * D;
+        if (lid == 0) { KAHAN_ADD(tile[o], comp[o], 1.0f); KAHAN_ADD(tile[o + 1], comp[o + 1], best_d[i]); }
+        for (uint j = lid; j < D; j += 32) KAHAN_ADD(tile[o + 2 + j], comp[o + 2 + j], X[xi + j]);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = lid; e < KW; e += 32) { sums[b * KW + e] = tile[e]; comp_out[b * KW + e] = comp[e]; }
+"""
+
+
+def _lanes_src(u, dpl):
+    """Source for the dimension-per-lane accumulator, unrolled over u rows and dpl dims per lane."""
+    decl = "".join(f"    uint o{t}; float bd{t};\n" for t in range(u))
+    decl += "".join(f"    float v{t}_{c};\n" for t in range(u) for c in range(dpl))
+    load = "".join(f"        o{t} = labels[i + {t}] * W;  bd{t} = best_d[i + {t}];\n" for t in range(u))
+    load += "".join(f"        v{t}_{c} = X[(i + {t}) * D + lid + {c} * 32];\n"
+                    for t in range(u) for c in range(dpl))
+    add = ""
+    for t in range(u):
+        add += (f"        if (lid == 0) {{ KAHAN_ADD(tile[o{t}], comp[o{t}], 1.0f);"
+                f" KAHAN_ADD(tile[o{t} + 1], comp[o{t} + 1], bd{t}); }}\n")
+        for c in range(dpl):
+            slot = f"o{t} + 2 + lid + {c} * 32"
+            add += (f"        if (lid + {c} * 32 < D) "
+                    f"KAHAN_ADD(tile[{slot}], comp[{slot}], v{t}_{c});\n")
+    return (_LANES_SRC_HEAD + decl
+            + f"    uint stop = start + (end - start) / {u} * {u};\n"
+            + f"    for (uint i = start; i < stop; i += {u}) {{\n" + load + add + "    }\n"
+            + _LANES_SRC_TAIL)
+
+
+def _accumulate_lanes(x, labels, best, k):
+    mx = _mx()
+    n, d = x.shape
+    w, kw = d + 2, k * (d + 2)
+    nb = max(1, min(LANES_BLOCKS, -(-n // LANES_MIN_ROWS)))
+    bs = -(-n // nb)
+    nb = -(-n // bs)
+    dpl = -(-d // 32)
+    acc = _kernel(f"kmeans_lanes_{dpl}", ["X", "labels", "best_d", "n_rows"], ["sums", "comp_out"],
+                  _lanes_src(LANES_ROWS_AHEAD, dpl), _KAHAN)
+    sums, comp = acc(inputs=[x, labels, best, _u32(n)], template=[("D", d), ("KW", kw), ("BS", bs)],
+                     grid=(nb * 32, 1, 1), threadgroup=(32, 1, 1),
+                     output_shapes=[(nb * kw,), (nb * kw,)], output_dtypes=[mx.float32, mx.float32])
+    red = _kernel("kmeans_reduce", ["sums", "comp", "n_blocks"], ["total", "total_comp"], _REDUCE_SRC, _KAHAN)
+    total, total_comp = red(inputs=[sums, comp, _u32(nb)], template=[("KW", kw)],
+                            grid=(kw, 1, 1), threadgroup=(64, 1, 1),
+                            output_shapes=[(kw,), (kw,)], output_dtypes=[mx.float32, mx.float32])
+    return (np.array(total, dtype=np.float64) + np.array(total_comp, dtype=np.float64)).reshape(k, w)
 
 
 def _accumulate_atomic(x, labels, best, k):
