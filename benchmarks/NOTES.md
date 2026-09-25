@@ -1082,3 +1082,40 @@ at 15.7 TFLOP/s, whichever is larger, and the measured pass over it. Today: geo-
 accumulate and the candidate check; the low-dimensional four are the named gap, and the assignment is most
 of it.
 
+## What the machine allows, per config (September 25, 2026)
+
+The floor column is the simplest exact pass on the resources our kernels reach. The other direction - what the
+hardware measurably does, whichever path reaches it - is `benchmarks/possible.py`, from the rates in
+MACHINE-PROFILE: DRAM 490 GB/s, simdgroup matrix unit 15.7 TFLOP/s, scalar FMA 13.8, `mx.matmul` on each
+config's own GEMM, host round trip 150-200 us, launch 5 us. Milliseconds for one Lloyd iteration, and how far
+the measured pass is from each bound:
+
+| config | measured | exact, our kernels | exact via the fast matmul | converged regime, per-centre bounds fp32 / fp16 | result-only (fp16 matmul) | round-trip floor |
+|---|---|---|---|---|---|---|
+| geo-trips 10M x 4, k=256 | 9.2 | 1.30 (7.1x) | same | same (bounds cost more than the GEMM) | same | 0.18 |
+| satellite 10M x 12, k=32 | 3.2 | 0.98 (3.3x) | same | same | same | 0.18 |
+| logs 10M x 32, k=256 | 27.8 | 10.4 (2.7x) | same | same | same | 0.18 |
+| single-cell 2M x 50, k=64 | 4.4 | 0.82 (5.4x) | same | same | same | 0.18 |
+| SIFT1M 1M x 128, k=1024 | 22.8 | 16.7 (1.4x) | 13.4 (1.7x) | 16.7 / 8.4 (1.4x / 2.7x) | 8.1 (2.8x) | 0.18 |
+| GIST1M 1M x 960, k=1024 | 176; 50-63 converged | 125 (1.4x) | 47.8 (3.7x) | 16.8 / 8.4 (3.0x / 6.0x on the converged 50) | 34 (5.2x) | 0.18 |
+
+How to read it:
+
+- **Below 128 dims the machine has exactly one fast resource for this problem: DRAM at 490 GB/s.** The matrix
+  hardware through `mx.matmul` is slower than a simdgroup kernel there (1-14 TFLOP/s), per-centre bounds
+  move more bytes than the distances they save (n x k x 8 per iteration: 20 GB at logs), and float16 buys
+  nothing because the pass is not compute-bound. The bound is one read of X, and the four low-dimensional
+  configs are 2.7-7.1x from it. All of that distance is ours: two reads instead of one, the scalar
+  assignment at 18-40% of the FMA peak, and the host round trips between stages.
+- **Above 128 dims the machine has three resources we do not use.** The fast matmul (41 TFLOP/s float32 at
+  GIST) would put an exact pass at 48 ms instead of 125 if its candidates could be verified cheaply - the
+  "matmul hybrid abandoned on precision grounds" is worth reopening with a candidate check sized to its
+  actual error rather than the direct sum's. Per-centre bounds in the converged regime are bandwidth-bound
+  on their own traffic (17 ms float32, 8.4 float16 at 1M x 1024), against 50-63 ms measured: 3-6x is left
+  there, most of it the visited pairs evaluated a row at a time. And float16 bounds halve that traffic.
+- **Below about a million rows the round trip is the floor**, not the data: 0.18 ms per iteration if the
+  convergence check runs on the host, which is 4x one read of 100k x 50. A GPU-resident loop (no sync per
+  iteration) is the technique; nothing in the suite is small enough to show it.
+- What no per-iteration bound sees: the iteration count. Initialisation and time-to-tolerance are the other
+  half of a fit, and the suite does not measure them.
+

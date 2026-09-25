@@ -183,3 +183,25 @@ threadgroup memory without collapsing the kernel around it; this is the measured
 single-read kernel is limited to small k x dims, and why a one-hot tile accumulation only wins once its
 footprint is a few KB (see NOTES, "The fused single-read kernel, second attempt").
 
+## Scalar FMA peak and what the matrix hardware delivers per shape (measured September 25, 2026)
+
+Scalar `fma` peak, eight independent chains per thread, no memory traffic: **13.8 TFLOP/s** - within 12% of the
+simdgroup matrix ceiling, so on this GPU a scalar distance loop is not slow because it is scalar; it is slow
+when its loop overhead (the compare and select per centre, the loads from cache) crowds out the multiplies.
+The rows kernel at 10M x 4, k=256 runs at 18% of it.
+
+`mx.matmul` on each benchmark config's own GEMM (rows x dims @ dims x k), TFLOP/s reached. This is the hardware
+our custom kernels cannot reach (38-63 TFLOP/s on large GEMMs) - and it only exists at large k x dims:
+
+| config | GEMM | fp32 | fp16 | simdgroup ceiling |
+|---|---|---|---|---|
+| geo-trips 10M x 4, k=256 | 20 GFLOP | 1.0 | 2.0 | 15.7 |
+| satellite 10M x 12, k=32 | 8 GFLOP | 2.0 | 3.9 | 15.7 |
+| logs 10M x 32, k=256 | 164 GFLOP | 6.4 | 13.7 | 15.7 |
+| single-cell 2M x 50, k=64 | 13 GFLOP | 6.5 | 12.1 | 15.7 |
+| SIFT1M 1M x 128, k=1024 | 262 GFLOP | 19.5 | 32.3 | 15.7 |
+| GIST1M 1M x 960, k=1024 | 1966 GFLOP | 41.1 | 57.7 | 15.7 |
+
+Below about 128 dims the matmul path is slower than a simdgroup kernel; above it, 1.2-2.6x faster in float32
+and 2-3.7x in float16. `benchmarks/possible.py` turns these into per-config bounds.
+
