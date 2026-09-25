@@ -911,15 +911,31 @@ n x k float32 array that implies, and the path is offered only where that fits (
 including one chunk in flight: 3.9M rows at k=1024). The state is dropped the moment any of its arrays is freed,
 so fit() on numpy input leaves nothing behind.
 
-How it runs. Iteration 0 is the ordinary tiles pass; its dot-product chunks also yield the bounds through one
-extra kernel (kmeans_lb_init, one coalesced read of each chunk - as a chain of MLX elementwise ops it was seven
-passes and cost more than the multiply). Each later iteration: a strided count pass (65k rows) estimates how
-many pairs the bounds would visit; above BOUNDS_MAX_VISITED it runs the full pass instead and rebuilds, which
-is what makes an n_init restart or a large early drift safe. Below it, one kernel per row: subtract each
-centre's drift from its bound, recompute the own distance exactly (so the inertia is exact and the upper bound
-tight), gather the centres whose bound fell below it into a 32-bit mask with simd_sum, walk it with ctz, and
-visit only those. The accumulation kernels run unchanged on the labels it produces. Only lloyd_step builds the
-state; a one-shot predict never allocates n x k.
+How it runs. A full pass records labels, own distances and centres (no n x k memory). The next full pass
+first asks a strided sample of rows (8k), given fresh bounds against the recorded centres, what fraction of
+the pairs a step would visit; only under BOUNDS_MAX_VISITED does that pass also build the bounds for every
+row - one extra kernel over the dot chunks the tiles path computes anyway (kmeans_lb_init, one coalesced
+read per chunk; as a chain of MLX elementwise ops it was seven passes and cost more than the multiply). Each
+iteration with bounds in hand: a strided count pass says how many pairs they would visit; above the
+threshold they are dropped and the full pass runs, which is what makes an n_init restart or a large early
+drift safe. Below it, one kernel per row: subtract each centre's drift from its bound, recompute the own
+distance exactly (so the inertia is exact and the upper bound tight), gather the centres whose bound fell
+below it into a 32-bit mask with simd_sum, walk it with ctz, and visit only those. The accumulation kernels
+run unchanged on the labels it produces. Only lloyd_step records or builds; a one-shot predict never
+allocates n x k.
+
+Two things the first version got wrong, both caught by the three-way comparison and the suite the same day:
+
+- It built the bounds on every full pass, on speculation. On isotropic high-dimensional data (500k x 384,
+  k=1024, Gaussian blobs) the margins between centres are a few percent of the distance - smaller than the
+  drift - so the bounds never paid, every pass rebuilt 2 GB, and 10 iterations took 1888 ms against 407.
+  Hence the predictor, and a back-off: a build that lasts a step or less makes the next question wait
+  1, 3, 7 iterations. That case now takes 430 ms.
+- Building the bounds from MLX's matmul (x @ C.T) instead of the tiles path's own dot kernel gave 1386 wrong
+  labels in an 80k-row suite case, at 8e-4 excess distance: MLX's float32 product carries ~630x the error
+  of the direct sum (the finding that kept the exact path off matmul in the first place), so a bound padded
+  for the direct sum's error and built from it is not a bound. The build uses the simdgroup dot kernel,
+  with the direct-distance kernel for the rows that do not fill a tile.
 
 Costs, GIST 300k x 960, k=1024 (theta_sweep, rebuilds disabled so the visited fraction drifts on its own):
 a bounds pass costs about 20 ms + 3.8 ms per percent of pairs visited (0.84%: 22 ms; 4.9%: 37 ms; 21%: 98 ms;
@@ -933,14 +949,14 @@ Results, same machine, old tree against new, interleaved:
 
 | | plain | bounds | |
 |---|---|---|---|
-| GIST 300k, k=1024, fit to tol=1e-4 (26 iterations both) | 1.87 s | 1.08 s | 1.73x |
-| GIST 1M, k=1024, 5 iterations | 0.89 s | 0.84 s | 1.06x |
-| GIST 1M, k=1024, 20 iterations | 3.51 s | 1.64 s | 2.14x |
-| GIST 1M, k=1024, one iteration in steady state | 175 ms | 43-55 ms | 3.2-4.1x |
+| GIST 300k, k=1024, fit to tol=1e-4 (26 iterations both) | 1.85 s | 1.05 s | 1.75x |
+| GIST 1M, k=1024, 5 iterations | 0.89 s | 0.74 s | 1.20x |
+| GIST 1M, k=1024, 20 iterations | 3.51 s | 1.62 s | 2.17x |
+| GIST 1M, k=1024, one iteration in steady state | 175 ms | 50-63 ms | 2.8-3.5x |
 
-The 5-iteration row is the suite's metric, and it barely moves - iteration 0 is a full pass plus the build,
-iteration 1 rebuilds because the first drift after a random-row start is huge, and one more rebuild usually
-follows - which is exactly why this lever was invisible to the per-pass benchmark.
+The 5-iteration row is the suite's metric, and it moves least: iterations 0 and 1 are full passes (the
+first drift after a random-row start is huge), iteration 2 is the full pass that builds, and only 3 and 4
+run on the bounds - which is exactly why this lever was invisible to the per-pass benchmark.
 
 Exactness. tests/accuracy.py has three multi-step cases on the path (60k x 960 k=1024 with unrelated centres
 injected at step 6, three slices at 256 dims, and one with nine empty-cluster relocations): at every step the

@@ -506,7 +506,7 @@ BOUNDS_MIN_DIMS = 256                   # per-centre bounds: below this the boun
 BOUNDS_MAX_DIMS = 2048                  # the step kernel holds a row in registers, D/32 per lane
 BOUNDS_MAX_BYTES = 16 << 30             # n x k float32 lower bounds, plus one DIST_BYTES chunk while it is rewritten
 BOUNDS_MAX_VISITED = 0.05               # centres the count pass expects to visit, as a fraction of n x k; above it, full pass
-BOUNDS_SAMPLE_ROWS = 65536              # rows the count pass looks at (strided); the estimate decides, the step counts exactly
+BOUNDS_SAMPLE_ROWS = 8192               # rows the count and prediction passes look at (strided); the step counts exactly
 ACC_BYTES = 256 << 20                   # budget for per-block accumulation buffers
 ACC_ROWS_PER_BLOCK = 256                # target rows per accumulation thread (measured sweet spot)
 ACC_MIN_BLOCKS, ACC_MAX_BLOCKS = 1024, 4096   # more blocks = less work per thread but more to reduce
@@ -637,7 +637,7 @@ def _tiles_nearest(x, Cm, n, k, d, lb_out=None):
     if whole < n:
         lab, bst = _rows_kernel(x, Cm, whole, n - whole, k, d)
         if lb_out is not None:
-            lb_out.append(_lb_from_dot(x, whole, x[whole:] @ Ct, csq, n - whole, k, d, gamma_f))
+            lb_out.append(_lb_chunk(x, Cm, Ct, csq, whole, n, k, d, gamma_f))
         labels.append(lab)
         best.append(bst)
     return (labels[0], best[0]) if len(labels) == 1 else (mx.concatenate(labels), mx.concatenate(best))
@@ -1522,19 +1522,29 @@ def _tiles1_ok(d, k):
 # drift is heavy-tailed - so the bounds are kept per centre: one float32 lower bound per (row, centre), n x k
 # in all, which is what limits where the path is offered (BOUNDS_MAX_BYTES).
 #
-# State per dataset: labels, the exact distance to the assigned centre (ub), the lower bounds (lb, in the row
-# chunks the tiles path produced them in), and the centres those bounds were computed against. A pass with
-# new centres C' subtracts each centre's drift |c' - c| from its column of lb, recomputes every row's own
-# distance exactly (so ub is tight and the inertia exact), and visits only the centres whose bound fell
-# below it. Labels stay exact: a centre that is not visited provably cannot be nearer. What differs from the
-# full pass is the tie rule - a row keeps its label unless a visited centre is strictly nearer in the computed
-# distance, and an exact tie with an unvisited centre cannot be seen - so on constructed ties the two paths
-# can disagree; on real data that set has measure zero, and either label is within float32 of optimal.
+# State per dataset: labels, the exact distance to the assigned centre (ub), the centres those were computed
+# against, and - only while they pay - the lower bounds (lb, in row chunks). A pass with new centres C'
+# subtracts each centre's drift |c' - c| from its column of lb, recomputes every row's own distance exactly
+# (so ub is tight and the inertia exact), and visits only the centres whose bound fell below it. Labels stay
+# exact: a centre that is not visited provably cannot be nearer. What differs from the full pass is the tie
+# rule - a row keeps its label unless a visited centre is strictly nearer in the computed distance, and an
+# exact tie with an unvisited centre cannot be seen - so on constructed ties the two paths can disagree; on
+# real data that set has measure zero, and either label is within float32 of optimal.
+#
+# When the bounds pay is a property of the data, and on isotropic high-dimensional data they never do (the
+# margins between centres are a few percent of the distance, smaller than the drift), so a full pass never
+# builds them on speculation: building n x k cost as much as the pass it was meant to save. Instead every
+# full pass records labels, ub and C (cheap), and the next full pass first asks a strided sample of rows,
+# given fresh bounds against the recorded centres from the exact dot kernel, what fraction of the pairs a
+# step would visit; only if that is under BOUNDS_MAX_VISITED does the pass build the bounds for every row -
+# one extra kernel over the dot chunks it computes anyway - and the step after it uses them. Bounds that
+# have decayed past the threshold are dropped, not rebuilt blindly, and a build that lasted a step or less
+# makes the next question wait (1, 3, 7 iterations), so data the bounds cannot help pays a few percent.
 #
 # Floating point: computed squared distances carry a relative error up to gamma = D*eps/(1-D*eps); stored
 # bounds are scaled by (1 - 2*gamma) and the own distance by (1 + 2*gamma) before any comparison, and drifts
-# are rounded up, so every skip is justified in exact arithmetic. The bounds initialised from the tiles path's
-# dot products use the expanded form's bound, 3*gamma*(|x|^2 + |c|^2), the same one its candidate test uses.
+# are rounded up, so every skip is justified in exact arithmetic. Bounds built from dot products use the
+# expanded form's bound, 3*gamma*(|x|^2 + |c|^2), the same one the tiles path's candidate test uses.
 #
 # Not tried yet: fp16 bounds (halves the memory and the traffic; needs round-toward-zero conversion) and
 # rewriting only the rows that visited something.
@@ -1547,8 +1557,7 @@ def _bounds_ok(parts, k, d):
 
 
 def _bounds_chunk(k):
-    step = 16 if k % 16 == 0 else 8                 # the tiles path's chunking, so lb chunks line up with its rows
-    return max(step, (DIST_BYTES // (4 * k)) // step * step)
+    return max(1, DIST_BYTES // (4 * k))            # rows per lower-bound chunk: one DIST_BYTES buffer
 
 
 # One simdgroup per row, lanes striding over the centres: the dot chunk is read once, coalesced, and the
@@ -1635,6 +1644,85 @@ _BOUNDS_STEP_SRC = _BOUNDS_HEAD.replace("STRIDE * i", "i").replace("LOCAL", "i")
 """
 
 
+def _bounds_edges(n, k):
+    """Row chunks: whole simdgroup tiles in DIST_BYTES pieces, then the tail rows (fewer than one tile)."""
+    step = 16 if k % 16 == 0 else 8
+    chunk = max(step, (DIST_BYTES // (4 * k)) // step * step)
+    whole = n // step * step
+    return list(range(0, whole, chunk)) + [whole] + ([n] if whole < n else []) if whole else [0, n]
+
+
+def _lb_chunk(x, Cm, Ct, csq, a, b, k, d, gamma):
+    """Lower bounds for rows a..b against Cm, from the exact dot kernels.
+
+    MLX's matmul is not accurate enough for this: its float32 product carries ~630x the error of the direct
+    sum (the reason the exact path never used it), and a bound padded for the direct sum's error and built
+    from it skipped genuinely nearer centres - 1386 wrong labels in a 80k-row test. The tiles path's own
+    simdgroup kernel is exact to gamma; the rows that do not fill a tile take the direct-distance kernel.
+    """
+    mx = _mx()
+    m, step = b - a, 16 if k % 16 == 0 else 8
+    if m % step == 0:
+        dot_k = (_kernel("kmeans_dot_tiles16", ["X", "Ct", "row0"], ["dot"], _DOT_TILES16_SRC) if step == 16
+                 else _kernel("kmeans_dot_tiles", ["X", "Ct", "row0"], ["dot"], _DOT_TILES_SRC))
+        dot = dot_k(inputs=[x, Ct, _u32(a)], template=[("D", d), ("K", k)],
+                    grid=((m // step) * (k // step) * 32, 1, 1), threadgroup=(TILE_THREADGROUP, 1, 1),
+                    output_shapes=[(m * k,)], output_dtypes=[mx.float32])[0]
+        return _lb_from_dot(x, a, dot, csq, m, k, d, gamma)
+    pairs = _kernel("kmeans_pairs", ["X", "C", "row0"], ["dist"], _PAIRS_SRC)
+    dist = pairs(inputs=[x, Cm, _u32(a)], template=[("D", d), ("K", k)], grid=(k, m, 1), threadgroup=(16, 16, 1),
+                 output_shapes=[(m, k)], output_dtypes=[mx.float32])[0]
+    lb = mx.sqrt(dist).reshape(m * k) * (1 - 2 * gamma)
+    mx.eval(lb)
+    return lb
+
+
+def _bounds_gamma(d):
+    eps = float(np.finfo(np.float32).eps)
+    return d * eps / (1 - d * eps)
+
+
+def _bounds_record(parts, C, nearest, k, d, lbs=None):
+    """After a full pass: keep labels, ub and C for the predictor, and the bounds if the pass built them."""
+    mx = _mx()
+    st = {"C": np.array(C, dtype=np.float32, copy=True), "labels": [], "ub": [], "lb": lbs, "life": 0}
+    for (labels, best), x in zip(nearest, parts):
+        edges = _bounds_edges(x.shape[0], k)
+        st["labels"].append([labels[a:b] for a, b in zip(edges, edges[1:])])
+        st["ub"].append([mx.sqrt(best[a:b]) for a, b in zip(edges, edges[1:])])
+        mx.eval(*st["labels"][-1], *st["ub"][-1])
+    if lbs is not None:
+        assert all(len(l) == len(c) for l, c in zip(lbs, st["labels"]))
+    return _hold(_bounds_state, (tuple(p.shape for p in parts), k, d), st, parts)
+
+
+def _bounds_predict(st, parts, C, k, d):
+    """-> the fraction of pairs a bounds step would visit if the bounds were built now, from a strided sample."""
+    mx = _mx()
+    Cm = mx.array(st["C"])
+    Ct, csq = mx.array(np.ascontiguousarray(st["C"].T)), (Cm * Cm).sum(1)
+    gamma = _bounds_gamma(d)
+    drift = mx.array(_bounds_drift(C, st["C"]))
+    pads = _bounds_pads(d)
+    kern = _kernel("kmeans_bounds_count", ["X", "C", "drift", "labels_in", "lb_in", "row0", "row_end", "stride", "pads"],
+                   ["count"], _BOUNDS_COUNT_SRC)
+    total, seen = 0.0, 0
+    step = 16 if k % 16 == 0 else 8
+    for x, labs in zip(parts, st["labels"]):
+        n = x.shape[0]
+        idx = mx.arange(0, n, max(1, n // BOUNDS_SAMPLE_ROWS), dtype=mx.uint32)
+        idx = idx[: max(step, idx.shape[0] // step * step)] if idx.shape[0] >= step else idx
+        xs = x[idx]
+        lab = mx.concatenate(labs)[idx] if len(labs) > 1 else labs[0][idx]
+        ns = xs.shape[0]
+        lb = _lb_chunk(xs, Cm, Ct, csq, 0, ns, k, d, gamma)
+        cnt = kern(inputs=[xs, C_mx(C), drift, lab, lb, _u32(0), _u32(ns), _u32(1), pads],
+                   template=[("D", d), ("K", k)], grid=(ns * 32, 1, 1), threadgroup=(256, 1, 1),
+                   output_shapes=[(ns,)], output_dtypes=[mx.uint32])[0]
+        total += float(mx.sum(cnt)); seen += ns
+    return total / (seen * k)
+
+
 def _bounds_drift(C, C0):
     """|c' - c| per centre, rounded up to float32."""
     dr = np.sqrt(((C.astype(np.float64) - C0.astype(np.float64)) ** 2).sum(1)).astype(np.float32)
@@ -1706,6 +1794,7 @@ def _bounds_pass(st, parts, C, k, d, accumulate):
         _bounds_state.clear()                           # chunks moved to C and chunks still at the old centres cannot mix
         raise
     st["C"] = np.array(C, dtype=np.float32, copy=True)
+    st["life"] = st.get("life", 0) + 1
     st["visited"] = nvis / (sum(p.shape[0] for p in parts) * k)
     return tot, nearest
 
@@ -1754,18 +1843,29 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto", iterate=False):
             nearest.append((lab, best))
         return tot, nearest
     casc = None
-    build_bounds = False
+    record_bounds, cool, build = False, 0, False
     if method == "auto" and _bounds_ok(parts, k, d):
         bk = (tuple(p.shape for p in parts), k, d)
         st = _bounds_state.get(bk)
         if st is not None and not _holds(st, parts):
             st = None
-        if st is not None and _bounds_count(st, parts, C, k, d) <= BOUNDS_MAX_VISITED:
-            return _bounds_pass(st, parts, C, k, d, accumulate)
-        if iterate:                                  # a single pass (predict) never allocates n x k for nothing
-            _bounds_state.clear()                    # one dataset at a time; the bounds are large
-            build_bounds = True
-            method = "tiles"                         # the full pass that also yields the bounds
+        if st is not None and st["lb"] is not None:
+            if _bounds_count(st, parts, C, k, d) <= BOUNDS_MAX_VISITED:
+                return _bounds_pass(st, parts, C, k, d, accumulate)
+            st["lb"] = None                          # decayed past use: drop the memory, keep labels/ub/C
+            # Bounds that lasted one step or none were not worth building (isotropic data: the margins are
+            # smaller than the drift). Wait longer before asking again, doubling each time it happens.
+            st["cool"] = min(2 * st.get("cool", 0) + 1, 8) if st.get("life", 0) <= 1 else 0
+        if iterate:                                  # a single pass (predict) records nothing
+            if st is not None:
+                cool = st.get("cool", 0)
+                # Would bounds built by this pass pay at the next step? Asked of the previous step's
+                # centres and drift, which is conservative: drift shrinks as the run converges.
+                build = cool == 0 and _bounds_predict(st, parts, C, k, d) <= BOUNDS_MAX_VISITED
+            _bounds_state.clear()                    # one dataset at a time
+            record_bounds = True
+            if build:
+                method = "tiles"                     # the pass whose dot chunks yield the bounds
     forced = method == "cascade"                     # by name: used by the accuracy suite
     if (method == "auto" or forced) and _cascade_ok(d, k):
         # The cascade needs two things the caller does not supply: which dimensions carry the variance, and
@@ -1819,8 +1919,7 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto", iterate=False):
             method = "rows"
     Cm = mx.array(C)
     tot = np.zeros((k, d + 2), dtype=np.float64)
-    nearest = []
-    bounds_parts = []
+    nearest, built = [], []
     fb = [] if key is not None else None
     plan = _fused_plan(d, k) if accumulate == "auto" and method == "rows" else None
     if casc is not None:
@@ -1845,26 +1944,14 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto", iterate=False):
             except Exception:                 # a GPU that will not take the threadgroup allocation
                 _fused_broken.add((d, k))
                 plan = None
-        lbs = [] if build_bounds else None
+        lbs = [] if build else None
         labels, best = _nearest(x, Cm, method, fb, lbs)
         tot += _accumulate(x, labels, best, k, accumulate)
         nearest.append((labels, best))
-        if build_bounds:
-            bounds_parts.append((labels, best, lbs))
-    if build_bounds:
-        chunk = _bounds_chunk(k)
-        st = {"C": np.array(C, dtype=np.float32, copy=True), "labels": [], "ub": [], "lb": []}
-        step = 16 if k % 16 == 0 else 8
-        for (labels, best, lbs), x in zip(bounds_parts, parts):
-            n = x.shape[0]
-            whole = n // step * step                 # the tiles path: whole tiles in chunks, then the tail rows
-            edges = list(range(0, whole, chunk)) + [whole] + ([n] if whole < n else [])
-            assert len(edges) - 1 == len(lbs), (edges, len(lbs))
-            st["labels"].append([labels[a:b] for a, b in zip(edges, edges[1:])])
-            st["ub"].append([mx.sqrt(best[a:b]) for a, b in zip(edges, edges[1:])])
-            st["lb"].append(lbs)
-            mx.eval(*st["labels"][-1], *st["ub"][-1])
-        _hold(_bounds_state, (tuple(p.shape for p in parts), k, d), st, parts)
+        if build:
+            built.append(lbs)
+    if record_bounds:
+        _bounds_record(parts, C, nearest, k, d, built if build else None)["cool"] = max(0, cool - 1)
     for ck, st in _cascade_state.items():
         if st["labels"] is None and ck[1] == k and ck[2] == d:
             st["labels"] = [lab for lab, _ in nearest]     # bootstrap: the next pass can prune

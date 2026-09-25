@@ -200,7 +200,7 @@ def check_bounds(name, X, C0, steps=10, slice_rows=None, inject_at=None, rng=Non
         ref_err = max(ref_err, float(np.max(np.abs(ours.astype(np.float64) - ref)) / scale))
         empties += n_empty
         C = ours
-    passed = ref_err <= 1e-6 and on_bounds >= steps // 2
+    passed = ref_err <= 1e-6 and on_bounds >= steps // 3          # engaged, not a policy pin: full passes precede it
     print(f"{'PASS' if passed else 'FAIL'}  {name:50s} {on_bounds}/{steps} steps on bounds, {empties} relocated  "
           f"center err vs float64 reference {ref_err:.1e}")
     return passed
