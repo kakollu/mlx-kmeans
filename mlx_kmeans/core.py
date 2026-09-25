@@ -482,12 +482,13 @@ CASCADE_MAX_SURVIVORS = 0.15            # survivor fraction past which pruning c
                                         # survivors are scored irregularly, at about a sixth of the dense
                                         # rate, so break-even is near 1/6 once the prefix pass is counted
 _cascade_state = {}                     # per dataset: variance order, prefix buffer, last pass's labels
-APPROX_MIN_DIMS = 384                   # dims from which giving up exactness buys anything at all. Below it
-                                        # the exact kernels beat an unverified matmul-and-argmin anyway,
-                                        # because they never materialise the n x k product: measured 0.57x
-                                        # at 128 dims and 0.90x at 256, against 1.03x at 384, 1.53x at 768
-                                        # and 1.63x at 960. So the flag is ignored below this, and even
-                                        # just above it the gain is small - it is worth having at 512+.
+APPROX_MIN_DIMS = 256                   # dims from which giving up exactness buys anything at all. Below it
+                                        # the exact paths win outright - the prefix-pruning cascade at 128
+                                        # dims (0.75x) and 192 (0.91x) - and above it the approximate path
+                                        # pulls ahead: 1.81x at 256, 1.92x at 384, 2.26x at 960. This moved
+                                        # down from 384 when the approximate path stopped walking the n x k
+                                        # product four times; it is a property of both paths, so it has to
+                                        # be re-measured whenever either changes.
 TILES1_SIMDGROUPS = 4                   # simdgroups per threadgroup there (16 rows each)
 MARGIN_CANDIDATES = 24                  # per-row candidate slots before falling back to a second scan
 ROWS_REG_MAX_DIMS = 96                  # above this the per-thread row array spills registers (measured)
@@ -752,6 +753,25 @@ _LABEL_DIST_SRC = """
 """
 
 
+# Argmin over a chunk of the product, in one pass. Writing this as MLX ops - csq[None,:] - 2*(x @ Ct) then
+# argmin - walks the n x k product four times: the matmul writes it, the scale reads and writes it, the
+# subtract reads and writes it, and the argmin reads it again. At 960 dims that intermediate is gigabytes,
+# so the arithmetic stops mattering. One simdgroup per row so the 32 lanes read 32 consecutive centres:
+# measured 360 GB/s against 257 for a thread per row.
+_APPROX_ARGMIN_SRC = """
+    uint i = thread_position_in_grid.x / 32, lane = thread_position_in_grid.x % 32, di = i * K;
+    float amin = INFINITY; uint cmin = 0;
+    for (uint c = lane; c < K; c += 32) {
+        float a = csq[c] - 2 * dot[di + c];
+        bool lt = a < amin; amin = select(amin, a, lt); cmin = select(cmin, c, lt);
+    }
+    float g = simd_min(amin);
+    uint cc = (amin == g) ? cmin : 0xffffffffu;      // lowest index among those achieving the minimum
+    cc = simd_min(cc);
+    if (lane == 0) labels[i] = cc;
+"""
+
+
 def _approx_nearest(x, Cm, n, k, d):
     """Nearest centre from matmul-derived distances, taken on trust -> (labels, exact best).
 
@@ -766,10 +786,13 @@ def _approx_nearest(x, Cm, n, k, d):
     csq = (Cm * Cm).sum(1)
     Ct = mx.contiguous(Cm.T)
     per = max(1, DIST_BYTES // (4 * k))
+    amin = _kernel("kmeans_approx_argmin", ["dot", "csq"], ["labels"], _APPROX_ARGMIN_SRC)
     labels = []
     for r0 in range(0, n, per):
-        xs = x[r0:r0 + per]
-        lab = mx.argmin(csq[None, :] - 2 * (xs @ Ct), axis=1).astype(mx.uint32)
+        m = min(per, n - r0)
+        dot = x[r0:r0 + m] @ Ct
+        lab = amin(inputs=[dot, csq], template=[("K", k)], grid=(m * 32, 1, 1), threadgroup=(256, 1, 1),
+                   output_shapes=[(m,)], output_dtypes=[mx.uint32])[0]
         mx.eval(lab)                          # bound memory: one chunk of the product alive at a time
         labels.append(lab)
     lab = labels[0] if len(labels) == 1 else mx.concatenate(labels)

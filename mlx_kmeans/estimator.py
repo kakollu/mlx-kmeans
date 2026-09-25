@@ -16,10 +16,9 @@ class KMeans:
     want for text/image embeddings compared by cosine similarity - give it L2-normalised rows.
 
     exact=False allows an approximate assignment: distances from a matmul in the expanded form, argmin taken
-    on trust. It changes nothing below 384 dimensions - there the exact kernels are faster as well as exact,
-    because they never materialise the n x k product, so the flag is ignored. Above it the gain grows with
-    dimension: 1.03x at 384, 1.53x at 768, 1.63x at 960, because MLX's matmul reaches hardware these kernels
-    cannot, at about 630x the error. Labels stop being provably optimal - about 0.15% of rows get a different
+    on trust. It changes nothing below 256 dimensions - there the exact paths are faster as well as exact -
+    so the flag is ignored. Above it the gain grows with dimension: 1.81x at 256, 1.92x at 384, 2.26x at 960,
+    because MLX's matmul reaches hardware these kernels cannot, at about 630x the error. Labels stop being provably optimal - about 0.15% of rows get a different
     centre in a pass, costing 1e-7 of the distance - and inertia_ is still the TRUE inertia of the labels
     returned, so an approximate run stays comparable with an exact one. On GIST1M at k=1024 it fitted 1.61x
     faster for 0.019% more inertia and recall@10 through a FAISS IVF index that was the same to within noise
