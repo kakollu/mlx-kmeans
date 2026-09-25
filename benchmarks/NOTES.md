@@ -1119,3 +1119,24 @@ How to read it:
 - What no per-iteration bound sees: the iteration count. Initialisation and time-to-tolerance are the other
   half of a fit, and the suite does not measure them.
 
+## Vector-search workloads, head to head (September 25, 2026, AC power)
+
+The same three-way comparison (ours exact, ours `exact=False`, a batched float16-matmul + scatter-add k-means on
+MLX) on the three jobs a vector-search build actually runs, fixed iterations, identical k-means++ starts, all
+scored by the same float64 routine:
+
+| workload | ours exact | ours exact=False | fp16/scatter-add | inertia, all three |
+|---|---|---|---|---|
+| coarse quantizer, GIST1M 1M x 960, k=1024, 20 it | 1514 ms (bounds engaged) | 1030 | 1036 | within 6e-5 |
+| coarse quantizer, SIFT1M 1M x 128 scaled by 1/128, k=1024, 20 it | 450 | 307 | 273 | within 8e-6 |
+| PQ codebooks, 16 x (256k x 8), k=256, 25 it | 528 (one fit per sub-quantizer) | - | 249 (one batched call) | within 1.4e-4 |
+
+On unscaled SIFT (0-255) the float16 implementation returns a 40% worse inertia - overflow - so it needs the
+data scaled, which a vector-search pipeline usually does anyway. With that done it is the fastest option on
+this machine for two of the three jobs (1.65x over our exact path at 128 dims, 2.1x on PQ codebooks, where
+batching the sub-quantizers into one launch is the whole difference) and at parity with our approximate path
+at 960 dims. Our exact path's advantages - unscaled data, exact labels, bit-reproducible runs - are not what
+quantizer training pays for. What would change the ranking, in order: a batched interface (the PQ gap is
+launches and round trips, not arithmetic), the fast matmul with verified candidates (48 ms against 125 per
+exact GIST pass, `possible.py`), float16 bounds in the converged regime.
+
