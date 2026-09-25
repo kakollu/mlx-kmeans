@@ -603,6 +603,26 @@ chunks cost more in dispatch and synchronisation than they save in traffic:
 | 32 MB | 207.7 ms | 57.4 ms | 85.6 ms |
 | 8 MB | 361.1 ms | 160.9 ms | 245.8 ms |
 
+### What is left in the high-dimensional path, and what it would cost
+
+With the multiply at its ceiling, GIST1M's 175 ms Lloyd step is 131.6 ms of multiply that cannot be
+improved, 9.3 ms of accumulation already at 1.1x its memory floor, and ~31 ms of margin kernel. So the whole
+step is **within about 24% of the floor implied by the hardware and the exactness guarantee**.
+
+The one measured opportunity inside that 31 ms: the margin kernel recomputes |x|^2 for every row on every
+pass, which at 960 dims is a second full read of X. Supplying it precomputed instead (labels bit-identical):
+
+| Config | margin now | with |x|^2 supplied | saved per pass |
+|---|---:|---:|---:|
+| GIST1M 1M x 960, k=1024 | 31.2 ms | 23.5 ms | 7.7 ms (4% of the step) |
+| SIFT1M 1M x 128, k=1024 | 20.9 ms | 14.2 ms | 6.7 ms (19% of the step) |
+
+Computing it per pass buys nothing - the MLX reduction costs the 8 ms it saves. The gain only exists if it
+is computed **once per fit**, since X does not change, and that is the catch: caching it against the data
+would be a correctness risk, not just a performance one, because a stale |x|^2 makes the error bound wrong
+and can change labels rather than merely slowing things down. It has to be threaded explicitly from the
+estimator, which owns the arrays for the life of a fit, rather than cached by identity.
+
 ## Input limits, measured
 
 Behaviour on degenerate input, worth knowing before trusting a result:
