@@ -71,6 +71,32 @@ _PP_KEYS_SRC = """
     // Gumbel-max: argmax over rows of log(d2) + Gumbel noise samples in proportion to d2
     key[i * TRIALS + t] = log(max(d2[i], 1e-30f)) - log(-log(u01(h)));
 """
+# keys and their argmax in one dispatch: one threadgroup per trial reduces over the whole sample on-chip,
+# instead of writing an (m x trials) key array for a separate mx.argmax to read back. Ties keep the first row,
+# matching mx.argmax, so the candidates are identical.
+_PP_PICK_SRC = """
+    threadgroup float bv[256];
+    threadgroup uint  bi[256];
+    uint t = threadgroup_position_in_grid.x;
+    uint lid = thread_position_in_threadgroup.x;
+    float best = -INFINITY; uint bestr = 0;
+    for (uint i = lid; i < M; i += 256) {
+        ulong h = mix64(seed[0] ^ mix64(i * TRIALS + t));
+        float key = log(max(d2[i], 1e-30f)) - log(-log(u01(h)));
+        bool gt = key > best; best = select(best, key, gt); bestr = select(bestr, i, gt);
+    }
+    bv[lid] = best; bi[lid] = bestr;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint sft = 128; sft > 0; sft >>= 1) {
+        if (lid < sft) {
+            bool gt = bv[lid + sft] > bv[lid];
+            bv[lid] = select(bv[lid], bv[lid + sft], gt);
+            bi[lid] = select(bi[lid], bi[lid + sft], gt);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0) cand[t] = bi[0];
+"""
 _PP_EVAL_SRC = """
     uint i = thread_position_in_grid.y, t = thread_position_in_grid.x;
     uint xi = i * D, ci = cand[t] * D;
@@ -144,16 +170,17 @@ def kmeans_pp_init(parts, rows, k, rng, sample=None):
     S = mx.array(take_rows(parts, np.sort(rng.choice(rows, size=min(sample, rows), replace=False))))
     m, d = S.shape
     trials = 2 + int(np.log(k)) if k > 1 else 1
-    keys_k = _kernel("kmeans_pp_keys", ["d2", "seed"], ["key"], _PP_KEYS_SRC, _GEN_HEADER)
+    pick_k = _kernel("kmeans_pp_pick", ["d2", "seed"], ["cand"], _PP_PICK_SRC, _GEN_HEADER)
     eval_k = _kernel("kmeans_pp_eval", ["S", "d2", "cand"], ["mins"], _PP_EVAL_SRC)
     first = int(rng.integers(m))
     picks = [mx.array([first], dtype=mx.uint32)]
     d2 = ((S - S[first]) ** 2).sum(1)
-    for _ in range(k - 1):
-        key = keys_k(inputs=[d2, mx.array([int(rng.integers(2**63 - 1))], dtype=mx.uint64)],
-                     template=[("TRIALS", trials)], grid=(trials, m, 1), threadgroup=(trials, 64 // trials or 1, 1),
-                     output_shapes=[(m * trials,)], output_dtypes=[mx.float32])[0]
-        cand = mx.argmax(key.reshape(m, trials), axis=0).astype(mx.uint32)
+    # All the per-round seeds in one transfer: drawing them one at a time cost a host allocation per round.
+    seeds = mx.array(rng.integers(2**63 - 1, size=k - 1).astype(np.uint64))
+    for r in range(k - 1):
+        cand = pick_k(inputs=[d2, seeds[r:r + 1]], template=[("M", m), ("TRIALS", trials)],
+                      grid=(trials * 256, 1, 1), threadgroup=(256, 1, 1),
+                      output_shapes=[(trials,)], output_dtypes=[mx.uint32])[0]
         mins = eval_k(inputs=[S, d2, cand], template=[("D", d), ("TRIALS", trials)],
                       grid=(trials, m, 1), threadgroup=(trials, 64 // trials or 1, 1),
                       output_shapes=[(m * trials,)], output_dtypes=[mx.float32])[0].reshape(m, trials)
