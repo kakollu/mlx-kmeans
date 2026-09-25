@@ -439,6 +439,16 @@ TILES_MIN_DIMS = 80                     # ...and the dims from which tiles beats
 FUSED_MAX_KW = 128                      # k*(dims+2) past which the fused kernel loses (measured)
 FUSED_ROWS_PER_BLOCK = 4096             # rows per threadgroup; 512-65536 all measured within 25%
 TG_FLOATS = 8192                        # threadgroup memory on Apple Silicon, in float32 slots
+TILES1_KEEP = 4                         # candidate slots held in registers by the one-pass tiles path
+TILES1_DIMS = (16, 96)                  # dims it is worth using over (below: too little work per tile to pay
+                                        # for the reduction; above: the row tiles spill out of registers)
+TILES1_MIN_WORK = 1024                  # k * dims below which the scalar rows kernel is still ahead
+TILES1_MAX_FALLBACK = 0.10              # simdgroup fallback rate past which this path stops being worth it. A
+                                        # simdgroup that falls back scores all K centres exactly, which costs
+                                        # about what the rows kernel costs for its 16 rows, so break-even is
+                                        # near 1/3; this leaves a wide margin.
+TILES1_PROBE_ROWS = 1 << 18             # rows a new dataset is measured on before the rest of the pass
+TILES1_SIMDGROUPS = 4                   # simdgroups per threadgroup there (16 rows each)
 MARGIN_CANDIDATES = 24                  # per-row candidate slots before falling back to a second scan
 ROWS_REG_MAX_DIMS = 96                  # above this the per-thread row array spills registers (measured)
 TILES_MIN_K = 64                        # ...and the k from which tiles beats pairs (measured; below it pairs wins
@@ -510,11 +520,157 @@ def _tiles_nearest(x, Cm, n, k, d):
     return (labels[0], best[0]) if len(labels) == 1 else (mx.concatenate(labels), mx.concatenate(best))
 
 
-def _nearest(x, Cm, method):
+# The tiles path above is fast at the multiply and slow everywhere else: it writes an n x k matrix of dot
+# products to memory and reads it straight back, which at k=256 is most of the pass. This does the same
+# multiply and never stores the matrix. Two things make that possible:
+#
+#   - the row tiles stay in simdgroup registers for the whole centre loop, so X is read once rather than
+#     K/16 times (the reason a naive fusion is slower, not faster);
+#   - the candidates are held in a fixed number of named registers instead of an indexed array. A candidate
+#     array is the obvious way to write this and costs more than the multiply it is protecting: indexing it
+#     by a running count forces it to scratch memory. Measured at 4M x 32, k=256: multiply plus running
+#     minimum 5.3 ms, with an indexed array 11.3 ms, with registers 5.7 ms, against 10.9 ms for the scalar
+#     kernel.
+#
+# Exactness is the margin kernel's argument with one change. Keeping only the R smallest approximate
+# distances means the discarded centres are not individually tested, so the test uses the largest |c|^2 over
+# all centres: every discarded centre has approx >= v[R-1], so if v[R-1] is above the bound widened by that
+# maximum, none of them can be the true nearest and scoring the R kept centres settles the row. When it is
+# not, the row is scored exactly against every centre. R = 4 because duplicate centres - which relocation and
+# seeding on repeated rows can both produce - put several exact ties in the window at once: with half the
+# centres duplicated R = 2 loses 3.2x, while R = 4 falls back on 0.8% of rows and stays level with the
+# scalar kernel. Ties go to the lowest index, as in every other path, which needs an explicit comparison here
+# because the kept set is ordered by distance rather than by index.
+_SCORE_HDR = """
+#define SCORE(cc) { uint c_ = (cc); float s = 0; \\
+    for (uint j = 0; j < D; j++) { float q = X[xi + j] - C[c_ * D + j]; s += q * q; } \\
+    bool lt = (s < best) || (s == best && c_ < bl); best = select(best, s, lt); bl = select(bl, c_, lt); }
+"""
+
+
+def _tiles1_src(r):
+    """Source for the one-pass tiles kernel keeping the r nearest candidates in registers."""
+    keep = "".join(f"                bool l{j} = a < v{j};\n" for j in range(r))
+    for j in range(r - 1, 0, -1):
+        keep += (f"                v{j} = l{j-1} ? v{j-1} : (l{j} ? a : v{j});\n"
+                 f"                u{j} = l{j-1} ? u{j-1} : (l{j} ? c : u{j});\n")
+    keep += "                v0 = l0 ? a : v0;  u0 = l0 ? c : u0;\n"
+    return ("""
+    uint sg = thread_position_in_grid.x / 32, lane = thread_position_in_grid.x % 32;
+    uint rbase = sg * 16, xrow = (row0[0] + rbase) * D;
+    const uint DK = D / 8;
+    threadgroup float tile[SGPG * 256];
+    threadgroup float *T = tile + (thread_position_in_threadgroup.x / 32) * 256;
+    simdgroup_float8x8 a0[DK], a1[DK];
+    for (uint kk = 0; kk < DK; kk++) {
+        simdgroup_load(a0[kk], X + xrow + kk * 8, D);
+        simdgroup_load(a1[kk], X + xrow + 8 * D + kk * 8, D);
+    }
+    uint i = rbase + lane, xi = (row0[0] + i) * D;
+    float xsq = 0;
+    if (lane < 16) for (uint j = 0; j < D; j++) xsq += X[xi + j] * X[xi + j];
+    float g3 = 3 * gamma[0];
+""" + "".join(f"    float v{j} = INFINITY; uint u{j} = 0;\n" for j in range(r)) + """
+    for (uint ct = 0; ct < K / 16; ct++) {
+        uint c0 = ct * 16;
+        simdgroup_float8x8 b0, b1;
+        simdgroup_float8x8 acc00 = simdgroup_float8x8(0.0f), acc01 = simdgroup_float8x8(0.0f);
+        simdgroup_float8x8 acc10 = simdgroup_float8x8(0.0f), acc11 = simdgroup_float8x8(0.0f);
+        for (uint kk = 0; kk < DK; kk++) {
+            simdgroup_load(b0, Ct + kk * 8 * K + c0, K);
+            simdgroup_load(b1, Ct + kk * 8 * K + c0 + 8, K);
+            simdgroup_multiply_accumulate(acc00, a0[kk], b0, acc00);
+            simdgroup_multiply_accumulate(acc01, a0[kk], b1, acc01);
+            simdgroup_multiply_accumulate(acc10, a1[kk], b0, acc10);
+            simdgroup_multiply_accumulate(acc11, a1[kk], b1, acc11);
+        }
+        simdgroup_store(acc00, T, 16);
+        simdgroup_store(acc01, T + 8, 16);
+        simdgroup_store(acc10, T + 8 * 16, 16);
+        simdgroup_store(acc11, T + 8 * 16 + 8, 16);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < 16) {
+            for (uint t = 0; t < 16; t++) {
+                uint c = c0 + t;
+                float a = csq[c] - 2 * T[lane * 16 + t];
+""" + keep + """
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+""" + f"    bool wide = (lane < 16) && (v{r-1} <= v0 + g3 * (xsq + csq[u0]) + g3 * (xsq + csqmax[0]));\n" + """
+    float any = simd_max(wide ? 1.0f : 0.0f);      // the whole simdgroup pays for one widened row
+    if (lane == 0) fb[sg] = (uint)any;
+    if (lane >= 16) return;
+    float best = INFINITY; uint bl = 0;
+    if (wide) {
+        for (uint c = 0; c < K; c++) {
+            float s = 0;
+            for (uint j = 0; j < D; j++) { float q = X[xi + j] - C[c * D + j]; s += q * q; }
+            bool lt = s < best; best = select(best, s, lt); bl = select(bl, c, lt);
+        }
+    } else {
+""" + "".join(f"        SCORE(u{j})\n" for j in range(r)) + """
+    }
+    labels[i] = bl; best_d[i] = best;
+""")
+
+
+def _tiles1_nearest(x, Cm, n, k, d, flags=None):
+    """Nearest centre with no materialised distance matrix -> (labels, best). Exact.
+
+    When `flags` is given the dataset has not been seen before: the first TILES1_PROBE_ROWS rows run on
+    their own and their fallback counts are read back, and if they went badly the rest of the slice goes to
+    the rows kernel instead of finishing a pass already known to be losing. That read is the one place this
+    path waits for the GPU mid-pass, and it happens once per dataset - the caller records the verdict.
+    """
+    mx = _mx()
+    eps = float(np.finfo(np.float32).eps)
+    csq = (Cm * Cm).sum(1)
+    Ct = mx.array(np.ascontiguousarray(np.array(Cm).T))
+    gamma = mx.array([d * eps / (1 - d * eps)], dtype=mx.float32)
+    csqmax = mx.max(csq).reshape(1)
+    kern = _kernel(f"kmeans_tiles1_{TILES1_KEEP}", ["X", "Ct", "C", "csq", "csqmax", "row0", "gamma"],
+                   ["labels", "best_d", "fb"], _tiles1_src(TILES1_KEEP), _SCORE_HDR)
+    whole = n // 16 * 16                     # whole row tiles here; the tail goes to the rows kernel
+    labels, best = [], []
+
+    def tiles(r0, m):
+        lab, bst, fell = kern(inputs=[x, Ct, Cm, csq, csqmax, _u32(r0), gamma],
+                               template=[("D", d), ("K", k), ("SGPG", TILES1_SIMDGROUPS)],
+                               grid=((m // 16) * 32, 1, 1), threadgroup=(TILES1_SIMDGROUPS * 32, 1, 1),
+                               output_shapes=[(m,), (m,), (m // 16,)],
+                               output_dtypes=[mx.uint32, mx.float32, mx.uint32])
+        labels.append(lab)
+        best.append(bst)
+        return fell
+
+    done = 0
+    if flags is not None and whole:
+        done = min(whole, TILES1_PROBE_ROWS // 16 * 16)
+        fell = tiles(0, done)
+        flags.append(fell)
+        if float(mx.sum(fell)) / (done // 16) > TILES1_MAX_FALLBACK and done < n:
+            lab, bst = _rows_kernel(x, Cm, done, n - done, k, d)
+            labels.append(lab)
+            best.append(bst)
+            return mx.concatenate(labels), mx.concatenate(best)
+    if whole > done:
+        tiles(done, whole - done)
+    if whole < n:
+        lab, bst = _rows_kernel(x, Cm, whole, n - whole, k, d)
+        labels.append(lab)
+        best.append(bst)
+    return (labels[0], best[0]) if len(labels) == 1 else (mx.concatenate(labels), mx.concatenate(best))
+
+
+def _nearest(x, Cm, method, fb_out=None):
     """Nearest center and its distance for every row of one slice -> (labels uint32, best float32)."""
     mx = _mx()
     n, d = x.shape
     k = Cm.shape[0]
+    if method == "tiles1":
+        return _tiles1_nearest(x, Cm, n, k, d, fb_out)
     if method == "tiles":
         return _tiles_nearest(x, Cm, n, k, d)
     if method == "rows":
@@ -679,10 +835,31 @@ def _fused_pass(x, Cm, k, tg, bs):
     return tot, labels, best
 
 
+_tiles1_slow = {}          # datasets whose error window is too wide for the one-pass path to pay off
+
+
+def _tiles1_ok(d, k):
+    """Shapes where the one-pass tiles path is faster (measured; see the kernel's comment)."""
+    return (TILES1_DIMS[0] <= d <= TILES1_DIMS[1] and d % 8 == 0 and k % 16 == 0
+            and k * d >= TILES1_MIN_WORK)
+
+
 def _gpu_pass(parts, C, method="auto", accumulate="auto"):
     """One assignment pass -> (float64 totals (k, d+2), [(labels, best) per slice] as MLX arrays)."""
     mx = _mx()
     k, d = C.shape
+    key = None
+    if method == "auto" and _tiles1_ok(d, k):
+        # Whether this path pays is a property of the data, not of the shape: its candidate window scales
+        # with |x|^2, so data that was never centred - a sensor column reading around 3000, say - puts every
+        # centre inside the window and every row takes the exact fallback, which costs 3x the rows kernel.
+        # The answer stays exact either way, so rather than model it, the kernel reports how often it
+        # happened and a dataset that goes over the limit is not offered this path again.
+        seen = (id(parts[0]), tuple(p.shape for p in parts), k, d)
+        verdict = _tiles1_slow.get(seen)
+        if verdict is not True:
+            method = "tiles1"
+            key = seen if verdict is None else None     # measure once per dataset, then trust it
     if method == "auto":
         # Two separate thresholds, both measured. Tiles beats rows from ~40 dims once k >= 64 (48 dims, k=256:
         # 46.4 vs 25.7 ms). Pairs beats tiles at small k from ~64 dims (64 dims, k=8: 2.7 vs 1.5 ms; 960 dims,
@@ -697,6 +874,7 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
     Cm = mx.array(C)
     tot = np.zeros((k, d + 2), dtype=np.float64)
     nearest = []
+    fb = [] if key is not None else None
     plan = _fused_plan(d, k) if accumulate == "auto" and method == "rows" else None
     for x in parts:
         if plan is not None:
@@ -708,9 +886,15 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
             except Exception:                 # a GPU that will not take the threadgroup allocation
                 _fused_broken.add((d, k))
                 plan = None
-        labels, best = _nearest(x, Cm, method)
+        labels, best = _nearest(x, Cm, method, fb)
         tot += _accumulate(x, labels, best, k, accumulate)
         nearest.append((labels, best))
+    if fb:
+        groups = sum(f.size for f in fb)
+        rate = sum(float(mx.sum(f)) for f in fb) / groups if groups else 0.0
+        if len(_tiles1_slow) > 256:
+            _tiles1_slow.clear()                        # ids get reused; the verdict is only a hint
+        _tiles1_slow[key] = rate > TILES1_MAX_FALLBACK
     return tot, nearest
 
 

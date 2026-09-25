@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Accuracy suite: every assignment-pass path must match float64 ground truth.
 
-For each case and each combination of nearest-center path (rows, pairs, tiles where dims and k allow)
+For each case and each combination of nearest-center path (rows, pairs, tiles, tiles1 where dims and k
+allow)
 and accumulation (blocks, sorted):
   1. Labels: every point's center is optimal in float64, up to float32 resolution:
          d64(x, label) <= d64(x, best) + 8 * eps32 * (|x|^2 + |c|^2)
@@ -68,6 +69,8 @@ def check(name, X, C, slice_rows=None, dist_bytes=None):
         combos += [("rows", "atomic")]
     if C.shape[1] % 8 == 0 and len(C) % 8 == 0:
         combos += [("tiles", "blocks"), ("tiles", "sorted")]
+    if km.core._tiles1_ok(C.shape[1], len(C)):
+        combos += [("tiles1", "blocks"), ("tiles1", "sorted")]
     for method, accumulate in combos:
         sums, counts, inertia, labels = km.assign_mlx(parts, C, method=method, return_labels=True, accumulate=accumulate)
         d_lab = ((X64 - C64[labels]) ** 2).sum(1)

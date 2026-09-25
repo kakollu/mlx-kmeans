@@ -1,0 +1,153 @@
+{
+  "environment": {
+    "chip": "Apple M5 Max",
+    "platform": "macOS-27.0-arm64-arm-64bit",
+    "python": "3.11.9 (v3.11.9:de54cf5be3, Apr  2 2024, 07:12:50) [Clang 13.0.0 (clang-1300.0.29.30)]",
+    "mlx": "0.32.2",
+    "power": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23855203)\t96%; discharging; 20:00 remaining present: true",
+    "power_settings": "Battery Power:\n powermode            0\n Sleep On Power Button 1\n standby              1\n ttyskeepawake        1\n hibernatemode        3\n powernap             0\n hibernatefile        /var/vm/sleepimage\n displaysleep         2\n womp                 0\n networkoversleep     0\n sleep                1\n lessbright           1\n tcpkeepalive         1\n disksleep            10\nAC Power:\n Sleep On Power Button 1\n powermode            0\n standby              1\n ttyskeepawake        1\n hibernatemode        3\n powernap             1\n hibernatefile        /var/vm/sleepimage\n womp                 1\n displaysleep         33\n networkoversleep     0\n sleep                0\n tcpkeepalive         1\n disksleep            10",
+    "source_sha256": {
+      "air_bench.py": "06c5452554215193efa8e15f8dcfb9dd01a7549839c47d187c7695b3d256c9cc",
+      "mlx_kmeans/core.py": "ec2eef81cf8fb3cb50e9e2e66bb0a68cd64c11c1f531288ee79b65c05a8dd158",
+      "mlx_kmeans/estimator.py": "3b9eeebd960792d89a6ea056c3aa9b1e9f654ff9b2e23afa72753995c043aea3"
+    }
+  },
+  "plan": {
+    "rows": 10000,
+    "memory_budget_bytes": 2147483648,
+    "estimated_working_bytes": 271635456,
+    "input_bytes": 240000,
+    "total_ram_bytes": 137438953472,
+    "available_ram_bytes": 86030319616,
+    "gpu_recommended_bytes": 115448725504
+  },
+  "download": {
+    "source": "existing local file; smoke test; no download"
+  },
+  "rows": 10000,
+  "scanned_rows": 32768,
+  "selection": "first valid rows of January 2015, not a random or representative sample",
+  "features": [
+    "distance_miles",
+    "duration_minutes",
+    "fare_dollars",
+    "tip_percent",
+    "hour",
+    "passengers"
+  ],
+  "clusters": 8,
+  "seed": 0,
+  "iterations": 17,
+  "download_or_cache_check_s": 4.6667002607136965e-05,
+  "load_s": 0.16645600000629202,
+  "prepare_s": 0.00036758300848305225,
+  "mlx_fit_including_labels_s": 0.09512508299667388,
+  "cluster_counts": [
+    386,
+    2967,
+    1451,
+    1062,
+    2439,
+    1226,
+    409,
+    60
+  ],
+  "mlx_inertia_float64": 13188.02678503361,
+  "centroids_original_units": [
+    [
+      5.2139846345126255,
+      23.32849174882304,
+      20.23264791731358,
+      10.067532226037782,
+      0.0,
+      4.740359858365763
+    ],
+    [
+      1.4997505053626543,
+      8.203416421921602,
+      7.795313653911245,
+      0.532527739195876,
+      0.0,
+      1.2774780833826853
+    ],
+    [
+      4.5192281430413725,
+      21.283310070006486,
+      18.217470671683877,
+      0.9514455798489205,
+      0.0,
+      1.448656106419214
+    ],
+    [
+      1.6201691506617488,
+      8.716870153730632,
+      8.162593943181193,
+      7.420424883224498,
+      0.0,
+      4.4191729537552025
+    ],
+    [
+      1.5503193169465697,
+      8.14447370648104,
+      7.817273758837233,
+      24.652948569735877,
+      0.0,
+      1.4040114709712135
+    ],
+    [
+      4.515286935387572,
+      19.946775723840254,
+      17.659098703220273,
+      22.051226216498623,
+      0.0,
+      1.4368852558295933
+    ],
+    [
+      12.157199133511202,
+      32.41388126317258,
+      38.890663550775216,
+      8.765357115212083,
+      0.0,
+      1.643734655846112
+    ],
+    [
+      1.7855000187052585,
+      8.850833460952977,
+      8.62833340625788,
+      78.03347031529012,
+      0.0,
+      1.6833333504124848
+    ]
+  ],
+  "sklearn": {
+    "version": "1.9.0",
+    "fit_s": 0.03278920898446813,
+    "iterations": 29,
+    "inertia_float64": 12513.893983982469
+  },
+  "controlled": {
+    "description": "same data and centers; one Lloyd update plus final labels; GPU input conversion and initialization excluded; sklearn fit includes its internal preparation",
+    "raw_seconds": {
+      "mlx": [
+        0.00196899997536093,
+        0.0030319169745780528,
+        0.0018699169741012156
+      ],
+      "sklearn": [
+        0.0015935829724185169,
+        0.001622958981897682,
+        0.0014987500035203993
+      ]
+    },
+    "median_seconds": {
+      "mlx": 0.00196899997536093,
+      "sklearn": 0.0015935829724185169
+    },
+    "inertia_float64": {
+      "mlx": 14266.302547207999,
+      "sklearn": 14266.302274621237
+    }
+  },
+  "process_peak_rss_bytes": 277823488,
+  "power_at_end": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23855203)\t96%; discharging; 20:00 remaining present: true"
+}
