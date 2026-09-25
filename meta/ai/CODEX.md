@@ -162,3 +162,28 @@ Lloyd passes' worth throughout. It does not come to dominate.
 
 So the closing branch of this recommendation applies: the current MLX matmul plus fused argmin is the
 high-dimensional endpoint for this library. Work continues in `~/git/mlx-vsearch`.
+
+### The kernel was then built anyway, to check the kill switch empirically
+
+The ceiling alone left one argument open: fusion also avoids writing the n x k product, and at lower
+dimensions that saving might outweigh the slower multiply (a rough model put the crossover near 450 dims). So
+the recommended kernel was built as specified - `prototypes/fused_online_argmin.py` - and measured on GIST1M's
+first 500k rows truncated to d columns, k=1024, labels only, per pass:
+
+| d | exact (tiles) | current approx (mx.matmul + argmin) | fused, best variant | vs current |
+|---:|---:|---:|---:|---:|
+| 256 | 27.6 ms | 12.2 ms | 17.7 ms | 0.69x |
+| 384 | 37.2 ms | 16.0 ms | 25.3 ms | 0.64x |
+| 512 | 48.4 ms | 17.3 ms | 33.6 ms | 0.52x |
+| 768 | 66.5 ms | 22.7 ms | 50.1 ms | 0.45x |
+| 960 | 81.6 ms | 28.6 ms | 62.6 ms | 0.46x |
+
+The best variant everywhere was fp16 inputs with 64 centres per reduction step. It is not badly built: at 960
+dims it runs at 15.7 TFLOP/s, the instruction ceiling. MLX's path reaches 21-34 TFLOP/s *including* its argmin
+pass, so the product traffic saved by fusion is worth less than the multiply throughput lost, at every
+dimension measured. Fails both kill criteria (>= 25 TFLOP/s; >= 20% faster than current).
+
+Side finding: at identical centres the fused kernel's labels differ from exact on 435-679 of 500,000 rows,
+against ~2,000 for MLX's fp32 matmul path at the same scale - fp16 inputs with fp32 accumulation in a custom
+kernel are about four times *more* accurate than MLX's matmul, consistent with the ~5,900 x eps error measured
+for it earlier. Slower, but more faithful.
