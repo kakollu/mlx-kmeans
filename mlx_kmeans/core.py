@@ -440,9 +440,12 @@ FUSED_MAX_KW = 128                      # k*(dims+2) past which the fused kernel
 FUSED_ROWS_PER_BLOCK = 4096             # rows per threadgroup; 512-65536 all measured within 25%
 TG_FLOATS = 8192                        # threadgroup memory on Apple Silicon, in float32 slots
 TILES1_KEEP = 4                         # candidate slots held in registers by the one-pass tiles path
-TILES1_DIMS = (16, 96)                  # dims it is worth using over (below: too little work per tile to pay
-                                        # for the reduction; above: the row tiles spill out of registers)
-TILES1_MIN_WORK = 1024                  # k * dims below which the scalar rows kernel is still ahead
+TILES1_DIMS = (32, 96)                  # dims it is worth using over. Below 32 the reduction costs more than
+                                        # the multiply it replaces, and zero-padding a short row wastes a
+                                        # growing share of the tile (2x at 4 dims); above 96 the row tiles
+                                        # spill out of registers and it loses 3x.
+TILES1_MIN_K = 64                       # ...and the k from which it wins consistently (measured; at k=32 it
+                                        # ranges from 0.55x to 2.07x across dims, which is not worth picking)
 TILES1_MAX_FALLBACK = 0.10              # simdgroup fallback rate past which this path stops being worth it. A
                                         # simdgroup that falls back scores all K centres exactly, which costs
                                         # about what the rows kernel costs for its 16 rows, so break-even is
@@ -558,27 +561,37 @@ def _tiles1_src(r):
     return ("""
     uint sg = thread_position_in_grid.x / 32, lane = thread_position_in_grid.x % 32;
     uint rbase = sg * 16, xrow = (row0[0] + rbase) * D;
-    const uint DK = D / 8;
+    const uint DK = DP / 8, DFULL = D / 8;
     threadgroup float tile[SGPG * 256];
     threadgroup float *T = tile + (thread_position_in_threadgroup.x / 32) * 256;
     simdgroup_float8x8 a0[DK], a1[DK];
-    for (uint kk = 0; kk < DK; kk++) {
+    for (uint kk = 0; kk < DFULL; kk++) {
         simdgroup_load(a0[kk], X + xrow + kk * 8, D);
         simdgroup_load(a1[kk], X + xrow + 8 * D + kk * 8, D);
+    }
+    if (DFULL < DK) {                              // ragged last tile: stage it zero-padded on chip
+        for (uint e = lane; e < 128; e += 32) {
+            uint r = e / 8, j = DFULL * 8 + (e % 8);
+            T[e] = (j < D) ? X[xrow + r * D + j] : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_load(a0[DFULL], T, 8);
+        simdgroup_load(a1[DFULL], T + 64, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
     }
     uint i = rbase + lane, xi = (row0[0] + i) * D;
     float xsq = 0;
     if (lane < 16) for (uint j = 0; j < D; j++) xsq += X[xi + j] * X[xi + j];
     float g3 = 3 * gamma[0];
 """ + "".join(f"    float v{j} = INFINITY; uint u{j} = 0;\n" for j in range(r)) + """
-    for (uint ct = 0; ct < K / 16; ct++) {
+    for (uint ct = 0; ct < KP / 16; ct++) {
         uint c0 = ct * 16;
         simdgroup_float8x8 b0, b1;
         simdgroup_float8x8 acc00 = simdgroup_float8x8(0.0f), acc01 = simdgroup_float8x8(0.0f);
         simdgroup_float8x8 acc10 = simdgroup_float8x8(0.0f), acc11 = simdgroup_float8x8(0.0f);
         for (uint kk = 0; kk < DK; kk++) {
-            simdgroup_load(b0, Ct + kk * 8 * K + c0, K);
-            simdgroup_load(b1, Ct + kk * 8 * K + c0 + 8, K);
+            simdgroup_load(b0, Ct + kk * 8 * KP + c0, KP);
+            simdgroup_load(b1, Ct + kk * 8 * KP + c0 + 8, KP);
             simdgroup_multiply_accumulate(acc00, a0[kk], b0, acc00);
             simdgroup_multiply_accumulate(acc01, a0[kk], b1, acc01);
             simdgroup_multiply_accumulate(acc10, a1[kk], b0, acc10);
@@ -626,10 +639,19 @@ def _tiles1_nearest(x, Cm, n, k, d, flags=None):
     """
     mx = _mx()
     eps = float(np.finfo(np.float32).eps)
+    dp, kp = -(-d // 8) * 8, -(-k // 16) * 16
     csq = (Cm * Cm).sum(1)
-    Ct = mx.array(np.ascontiguousarray(np.array(Cm).T))
-    gamma = mx.array([d * eps / (1 - d * eps)], dtype=mx.float32)
-    csqmax = mx.max(csq).reshape(1)
+    csqmax = mx.max(csq).reshape(1)                    # over the real centres, before any padding
+    # Padding is exact, not an approximation: the extra dimensions are zero in both the row and the centre,
+    # so they contribute +0.0f terms that cannot move a float32 accumulator, and the padded centres carry
+    # csq = +inf so they never enter the candidate set. Only the centre matrix is copied - X is untouched,
+    # and its own ragged tile is staged on chip inside the kernel.
+    Ctp = np.zeros((dp, kp), dtype=np.float32)
+    Ctp[:d, :k] = np.array(Cm).T
+    Ct = mx.array(Ctp)
+    if kp > k:
+        csq = mx.concatenate([csq, mx.full((kp - k,), float("inf"), dtype=mx.float32)])
+    gamma = mx.array([dp * eps / (1 - dp * eps)], dtype=mx.float32)
     kern = _kernel(f"kmeans_tiles1_{TILES1_KEEP}", ["X", "Ct", "C", "csq", "csqmax", "row0", "gamma"],
                    ["labels", "best_d", "fb"], _tiles1_src(TILES1_KEEP), _SCORE_HDR)
     whole = n // 16 * 16                     # whole row tiles here; the tail goes to the rows kernel
@@ -637,7 +659,8 @@ def _tiles1_nearest(x, Cm, n, k, d, flags=None):
 
     def tiles(r0, m):
         lab, bst, fell = kern(inputs=[x, Ct, Cm, csq, csqmax, _u32(r0), gamma],
-                               template=[("D", d), ("K", k), ("SGPG", TILES1_SIMDGROUPS)],
+                               template=[("D", d), ("DP", dp), ("K", k), ("KP", kp),
+                                         ("SGPG", TILES1_SIMDGROUPS)],
                                grid=((m // 16) * 32, 1, 1), threadgroup=(TILES1_SIMDGROUPS * 32, 1, 1),
                                output_shapes=[(m,), (m,), (m // 16,)],
                                output_dtypes=[mx.uint32, mx.float32, mx.uint32])
@@ -839,9 +862,11 @@ _tiles1_slow = {}          # datasets whose error window is too wide for the one
 
 
 def _tiles1_ok(d, k):
-    """Shapes where the one-pass tiles path is faster (measured; see the kernel's comment)."""
-    return (TILES1_DIMS[0] <= d <= TILES1_DIMS[1] and d % 8 == 0 and k % 16 == 0
-            and k * d >= TILES1_MIN_WORK)
+    """Shapes where the one-pass tiles path is faster (measured; see the kernel's comment).
+
+    Dimensions and k need not be multiples of anything - the kernel pads both, exactly.
+    """
+    return TILES1_DIMS[0] <= d <= TILES1_DIMS[1] and k >= TILES1_MIN_K
 
 
 def _gpu_pass(parts, C, method="auto", accumulate="auto"):
