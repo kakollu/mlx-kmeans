@@ -28,7 +28,15 @@ it is the single most useful number here. It is why never materialising the n x 
 costs nothing (it is kilobytes and lives above the cliff), and why keeping segment totals in registers
 instead of device memory was worth 5.6x.
 
-**3. Every round trip to the host costs 150 microseconds.** An `eval` of a trivial op, a one-float readback
+**3. A round trip to the host costs 150-200 microseconds; a launch costs 4-5.** Those are different
+things and were conflated for a day. An `eval` - queue the work, wait for it - is 150-196 us. Queuing a
+kernel or an MLX op without waiting is **~4-5 us** (measured over chains of 100-1000 dependent launches,
+one eval at the end). So chunking a computation finely is nearly free *as long as nothing waits per chunk*:
+the fp16 assignment at 960 dims runs at 19.5 ms whether it is cut into 4096-row or 262144-row chunks, when
+each chunk is not evaluated. Cut into 4096-row chunks *with* an eval each, it is 38.5 ms. The earlier
+"smaller chunks are monotonically worse" result was measuring the per-chunk eval, not the chunking.
+
+**3a. Every round trip to the host costs 150 microseconds.** An `eval` of a trivial op, a one-float readback
 and a one-kernel dispatch all measure 147-161 us. Building an MLX op in Python costs 1 us. So the floor on a
 Lloyd pass is set by how many times it synchronises, not by the host language - which is why rewriting in
 C++ would buy ~0% (measured 0-1% of a step at scale, and the remaining fixed cost is round trips).
@@ -46,6 +54,8 @@ it slower, not faster (161.9 ms to 361.1 ms as chunks go 512 MB to 8 MB), becaus
 | ...with 1 / 2 / 4 accumulators | 3.0 / 7.4 / 9.1 | the unit is pipelined; 8 chains are needed to fill it |
 | Scalar fp32, as the distance kernel uses it | 9.0 achieved | direct form, 98.3 GFLOP in 10.9 ms, and shown issue-bound by the MAC-count ablation |
 | MLX `@`, fp32, 128 dims | 17.2 | 262144 x 128 @ 128 x 1024 |
+| MLX `@`, fp16, 960 dims, **vs rows** | 27.0 / 51.9 / 56.6 | at M = 16384 / 65536 / 262144 - the rate depends on the row count |
+| MLX `@`, fp16/bf16, best shape seen | 62.8 / 63.0 | 65536 x 4096 @ 4096 x 4096 |
 | MLX `@`, fp32, 960 dims | 36.2 | 65536 x 960 @ 960 x 1024 |
 | MLX `@`, fp16 / bf16, 128 dims | 28.2 / 30.0 | |
 | MLX `@`, fp16 / bf16, 960 dims | 52.1 / 52.2 | |
@@ -67,6 +77,24 @@ of error against our kernel's ~9x, far too much for a candidate bound to survive
 much admits every centre.
 
 ## Memory
+
+| What | Measured |
+|---|---:|
+| Read bandwidth, float4 loads, **best of N** | 510 GB/s |
+| Write bandwidth | 435 GB/s |
+| Copy, 1 GB in + 1 GB out | **488 GB/s combined** - read and write share one bus, they do not add |
+| MLX elementwise / dtype convert, combined | 508-516 GB/s |
+
+**Medians drift.** The same read probe returned medians of 368-505 GB/s across four trials a few seconds
+apart, with worst cases down to 249, while the best of each trial sat at 510-516. Nothing heavy was running;
+the GPU is shared with the display, and the desktop app's own rendering was 24-30% of a core. So: **ceilings
+are best-of-N; comparisons are interleaved A/B**; a median from one run is not a number. The 917 ms - 1016 ms
+- 892 ms sequence on the same gist benchmark in one afternoon is what ignoring this looks like.
+
+**AC against battery** (checked 2026-09-25): the fp16 matmul rate, the exact pass and the approximate pass
+were the same to within 2% on both. Bandwidth probes are dominated by the contention above either way.
+
+### Older memory numbers
 
 | What | Measured |
 |---|---:|
@@ -114,3 +142,23 @@ much admits every centre.
 
 See `MACHINES-2026-09-24.md`: from 5 GPU cores to 40, the spread on a low-dimensional pass is 7.6x, and on a
 small one only 3.1x - low-dimensional k-means is bandwidth-bound, so core count buys less than it looks.
+
+## How to compute a floor on this machine
+
+The recipe that decided when to stop optimising, written so it can be reused:
+
+1. **Split the pass into stages and name the unit each one is bound by.** Multiply (which multiplier?
+   custom Metal is capped at 15.7 TFLOP/s, `mx.matmul` at 52-57 fp16 / 38-44 fp32 for our shapes),
+   streaming reads (490 GB/s combined), on-chip work (2 TB/s if it fits in ~32 MB), host round trips
+   (150-200 us each), pure launches (4-5 us each).
+2. **Floor each stage from its unit**, then sum. Bytes that must be written and read again count twice
+   against the shared 490 GB/s.
+3. **Measure each stage separately with a sync after it**, best-of-N. Compare stage by stage, not total to
+   total - the total hides which stage is off.
+4. **Name the scope.** A floor is conditional on which units are reachable. Ours: custom kernels cannot
+   reach the fast multiplier; `mx.matmul` cannot fuse a reduction. Either changing moves the floor.
+5. **Stop at the measurement's resolution, not at zero.** With ~25% median drift under UI load and ~3%
+   on the multiply, a 10-15% gap on a 27 ms pass is inside what an A/B can resolve. Pieces below ~1.5% each
+   are not findable on this machine without dedicated counters.
+
+Applied at 960 dims (GIST 500k rows, k=1024): see `NOTES.md`, "Optimal at 960 dims".

@@ -756,6 +756,44 @@ quarter of float16's range; SIFT fails it and stays fp32, as it must - every SIF
 
 The correction to the record: "fp16 is worth 6%" was a measurement of my test harness, not of fp16.
 
+## Optimal at 960 dims: the accounting that ended the loop (September 25, 2026, AC power)
+
+GIST1M, first 500k rows, k=1024. Floors from the ceilings in `MACHINE-PROFILE.md`; measured stage by stage
+with a sync after each, best of 5-7.
+
+**Approximate pass (`exact=False`): 26.7-27.1 ms, floor ~23.4 ms, gap ~14%.**
+
+| stage | measured | floor | note |
+|---|---:|---:|---|
+| fp16 multiply + argmin, chunked, no per-chunk eval | 19.5 ms | 19.5 | 17.4 ms of multiply at MLX's 56.6 TFLOP/s + 2.1 ms to read the 1 GB fp16 product once; the product write is inside the matmul number |
+| counting sort | 0.70 | ~0.5 | |
+| segment kernel: distance + compensated sums, fp16 X | 2.36 | 1.96 | one fp16 read of X; **83% of bandwidth floor** |
+| segment reduce | 0.22 | 0.2 | |
+| totals to float64 on host | 0.86 | ~0.7 | best alternative found: 0.70 (mx float64 add on the CPU stream) |
+| centre update (numpy, float64) | 1.61 | ~1.2 | float32 division would be 1.24, in approximate mode only |
+
+The two host items are 0.16 + 0.37 ms = 2% of the pass, each below the ~3% multiply variance and far
+below the ~25% bandwidth median drift measured the same hour. Neither is worth the code they would need.
+
+Two things that could have moved the floor were checked and do not: cutting the assignment into
+cache-resident chunks (8-16 MB of product) without per-chunk syncs gives 19.4-19.9 ms at every chunk size
+from 4096 to 262144 rows - no gain and no loss, because MLX already pipelines unsynced chunks; and the matmul
+rate at our K=960 tops out at ~57 TFLOP/s regardless of M or N (63 needs K=4096, which is not our problem).
+
+**Exact pass: 90.3 ms.** The multiply runs at 14.9 TFLOP/s against a 15.7 ceiling for the only instruction
+an exactness bound can be built on (three independent measurements: the no-load ceiling, the MAC-count
+ablation, and Codex's fused kernel built and lost at every dimension). The margin kernel's per-row |x|^2
+recompute is ~4 ms (4.4%), the only identified slack, and a per-slice maximum instead was worth 1.12x on
+that kernel - 1.7% of the pass.
+
+**Scope.** Optimal *given that* custom Metal kernels cannot reach the multiplier `mx.matmul` uses, and
+`mx.matmul` cannot fuse a reduction into its output. If MLX exposes a fused matmul-reduce, or a future
+Metal exposes the fast multiplier, the approximate floor drops by up to the 2.1 ms product read plus
+whatever the argmin then costs on chip, and this section should be redone.
+
+**Verdict.** At 960 dims both modes are at their respective units' limits, with residuals inside
+measurement resolution. Further passes here would be measuring noise. The loop stops.
+
 ## Input limits, measured
 
 Behaviour on degenerate input, worth knowing before trusting a result:
