@@ -980,3 +980,28 @@ unvisited bound loses a half-ulp per iteration); building the bounds inside the 
 second read of the dot chunk (+27 ms per rebuild at 1M rows); and the count pass's sample (1.5 ms at 300k)
 could be smaller. Below 256 dims the path is not offered and has not been measured.
 
+## Where a low-dimensional pass loses to MLX's own primitives (September 25, 2026, AC power)
+
+2M x 50, k=64 (the single-cell shape), one pass, same data and start throughout:
+
+| | ms | against a floor of |
+|---|---|---|
+| reading X once (400 MB at 490 GB/s) | 0.82 | - |
+| our assignment, tiles1 (exact) | 2.11 | one read |
+| our accumulation, sorted (deterministic) | 2.27 | one read |
+| our accumulation, atomic (opt-in, not deterministic) | 3.24 | one read |
+| **our pass, auto** | **4.1-4.7** | 0.82 fused, 1.64 unfused |
+| MLX matmul + argmin, float32 | 9.33 | - |
+| MLX scatter-add (`zeros.at[labels].add(x)`) sums + counts | 1.63 | one read |
+| one-hot float16 matmul for sums + counts | 4.02 | one read |
+
+Each of our two stages is 2.5-2.8x its floor, and the fused single-read kernel cannot apply: it keeps a
+private Kahan accumulator per thread in threadgroup memory, which caps it at k*(dims+2) <= 128 (here 3328).
+MLX's scatter-add does the accumulation in 1.63 ms - faster than our own atomic tile, which is the same idea
+with a worse kernel - at the price of atomics (not bit-reproducible run to run), and a float16 matmul does
+the assignment in about a millisecond at the price of exactness. A pass built from those two primitives
+takes about 2.7 ms here, 1.5x faster than ours; on this shape the exact, deterministic pass is paying
+about 1.4 ms for each of its two guarantees. Closing it means one exact kernel that assigns and accumulates
+in a single read of X at this k*w, with accumulators shared across a simdgroup rather than private per
+thread - not a tuning of either existing stage.
+
