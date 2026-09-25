@@ -66,6 +66,8 @@ def check(name, X, C, slice_rows=None, dist_bytes=None):
     X64, C64 = X.astype(np.float64), C.astype(np.float64)
     ok = True
     combos = [("rows", "blocks"), ("rows", "sorted"), ("pairs", "blocks"), ("pairs", "sorted")]
+    if km.core._onehot_plan(min(p.shape[0] for p in parts), X.shape[1], len(C)):
+        combos += [("onehot", "auto")]
     if 2 * len(C) * (C.shape[1] + 2) <= km.core.TG_FLOATS:
         combos += [("rows", "lanes")]
     if len(C) * (C.shape[1] + 2) <= km.core.ATOMIC_MAX_KW:

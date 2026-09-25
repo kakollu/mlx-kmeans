@@ -162,3 +162,24 @@ The recipe that decided when to stop optimising, written so it can be reused:
    are not findable on this machine without dedicated counters.
 
 Applied at 960 dims (GIST 500k rows, k=1024): see `NOTES.md`, "Optimal at 960 dims".
+
+## Threadgroup memory and occupancy (measured September 25, 2026)
+
+A streaming kernel (each thread sums a strided slice of 256 MB) with a threadgroup buffer of the stated size
+declared and touched once. What the buffer costs is occupancy: the per-core pool is small, so every KB a
+threadgroup declares keeps other threadgroups off the core.
+
+| threads per threadgroup | 1 KB | 4 KB | 8 KB | 12 KB | 16 KB | 24 KB | 32 KB |
+|---|---|---|---|---|---|---|---|
+| 32 | 333 | 230 | 119 | 110 | 76 | 69 | 57 |
+| 64 | 350 | 343 | 153 | 239 | 194 | 130 | 100 |
+| 128 | 371 | 366 | 370 | 258 | 196 | 140 | 116 |
+| 256 | 334 | 365 | 314 | 202 | 263 | 142 | 224 |
+
+GB/s streamed. Rule that fits the table: keep threadgroup memory under about 64 bytes per resident thread
+(8 KB per 128 threads) and bandwidth holds; at 128 bytes per thread it is half, at 256 a third. A
+per-simdgroup accumulator of k x (dims+2) floats - 13 KB at k=64, 50 dims - therefore cannot live in
+threadgroup memory without collapsing the kernel around it; this is the measured reason the fused
+single-read kernel is limited to small k x dims, and why a one-hot tile accumulation only wins once its
+footprint is a few KB (see NOTES, "The fused single-read kernel, second attempt").
+

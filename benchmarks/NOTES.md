@@ -1023,3 +1023,62 @@ free below and above it, and cannot be dropped on SIFT at all. A "result-only" p
 the exact, deterministic pass on every other shape. The single-cell gap is structural (two reads of X and
 the host round trips between them), not the price of the guarantees.
 
+## The fused single-read kernel, second attempt (September 25, 2026, AC power)
+
+Section 1b of core.py, `method="onehot"`. Built for the low-dimensional gap above: one kernel that assigns a
+row and adds it to its cluster's sums without a second read of X and without the host round trips between
+the two stages. The design that worked holds the per-cluster sums as simdgroup 8x8 tiles in registers and
+adds each 8-row batch with one-hot multiplies on the matrix unit - sums (k x W) += onehot^T (k x 8) @ rows
+(8 x W) - with the rows' tiles loaded straight from X (just read for the assignment: cache) and a 64-float
+tail tile carrying the ragged dims plus [1, best], so counts and inertia come out of the same multiply.
+Threadgroup memory is 2.3 KB per simdgroup at k=64. Partials per simdgroup, Kahan reduce in index order:
+deterministic, and the centres came out bit-identical to the two-stage path on every shape tried. Labels
+and best are the rows kernel's, bit for bit.
+
+Three designs were measured before this one, all exact:
+
+| design | 2M x 50 k=64 | why |
+|---|---|---|
+| lane-owned clusters, rows broadcast with simd_shuffle | 32 ms | O(32 x dims) per row whatever k is, and the two accumulators plus the row spill the register file |
+| one-hot tiles, 8 rows staged by 8 lanes, one-hot zeroed per batch | 3.8 ms (accumulate alone 2-3) | the staging and zeroing, not the multiplies: sorted labels with 7 of 8 blocks skipped still cost 1.3 ms |
+| one-hot tiles, 32 rows staged at once, 15 KB per simdgroup | 5.8 ms | occupancy: see the threadgroup-memory table in MACHINE-PROFILE (measured for this) |
+| **one-hot tiles, X tiles from cache, 2.3 KB per simdgroup** | **4.2 ms, parity** | assignment-bound (below) |
+
+The threadgroup-memory table is the durable result: streaming bandwidth holds to about 64 bytes of
+threadgroup memory per resident thread and halves by 128 - which is the measured reason a per-simdgroup
+accumulator cannot live there, and the reason the first fused kernel is limited to k x (dims+2) <= 128.
+
+Measured on the benchmark's own generator, a full lloyd_step, best of three medians after a discarded first
+one (the first median after a dataset is created runs 1.5-2x slow - page-in or clock - and an earlier sweep
+without the discard read every 2M-row shape as a loss):
+
+| shape | two-stage | onehot | | shape | two-stage | onehot | |
+|---|---|---|---|---|---|---|---|
+| 20M x 8 k=16 | 8.29 | 2.79 | 2.97x | 2M x 12 k=128 | 2.72 | 2.33 | 1.17x |
+| 10M x 12 k=32 (satellite) | 4.88 | 2.83 | 1.72x | 2M x 12 k=64 | 1.49 | 1.39 | 1.07x |
+| 2M x 50 k=32 | 3.97 | 2.47 | 1.61x | 2M x 24 k=96 | 3.39 | 3.39 | 1.00x |
+| 0.5M x 50 k=64 | 1.98 | 1.40 | 1.41x | 2M x 50 k=64 (single-cell) | 4.15 | 4.21 | 0.99x |
+| 2M x 90 k=16 | 5.14 | 3.74 | 1.37x | 2M x 20 k=48 | 1.68 | 1.76 | 0.96x |
+| 2M x 30 k=64 | 3.36 | 2.52 | 1.34x | 2M x 24 k=32 | 1.50 | 1.62 | 0.93x |
+| 2M x 62 k=24 | 3.26 | 2.51 | 1.30x | 10M x 4 k=256 (geo-trips) | 8.53 | 7.57 | 1.13x |
+| 10M x 6 k=8 | 1.44 | 1.15 | 1.25x | 2M x 12 k=256 | 3.68 | 5.46 | 0.67x |
+| 2M x 40 k=16 | 1.90 | 1.58 | 1.20x | 2M x 8 k=256 | 2.89 | 4.85 | 0.60x |
+
+So the path is offered up to k=128 (never below 0.93x measured; k=256 loses at 2M rows and its 1.13x on
+geo-trips is left on the table), dims up to 96, k x dim-tiles up to 640 (the accumulator tiles are
+registers). In the suite: satellite 5.1 -> 3.2 ms per pass; single-cell unchanged at parity.
+
+Why single-cell is parity and not the 1.5x hoped for: the assignment. Sustained (40 launches queued), the
+fused kernel costs 1.9x the bare rows assignment at 2M x 24 k=32 (0.93 vs 0.50 ms) - the one-hot multiplies
+and barriers cost about what the rows loop does - and at 2M x 50 k=64 tiles1 assigns in 1.8 ms where the
+rows loop needs 2.4; the one-hot accumulation saves exactly that over the sorted path. What would move it is
+tiles1's assignment (simdgroup dot products with the candidate check) inside this loop, where its X tiles
+are already loaded; that is a new kernel, and the same one that would close geo-trips (5.6x off its floor,
+all of it in the scalar assignment at k=256, d=4).
+
+Floors are now a column in BENCHMARKS.md (`bench.py --report`): one read of X at 490 GB/s or 2*rows*k*dims
+at 15.7 TFLOP/s, whichever is larger, and the measured pass over it. Today: geo-trips 7.1x, single-cell
+5.4x, satellite 3.2x, logs 2.7x, SIFT 1.4x, GIST 1.4x. The GEMM-bound pair are at the hardware within the
+accumulate and the candidate check; the low-dimensional four are the named gap, and the assignment is most
+of it.
+

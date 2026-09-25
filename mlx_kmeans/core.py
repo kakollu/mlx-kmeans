@@ -462,6 +462,11 @@ TILES_MIN_DIMS = 80                     # ...and the dims from which tiles beats
                                         # the old rule cost 1.46x at 48 dims k=256 and 1.26x at 64 dims.
 FUSED_MAX_KW = 128                      # k*(dims+2) past which the fused kernel loses (measured)
 FUSED_ROWS_PER_BLOCK = 4096             # rows per threadgroup; 512-65536 all measured within 25%
+ONEHOT_ROWS = 1024                      # rows per simdgroup in the one-hot fused kernel (512-2048 measured alike)
+ONEHOT_MAX_K = 128                      # at 256 the one-hot tile is 8 KB and the pass loses at 2M rows (0.60-0.67x); at 128 never below 0.93x
+ONEHOT_MAX_KWB = 640                    # k x (dim tiles): the accumulator tiles live in registers, 2 per lane each (measured to here)
+ONEHOT_SIMDGROUPS = 2                   # simdgroups per threadgroup (2 beat 1 and 4 on every shape measured)
+ONEHOT_SKIP_MAX_K = 64                  # skip cluster blocks absent from a batch up to this k; above it the test costs more
 TG_FLOATS = 8192                        # threadgroup memory on Apple Silicon, in float32 slots
 TILES1_KEEP = 4                         # candidate slots held in registers by the one-pass tiles path
 TILES1_DIMS = (32, 96)                  # dims it is worth using over. Below 32 the reduction costs more than
@@ -1501,6 +1506,140 @@ def _fused_pass(x, Cm, k, tg, bs):
     return tot, labels, best
 
 
+# 1b. Assignment and accumulation in one read of X, for small k x dims, with the sums formed on the matrix unit.
+#
+# The plain fused kernel above keeps a private Kahan accumulator per thread in threadgroup memory, which caps
+# it at k*(dims+2) <= 128. This one holds the per-cluster sums as simdgroup 8x8 tiles in registers and adds
+# each batch of 8 rows with one-hot multiplies: sums (k x W) += onehot^T (k x 8) @ rows (8 x W), where the
+# rows' tiles are loaded straight from X (just read for the assignment, so they come from cache) and a
+# 64-float tail tile carries the ragged dims plus [1, best] so that counts and inertia fall out of the same
+# multiply. Threadgroup memory is the 8-row one-hot (k x 8 floats) and that tail tile - 2.3 KB at k=64 -
+# because MACHINE-PROFILE's occupancy table says a per-simdgroup accumulator there would halve the kernel.
+# Each simdgroup sums ONEHOT_ROWS rows into its tiles and stores them as a partial; a reduce kernel sums the
+# partials per (cluster, column) in index order with Kahan, so the result is deterministic. Labels and best
+# are the rows kernel's, bit for bit (same loop, same tie rule).
+#
+# Measured against the two-stage default on the benchmark's own data generator (best of three medians, a full
+# lloyd_step): 20M x 8 k=16 8.29 -> 2.79 ms, 10M x 12 k=32 4.88 -> 2.83, 2M x 50 k=32 3.97 -> 2.47, 2M x 30
+# k=64 3.36 -> 2.52, 2M x 90 k=16 5.14 -> 3.74, 10M x 6 k=8 1.44 -> 1.15; parity (0.93-1.07x) at 2M x 50 k=64,
+# 2M x 24 k=96, 2M x 24 k=32 and the like; 0.60-0.67x at k=256 with 2M rows, which is why k stops at 128.
+# Where it is only parity the reason is the assignment: tiles1 assigns 2M x 50 k=64 in 1.8 ms where this rows
+# loop takes 2.4, and the one-hot accumulation saves exactly that much over the sorted path. Putting the
+# tiles1 assignment inside this loop is the next step, not a tuning of this one. Two things that did not work
+# on the way: lane-owned clusters fed by simd_shuffle (O(32*dims) per row whatever k is, and the two
+# accumulators plus the row spill the register file: 32 ms at 2M x 50), and staging 32 rows in threadgroup
+# memory for the tiles (15 KB per simdgroup: 5.8 ms at 2M x 50, occupancy).
+_onehot_broken = set()
+
+_ONEHOT_SRC = """
+    threadgroup float oh_all[SGT * K * 8];
+    threadgroup float tt_all[SGT * 64];
+    uint lid = thread_position_in_threadgroup.x, lane = lid % 32, sgi = lid / 32;
+    uint sg = thread_position_in_grid.x / 32;
+    threadgroup float* oh = oh_all + sgi * K * 8;
+    threadgroup float* tt = tt_all + sgi * 64;
+    for (uint e = lane; e < K * 8; e += 32) oh[e] = 0.0f;
+    for (uint e = lane; e < 64; e += 32) tt[e] = 0.0f;
+    simdgroup_float8x8 acc[KB][WB];
+    #pragma clang loop unroll(full)
+    for (uint cb = 0; cb < KB; cb++) {
+        #pragma clang loop unroll(full)
+        for (uint wb = 0; wb < WB; wb++) acc[cb][wb] = simdgroup_float8x8(0.0f);
+    }
+    uint base = sg * RPS, end = min(base + RPS, uint(N));
+    for (uint r0 = base; r0 < end; r0 += 32) {
+        uint row = r0 + lane; bool valid = row < end;
+        float xv[D];
+        for (uint j = 0; j < D; j++) xv[j] = valid ? X[row * D + j] : 0.0f;
+        float bst = INFINITY; uint lab = 0;
+        for (uint c = 0; c < K; c++) {
+            float s = 0;
+            for (uint j = 0; j < D; j++) { float t = xv[j] - C[c * D + j]; s += t * t; }
+            bool lt = s < bst; bst = select(bst, s, lt); lab = select(lab, c, lt);
+        }
+        if (valid) { labels[row] = lab; best_d[row] = bst; }
+        for (uint q = 0; q < 4; q++) {
+            uint sb = r0 + q * 8;
+            if (sb >= end) break;
+            uint m = min(8u, end - sb);
+            uint b0 = (sb + 8 <= uint(N)) ? sb : uint(N) - 8;      // the last tile of the buffer is shifted back
+            uint shift = sb - b0;                                  // so that no row beyond N is ever read
+            bool mine = (lane / 8) == q;
+            uint r = lane % 8, col = r + shift;
+            bool take = mine && r < m;
+            if (take) {                                            // the tiles are clean: their last writers cleared them
+                oh[lab * 8 + col] = 1.0f;
+                for (uint t = 0; t < TD; t++) tt[col * 8 + t] = xv[D - TD + t];
+                tt[col * 8 + TD] = 1.0f; tt[col * 8 + TD + 1] = bst;
+            }
+            uint pres = simd_or(take ? (1u << (lab / 8)) : 0u);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_float8x8 B[WB];
+            #pragma clang loop unroll(full)
+            for (uint wb = 0; wb < WB - 1; wb++) simdgroup_load(B[wb], X + b0 * D + wb * 8, D);
+            simdgroup_load(B[WB - 1], tt, 8);
+            #pragma clang loop unroll(full)
+            for (uint cb = 0; cb < KB; cb++) {
+                if (SKIP && !(pres & (1u << cb))) continue;
+                simdgroup_float8x8 A;
+                simdgroup_load(A, oh + cb * 64, 8);
+                #pragma clang loop unroll(full)
+                for (uint wb = 0; wb < WB; wb++) simdgroup_multiply_accumulate(acc[cb][wb], A, B[wb], acc[cb][wb]);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            if (take) { oh[lab * 8 + col] = 0.0f; for (uint t = 0; t < TD + 2; t++) tt[col * 8 + t] = 0.0f; }
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (uint cb = 0; cb < KB; cb++) {
+        #pragma clang loop unroll(full)
+        for (uint wb = 0; wb < WB; wb++) simdgroup_store(acc[cb][wb], partial + (sg * K + cb * 8) * WPAD + wb * 8, WPAD);
+    }
+"""
+
+# partial columns are [dims..., ragged dims, count, inertia, pad]; the totals come out as [count, inertia, sums...]
+_ONEHOT_REDUCE_SRC = """
+    uint col = thread_position_in_grid.x, c = thread_position_in_grid.y;
+    if (col >= W) return;
+    uint src = (col == 0) ? D : (col == 1) ? D + 1 : col - 2;
+    float s = 0.0f, cc = 0.0f;
+    for (uint g = 0; g < NSG; g++) KAHAN_ADD(s, cc, partial[(g * K + c) * WPAD + src]);
+    total[c * W + col] = s; comp[c * W + col] = cc;
+"""
+
+
+def _onehot_plan(n, d, k):
+    """-> (simdgroups per threadgroup, skip absent blocks) if the one-hot fused kernel applies here, else None."""
+    if n < 8 or k % 8 or k > ONEHOT_MAX_K or d > ROWS_REG_MAX_DIMS or d % 8 > 6 or (d, k) in _onehot_broken:
+        return None
+    if k * (d // 8 + 1) > ONEHOT_MAX_KWB:
+        return None
+    fit = 32768 // ((k * 8 + 64) * 4)                # simdgroups whose one-hot and tail tiles fit 32 KB
+    return max(1, min(ONEHOT_SIMDGROUPS, fit)), k <= ONEHOT_SKIP_MAX_K
+
+
+def _onehot_pass(x, Cm, k, plan):
+    """Assignment and accumulation in one read of X -> (totals (k, d+2) float64, labels, best)."""
+    mx = _mx()
+    n, d = x.shape
+    sgt, skip = plan
+    td, wb = d % 8, d // 8 + 1
+    w, wpad, kb, nsg = d + 2, wb * 8, k // 8, -(-n // ONEHOT_ROWS)
+    kern = _kernel(f"kmeans_onehot_{d}_{k}_{sgt}_{int(skip)}", ["X", "C"], ["partial", "labels", "best_d"], _ONEHOT_SRC)
+    part, labels, best = kern(inputs=[x, Cm],
+                              template=[("D", d), ("K", k), ("WPAD", wpad), ("KB", kb), ("WB", wb), ("TD", td),
+                                        ("RPS", ONEHOT_ROWS), ("N", n), ("SGT", sgt), ("SKIP", 1 if skip else 0)],
+                              grid=(nsg * 32, 1, 1), threadgroup=(sgt * 32, 1, 1),
+                              output_shapes=[(nsg * k * wpad,), (n,), (n,)],
+                              output_dtypes=[mx.float32, mx.uint32, mx.float32])
+    red = _kernel("kmeans_onehot_reduce", ["partial"], ["total", "comp"], _ONEHOT_REDUCE_SRC, _KAHAN)
+    total, comp = red(inputs=[part], template=[("D", d), ("K", k), ("W", w), ("WPAD", wpad), ("NSG", nsg)],
+                      grid=(-(-w // 32) * 32, k, 1), threadgroup=(32, 1, 1),
+                      output_shapes=[(k * w,), (k * w,)], output_dtypes=[mx.float32, mx.float32])
+    mx.eval(labels, best)
+    return (_host(total, np.float64) + _host(comp, np.float64)).reshape(k, w), labels, best
+
+
 _tiles1_slow = {}          # datasets whose error window is too wide for the one-pass path to pay off
 
 
@@ -1894,6 +2033,11 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto", iterate=False):
     if method == "cascade":
         method = "auto"                              # if it could not apply, fall through to the usual rules
     key = None
+    if method == "onehot" and _onehot_plan(min(p.shape[0] for p in parts), d, k) is None:
+        raise ValueError(f"method='onehot' does not apply at k={k}, dims={d}: it needs k a multiple of 8 up to "
+                         f"{ONEHOT_MAX_K}, dims up to {ROWS_REG_MAX_DIMS} with dims % 8 <= 6, and k x dim tiles <= {ONEHOT_MAX_KWB}")
+    if method == "auto" and casc is None and accumulate == "auto" and _onehot_plan(min(p.shape[0] for p in parts), d, k):
+        method = "onehot"
     if method == "auto" and casc is None and _tiles1_ok(d, k):
         # Whether this path pays is a property of the data, not of the shape: its candidate window scales
         # with |x|^2, so data that was never centred - a sensor column reading around 3000, say - puts every
@@ -1935,6 +2079,15 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto", iterate=False):
             casc["ok"] = False        # this data has no usable variance structure; stop offering the path
         return tot, nearest
     for x in parts:
+        if method == "onehot":
+            try:
+                part, labels, best = _onehot_pass(x, Cm, k, _onehot_plan(x.shape[0], d, k))
+                tot += part
+                nearest.append((labels, best))
+                continue
+            except Exception:                 # a GPU that will not take the kernel: the two-stage path instead
+                _onehot_broken.add((d, k))
+                method = "rows"
         if plan is not None:
             try:
                 part, labels, best = _fused_pass(x, Cm, k, *plan)

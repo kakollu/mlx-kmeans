@@ -284,8 +284,13 @@ experiments recorded in `benchmarks/NOTES.md`, not fresh ablations in the Septem
 | **Greedy k-means++ seeding on the GPU** | Initialization 18.1 s → 0.2 s at k=1024, and roughly 10× fewer iterations to converge. |
 | **Seeding without a host sync per round** | Each of the k rounds does little work, so waiting for it made seeding cost k GPU round trips regardless of data size — 16 ms of a 19 ms fit at k=64 on 1k rows. Leaving the rounds unevaluated lets MLX pipeline them: 2–4× faster seeding, and the centers are bit-identical across k=8–1024 because only the timing of evaluation changed. What it saves is a fixed few tens of milliseconds per fit, so complete fits measured 1.1–1.9× faster between 1k and 100k rows and the gain fades to a few percent at millions of rows, where the fit is long enough that seeding was never the problem. |
 | **GPU-generated input** | The billion-row CLI creates data on the GPU, avoiding a NumPy input copy. NumPy input through the public API can require additional storage. |
+| **One-read fused kernel with the sums on the matrix unit** (k ≤ 128, dims ≤ 96) | Assigns a row and adds it to its cluster with one-hot tile multiplies, in one read of X: satellite 5.1 → 3.2 ms per pass, 20M × 8 k=16 8.3 → 2.8 ms, and never below parity where offered. Deterministic; centres bit-identical to the two-stage path. |
 
 | **Per-center distance bounds between iterations** (Elkan's lower bounds, kept for every row × center) | After the first iteration or two, 97–99% of the n × k distances a pass computes cannot change any assignment; the bounds skip them, exactly. GIST 1M, k=1024: one iteration 175 → 50–63 ms in steady state, 20 iterations 3.51 → 1.62 s, 5 iterations 0.89 → 0.74 s; a fit to tolerance on GIST 300k 1.85 → 1.05 s. A 5-iteration benchmark moves least, which is why this stayed hidden. Built only when a sampled prediction says they will pay, so data they cannot help costs a few percent. Offered at 256+ dims where the n × k bounds fit (3.9M rows at k=1024), released with the data; a one-shot `predict` never allocates them. |
+
+`BENCHMARKS.md` now carries a floor for every config — one read of the data at the measured DRAM rate or the
+multiply at the measured matrix-unit ceiling, whichever is larger — and the pass's distance from it, so the table
+says not only how we compare to other libraries but how far each shape is from this machine.
 
 `benchmarks/NOTES.md` is the full record, including what *didn't* work: cache tiling (1.4×, so cache misses weren't
 the cause), branch-free argmin (no effect), the center-to-center triangle-inequality test inside one pass (78% of

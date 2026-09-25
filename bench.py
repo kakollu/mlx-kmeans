@@ -43,6 +43,17 @@ OURS = "ours: kmeans.py metal"
 PUBLISH_TARGET = 1.5
 BUSY_CPU = 400  # % CPU used by other processes above which a timing is flagged (idle background is ~230%)
 ITERS, REPEATS = 5, 3
+# Floors, from benchmarks/MACHINE-PROFILE.md ("How to compute a floor"): one read of X at the measured DRAM rate, and
+# 2*rows*k*dims at the simdgroup-matrix ceiling. A pass cannot beat the larger of the two; the ratio says how far
+# the implementation is from the hardware. The GEMM-bound configs sit near 1.1 (the tiles kernel is at 94% of the
+# ceiling); anything above ~1.5 is a named gap, not noise. What this floor cannot see is the iteration count: a
+# technique that makes later passes cheaper (the per-centre bounds) shows nothing here.
+DRAM_BYTES_PER_S = 490e9
+MATRIX_FLOP_PER_S = 15.7e12
+
+
+def floor_s(rows, dims, k):
+    return max(rows * dims * 4 / DRAM_BYTES_PER_S, 2.0 * rows * k * dims / MATRIX_FLOP_PER_S)
 
 # Representative problems (see google_chat.txt): shapes people actually cluster.
 SUITE = {
@@ -280,8 +291,8 @@ def report():
         f"**Publish target:** ours at least {PUBLISH_TARGET}x faster on every config than the fastest of the "
         f"libraries compared here (scikit-learn, FAISS, fast-pytorch-kmeans).",
         "",
-        "| Config | Problem | Shape | Ours s/pass | Fastest valid public | Its s/pass | Ours vs it |",
-        "|---|---|---|---|---|---|---|",
+        "| Config | Problem | Shape | Ours s/pass | Floor s/pass | Ours ÷ floor | Fastest valid public | Its s/pass | Ours vs it |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     details = []
     for name, cfg in SUITE.items():
@@ -296,7 +307,9 @@ def report():
             ratio = best["sec_per_pass"] / ours["sec_per_pass"]
             mark = "✅" if ratio >= PUBLISH_TARGET else ("🟡" if ratio >= 1 else "❌")
             verdict = f"{mark} {ratio:.1f}x"
-            out.append(f"| {name} | {cfg['why']} | {shape} | {ours['sec_per_pass']:.4f} | {best['impl']} ({best['date'][:10]}) | {best['sec_per_pass']:.4f} | {verdict} |")
+            fl = floor_s(rs[0]["rows"], rs[0]["dims"], rs[0]["k"])
+            out.append(f"| {name} | {cfg['why']} | {shape} | {ours['sec_per_pass']:.4f} | {fl:.4f} | {ours['sec_per_pass'] / fl:.1f}x | "
+                       f"{best['impl']} ({best['date'][:10]}) | {best['sec_per_pass']:.4f} | {verdict} |")
         details += [f"### {name}: {cfg['why']} ({shape}, {cfg['data']} data)", "",
                     "| Implementation (latest run) | Version | s/pass (median) | min–max | vs ours | Inertia vs ours | Load / other CPU | Commit | Date |",
                     "|---|---|---|---|---|---|---|---|---|"]
@@ -313,7 +326,14 @@ def report():
             details.append(f"| {r['impl']} | {r['version']} | {r['sec_per_pass']:.4f} | {r['min_s']:.4f}–{r['max_s']:.4f} | {vs} | "
                            f"{rel} | {r['load1']:.1f} / {r.get('other_cpu', float('nan')):.0f}%{busy} | {commit} | {r['date'][:10]} |")
         details.append("")
-    out += ["", "✅ meets target · 🟡 faster but below target · ❌ slower", "", "## Details", ""] + details
+    out += ["", "✅ meets target · 🟡 faster but below target · ❌ slower", "",
+            f"**Floor:** the larger of one read of X at {DRAM_BYTES_PER_S / 1e9:.0f} GB/s and 2·rows·k·dims at "
+            f"{MATRIX_FLOP_PER_S / 1e12:.1f} TFLOP/s, the two ceilings measured in `benchmarks/MACHINE-PROFILE.md`. "
+            "The ratio is the distance from the hardware for one pass: the GEMM-bound configs sit at 1.4x (the tiles "
+            "kernel is at 94% of the ceiling; the rest is the accumulation and the candidate check), and anything above "
+            "about 1.5x is a named gap (see `benchmarks/NOTES.md`). A per-pass floor cannot see the iteration count, "
+            "which is where the per-centre bounds act; a fit-to-tolerance config belongs in the suite for that.",
+            "", "## Details", ""] + details
     out += ["`*` after a commit = uncommitted changes to kmeans.py/bench.py at run time.", ""]
     REPORT.write_text("\n".join(out))
     print(f"wrote {REPORT.relative_to(ROOT)}")
