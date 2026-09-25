@@ -430,8 +430,12 @@ _REDUCE_SRC = """
     total[e] = s; total_comp[e] = c;
 """
 _kernels = {}
-PAIRS_MIN_DIMS = 64                     # dims from which the pairs path beats the rows path (measured)
-TILES_MIN_DIMS = 40                     # ...and the dims from which tiles beats rows, which is lower
+PAIRS_MIN_DIMS = 80                     # dims from which the pairs path beats the rows path (measured)
+TILES_MIN_DIMS = 80                     # ...and the dims from which tiles beats rows. Both moved up from
+                                        # 64/40 once the rows kernel started holding the row in registers:
+                                        # that made it 1.0-3.2x faster and invalidated a threshold measured
+                                        # an hour earlier. rows now wins to 64 dims at every k tested, and
+                                        # the old rule cost 1.46x at 48 dims k=256 and 1.26x at 64 dims.
 FUSED_MAX_KW = 128                      # k*(dims+2) past which the fused kernel loses (measured)
 FUSED_ROWS_PER_BLOCK = 4096             # rows per threadgroup; 512-65536 all measured within 25%
 TG_FLOATS = 8192                        # threadgroup memory on Apple Silicon, in float32 slots
