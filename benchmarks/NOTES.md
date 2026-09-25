@@ -663,6 +663,44 @@ At 960 dims and k=1024 the approximate path disagreed with exact labels on 4,038
 which is the argument for an opt-in approximate mode confined to high dimensions, and the argument against
 making it the default anywhere.
 
+## The approximate path, measured (September 24, 2026, AC power)
+
+Following the reconciliation above, `KMeans(exact=False)` exists so the trade can be measured rather than
+argued about. It takes the argmin of matmul-derived distances on trust - what a k-means written directly on
+MLX does - and then computes the distance to the chosen centre exactly, so `inertia_` is the true inertia of
+the labels returned and an approximate run stays comparable with an exact one.
+
+It is ignored below 384 dims, because there the exact kernels are faster as well as exact. One assignment
+pass from identical centres, k=1024:
+
+| Shape | exact | approx | speedup | labels differing | extra inertia |
+|---|---:|---:|---:|---:|---:|
+| 500k x 128 | 16.7 ms | 29.3 ms | 0.57x *(flag ignored)* | 973 / 500k | 3.2e-07 |
+| 500k x 384 | 36.5 ms | 35.4 ms | 1.03x | 790 / 500k | 1.2e-07 |
+| 500k x 768 | 66.7 ms | 43.7 ms | 1.53x | 726 / 500k | 6.0e-08 |
+| 200k x 960 | 33.5 ms | 20.5 ms | 1.63x | 309 / 200k | 6.1e-08 |
+
+Disagreement is ~0.15% of rows and each one costs about 1e-7 of the distance - the approximate choice is
+almost always a near-tie. Measuring it at identical centres matters: comparing labels after two full fits
+conflates the approximation with the two runs reaching different local minima, which is a much larger effect
+(12.8% of labels, on a case where the approximate fit ended with *lower* inertia).
+
+**On the use case it exists for, it costs nothing measurable.** GIST1M, 1M x 960, k=1024, 12 iterations,
+both sets of centroids scored by the same exact routine and then used to build a FAISS IVF index:
+
+| | fit | inertia | recall@10, nprobe 1 | nprobe 8 | nprobe 32 |
+|---|---:|---:|---:|---:|---:|
+| exact | 2.84 s | — | 25.42% | 68.07% | 92.44% |
+| approx | 1.77 s | +1.86e-04 | 25.57% | 68.49% | 92.49% |
+
+1.61x faster for 0.019% more inertia, and recall the same to within noise - the approximate centroids score
+marginally *higher* at every nprobe, which is a different local minimum rather than an improvement and
+should not be read as one. Reproduce with `scripts/compare_exact_approx.py --ann`.
+
+The honest summary for a user: above 384 dims this is a real speedup and the clustering is very slightly
+worse in a way that did not reach the downstream metric; below 384 dims there is nothing to trade, because
+exact is already faster.
+
 ## Input limits, measured
 
 Behaviour on degenerate input, worth knowing before trusting a result:

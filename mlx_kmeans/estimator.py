@@ -15,6 +15,16 @@ class KMeans:
     spherical=True runs spherical k-means (centers re-normalised to unit length each iteration), which is what you
     want for text/image embeddings compared by cosine similarity - give it L2-normalised rows.
 
+    exact=False allows an approximate assignment: distances from a matmul in the expanded form, argmin taken
+    on trust. It changes nothing below 384 dimensions - there the exact kernels are faster as well as exact,
+    because they never materialise the n x k product, so the flag is ignored. Above it the gain grows with
+    dimension: 1.03x at 384, 1.53x at 768, 1.63x at 960, because MLX's matmul reaches hardware these kernels
+    cannot, at about 630x the error. Labels stop being provably optimal - about 0.15% of rows get a different
+    centre in a pass, costing 1e-7 of the distance - and inertia_ is still the TRUE inertia of the labels
+    returned, so an approximate run stays comparable with an exact one. On GIST1M at k=1024 it fitted 1.61x
+    faster for 0.019% more inertia and recall@10 through a FAISS IVF index that was the same to within noise
+    (92.49% against 92.44% at nprobe 32). scripts/compare_exact_approx.py reproduces that.
+
     accumulate="atomic" sums cluster totals in threadgroup memory: ~1.7-4.5x faster at small k * dims, at the cost
     of bit-reproducibility (centers move by ~1e-8 relative between identical runs, which can change which local
     minimum a run reaches). The default is deterministic.
@@ -24,7 +34,7 @@ class KMeans:
     """
 
     def __init__(self, n_clusters=8, n_init=1, max_iter=300, tol=1e-4, random_state=None, verbose=False,
-                 spherical=False, accumulate="auto"):
+                 spherical=False, accumulate="auto", exact=True):
         self.n_clusters = n_clusters
         self.n_init = n_init
         self.max_iter = max_iter
@@ -33,6 +43,11 @@ class KMeans:
         self.verbose = verbose
         self.spherical = spherical
         self.accumulate = accumulate
+        self.exact = exact
+
+    @property
+    def _method(self):
+        return "auto" if self.exact else "approx"
 
     @classmethod
     def from_centers(cls, centers, **kwargs):
@@ -101,7 +116,8 @@ class KMeans:
             C = self._normalise(C)
         prev = None
         for it in range(self.max_iter):
-            C, inertia, n_empty = core.lloyd_step(parts, C, accumulate=self.accumulate)
+            C, inertia, n_empty = core.lloyd_step(parts, C, method=self._method,
+                                                  accumulate=self.accumulate)
             if not np.isfinite(inertia):            # free: the data, not the algorithm, is the usual cause
                 self._explain_nonfinite(parts)
             if self.spherical:
@@ -130,7 +146,8 @@ class KMeans:
             C, inertia, iters = self._one_run(parts, rows, seed)
             # A Lloyd step reports inertia before its center update. Score the final centers so restarts,
             # labels_, and inertia_ all describe the same fitted model.
-            _, _, inertia, labels = core.assign_mlx(parts, C, return_labels=True, accumulate=self.accumulate)
+            _, _, inertia, labels = core.assign_mlx(parts, C, method=self._method, return_labels=True,
+                                                    accumulate=self.accumulate)
             if self.verbose and self.n_init > 1:
                 print(f"start {run + 1}/{self.n_init}: inertia {inertia:.6e} after {iters} iterations")
             if best is None or inertia < best[1]:
@@ -141,8 +158,8 @@ class KMeans:
     def predict(self, X):
         """Cluster index for every row of X (any array-like)."""
         parts = self._parts(X)
-        _, _, inertia, labels = core.assign_mlx(parts, self.cluster_centers_, return_labels=True,
-                                                accumulate=self.accumulate)
+        _, _, inertia, labels = core.assign_mlx(parts, self.cluster_centers_, method=self._method,
+                                                return_labels=True, accumulate=self.accumulate)
         if not np.isfinite(inertia):
             self._explain_nonfinite(parts)
         return labels

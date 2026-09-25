@@ -473,6 +473,12 @@ TILES1_MAX_FALLBACK = 0.10              # simdgroup fallback rate past which thi
                                         # about what the rows kernel costs for its 16 rows, so break-even is
                                         # near 1/3; this leaves a wide margin.
 TILES1_PROBE_ROWS = 1 << 18             # rows a new dataset is measured on before the rest of the pass
+APPROX_MIN_DIMS = 384                   # dims from which giving up exactness buys anything at all. Below it
+                                        # the exact kernels beat an unverified matmul-and-argmin anyway,
+                                        # because they never materialise the n x k product: measured 0.57x
+                                        # at 128 dims and 0.90x at 256, against 1.03x at 384, 1.53x at 768
+                                        # and 1.63x at 960. So the flag is ignored below this, and even
+                                        # just above it the gain is small - it is worth having at 512+.
 TILES1_SIMDGROUPS = 4                   # simdgroups per threadgroup there (16 rows each)
 MARGIN_CANDIDATES = 24                  # per-row candidate slots before falling back to a second scan
 ROWS_REG_MAX_DIMS = 96                  # above this the per-thread row array spills registers (measured)
@@ -725,11 +731,52 @@ def _tiles1_nearest(x, Cm, n, k, d, flags=None):
     return (labels[0], best[0]) if len(labels) == 1 else (mx.concatenate(labels), mx.concatenate(best))
 
 
+# Distance from each row to the centre it was already assigned. Used by the approximate path so that the
+# inertia it reports is the true inertia of the labels it returned, rather than the approximation that chose
+# them - otherwise an approximate run could not be compared against an exact one at all. Same accumulation
+# order as every other exact distance here.
+_LABEL_DIST_SRC = """
+    uint i = thread_position_in_grid.x, xi = (row0[0] + i) * D, ci = labels[i] * D;
+    float s = 0;
+    for (uint j = 0; j < D; j++) { float t = X[xi + j] - C[ci + j]; s += t * t; }
+    best_d[i] = s;
+"""
+
+
+def _approx_nearest(x, Cm, n, k, d):
+    """Nearest centre from matmul-derived distances, taken on trust -> (labels, exact best).
+
+    NOT exact, and not the default: this is the expanded form |c|^2 - 2 x.c with no verification, which is
+    what a k-means written directly on MLX does. It is worth having because above about 320 dims MLX's
+    matmul reaches hardware this library's own kernels cannot - 28.7 against a 15.7 TFLOP/s ceiling for
+    simdgroup_multiply_accumulate - at about 630x the error, which is far too much for the exact path's
+    candidate bound but may be irrelevant to the application. Below that crossover the exact kernels are
+    faster anyway, so `exact=False` does not use this there.
+    """
+    mx = _mx()
+    csq = (Cm * Cm).sum(1)
+    Ct = mx.contiguous(Cm.T)
+    per = max(1, DIST_BYTES // (4 * k))
+    labels = []
+    for r0 in range(0, n, per):
+        xs = x[r0:r0 + per]
+        lab = mx.argmin(csq[None, :] - 2 * (xs @ Ct), axis=1).astype(mx.uint32)
+        mx.eval(lab)                          # bound memory: one chunk of the product alive at a time
+        labels.append(lab)
+    lab = labels[0] if len(labels) == 1 else mx.concatenate(labels)
+    kern = _kernel("kmeans_label_dist", ["X", "C", "labels", "row0"], ["best_d"], _LABEL_DIST_SRC)
+    best = kern(inputs=[x, Cm, lab, _u32(0)], template=[("D", d)], grid=(n, 1, 1), threadgroup=(64, 1, 1),
+                output_shapes=[(n,)], output_dtypes=[mx.float32])[0]
+    return lab, best
+
+
 def _nearest(x, Cm, method, fb_out=None):
     """Nearest center and its distance for every row of one slice -> (labels uint32, best float32)."""
     mx = _mx()
     n, d = x.shape
     k = Cm.shape[0]
+    if method == "approx":
+        return _approx_nearest(x, Cm, n, k, d)
     if method == "tiles1":
         return _tiles1_nearest(x, Cm, n, k, d, fb_out)
     if method == "tiles":
@@ -996,6 +1043,8 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
     """One assignment pass -> (float64 totals (k, d+2), [(labels, best) per slice] as MLX arrays)."""
     mx = _mx()
     k, d = C.shape
+    if method == "approx" and d < APPROX_MIN_DIMS:
+        method = "auto"           # below the crossover the exact kernels are faster as well as exact
     key = None
     if method == "auto" and _tiles1_ok(d, k):
         # Whether this path pays is a property of the data, not of the shape: its candidate window scales
