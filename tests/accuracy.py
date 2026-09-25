@@ -23,6 +23,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import mlx_kmeans as km  # noqa: E402
+from mlx_kmeans import core  # noqa: E402
 
 EPS32 = float(np.finfo(np.float32).eps)
 
@@ -165,6 +166,46 @@ def check_relocation(name, X, C0, steps=8, vs_sklearn=False):
     return passed
 
 
+def check_bounds(name, X, C0, steps=10, slice_rows=None, inject_at=None, rng=None):
+    """Consecutive Lloyd steps through the per-centre bounds path (dims >= 256): the same checks as check_relocation
+    at every step, plus the path must actually engage. With inject_at, unrelated centres replace the sequence at
+    that step - the n_init restart - and the pass must fall back to a full evaluation and stay exact.
+
+    The labels are read from the path's own state rather than from a second assign_mlx call: a step that rebuilt
+    the bounds ran the tiles kernel, the next assignment runs the bounds kernel, and the two sum a distance in a
+    different order, so a float32-level tie can land differently. Both are exact; only the step's own labels
+    reproduce its centres.
+    """
+    mx = km._mx()
+    per = slice_rows or len(X)
+    parts = [mx.array(X[a:a + per]) for a in range(0, len(X), per)]
+    scale = float(np.sqrt((X.astype(np.float64) ** 2).mean()))
+    core._bounds_state.clear()
+    C, ref_err, on_bounds, empties = C0.copy(), 0.0, 0, 0
+    for step in range(steps):
+        if inject_at is not None and step == inject_at:
+            C = X[rng.choice(len(X), len(C), replace=False)].copy()
+        for st in core._bounds_state.values():
+            st.pop("visited", None)
+        ours, _, n_empty = km.lloyd_step(parts, C)
+        on_bounds += any("visited" in st for st in core._bounds_state.values())
+        st = next(iter(core._bounds_state.values()))
+        labels = np.concatenate([np.array(c) for chunks in st["labels"] for c in chunks]).astype(np.int64)
+        _, ref_best = reference(X, C)
+        X64, C64 = X.astype(np.float64), C.astype(np.float64)
+        d_lab = ((X64 - C64[labels]) ** 2).sum(1)
+        if (d_lab > ref_best + 8 * EPS32 * ((X64 ** 2).sum(1) + (C64[labels] ** 2).sum(1))).any():
+            ref_err = float("inf")
+        ref, _ = reference_lloyd_step(X, C, labels)
+        ref_err = max(ref_err, float(np.max(np.abs(ours.astype(np.float64) - ref)) / scale))
+        empties += n_empty
+        C = ours
+    passed = ref_err <= 1e-6 and on_bounds >= steps // 2
+    print(f"{'PASS' if passed else 'FAIL'}  {name:50s} {on_bounds}/{steps} steps on bounds, {empties} relocated  "
+          f"center err vs float64 reference {ref_err:.1e}")
+    return passed
+
+
 def blobs(rng, n, d, true_k, spread, noise):
     centers = rng.uniform(-spread, spread, size=(true_k, d))
     return (centers[rng.integers(0, true_k, n)] + rng.normal(0, noise, (n, d))).astype(np.float32)
@@ -217,6 +258,16 @@ def main():
     X = blobs(rng, 200_000, 12, 16, 10, 1)
     C0 = np.concatenate([X[rng.choice(len(X), 31, replace=False)], rng.uniform(900, 1000, (1, 12)).astype(np.float32)])
     results.append(check_relocation("relocation, 1 empty d12 k32 (+ scikit-learn)", X, C0, vs_sklearn=True))
+    # per-centre bounds between iterations (dims >= 256): exact at every step, including a restart mid-sequence
+    X = blobs(rng, 60_000, 960, 50, 1, 1)
+    results.append(check_bounds("bounds d960 k1024, restart at step 6", X, X[rng.choice(len(X), 1024, replace=False)],
+                                steps=12, inject_at=6, rng=rng))
+    X = blobs(rng, 50_000, 256, 40, 3, 1)
+    results.append(check_bounds("bounds, 3 slices d256 k64", X, X[rng.choice(len(X), 64, replace=False)],
+                                steps=8, slice_rows=20_001))
+    X = blobs(rng, 80_000, 256, 30, 10, 1)
+    C0 = np.concatenate([X[rng.choice(len(X), 60, replace=False)], rng.uniform(900, 1000, (4, 256)).astype(np.float32)])
+    results.append(check_bounds("bounds with relocation d256 k64", X, C0, steps=8))
     print(f"\n{sum(results)}/{len(results)} cases passed")
     sys.exit(0 if all(results) else 1)
 

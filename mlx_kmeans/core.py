@@ -502,6 +502,11 @@ TILES_MIN_K = 64                        # ...and the k from which tiles beats pa
                                         # by a lot at high dims - 960 dims, k=32: pairs 36.6 ms vs tiles 51.8 ms)
 TILE_THREADGROUP = 512                  # threads per threadgroup in the tiles path (measured best)
 DIST_BYTES = 512 << 20                  # largest (rows x k) float32 distance chunk in the pairs path
+BOUNDS_MIN_DIMS = 256                   # per-centre bounds: below this the bound traffic costs more than the multiply it saves
+BOUNDS_MAX_DIMS = 2048                  # the step kernel holds a row in registers, D/32 per lane
+BOUNDS_MAX_BYTES = 16 << 30             # n x k float32 lower bounds, plus one DIST_BYTES chunk while it is rewritten
+BOUNDS_MAX_VISITED = 0.05               # centres the count pass expects to visit, as a fraction of n x k; above it, full pass
+BOUNDS_SAMPLE_ROWS = 65536              # rows the count pass looks at (strided); the estimate decides, the step counts exactly
 ACC_BYTES = 256 << 20                   # budget for per-block accumulation buffers
 ACC_ROWS_PER_BLOCK = 256                # target rows per accumulation thread (measured sweet spot)
 ACC_MIN_BLOCKS, ACC_MAX_BLOCKS = 1024, 4096   # more blocks = less work per thread but more to reduce
@@ -544,6 +549,22 @@ def _held(parts):
     return [weakref.ref(p) for p in parts]
 
 
+def _hold(cache, key, entry, parts):
+    """Install entry under key, and drop it again the moment any of its arrays is freed.
+
+    Without this the state - a float16 copy, the cascade prefix, n x k lower bounds - outlives the data it
+    describes until the next dataset arrives: fit() builds its arrays from the caller's numpy and they die when
+    it returns. The callback checks that the entry is still the one installed, so an older array dying late
+    cannot evict a newer entry of the same shape.
+    """
+    def gone(_ref):
+        if cache.get(key) is entry:
+            cache.pop(key, None)
+    entry["refs"] = [weakref.ref(p, gone) for p in parts]
+    cache[key] = entry
+    return entry
+
+
 def _holds(st, parts):
     refs = st.get("refs")
     return refs is not None and len(refs) == len(parts) and all(r() is p for r, p in zip(refs, parts))
@@ -584,12 +605,13 @@ def _rows_kernel(x, Cm, r0, m, k, d):
                 output_shapes=[(m,), (m,)], output_dtypes=[mx.uint32, mx.float32])
 
 
-def _tiles_nearest(x, Cm, n, k, d):
+def _tiles_nearest(x, Cm, n, k, d, lb_out=None):
     mx = _mx()
     eps = float(np.finfo(np.float32).eps)
     csq = (Cm * Cm).sum(1)
     Ct = mx.array(np.ascontiguousarray(np.array(Cm).T))
-    gamma = mx.array([d * eps / (1 - d * eps)], dtype=mx.float32)
+    gamma_f = d * eps / (1 - d * eps)
+    gamma = mx.array([gamma_f], dtype=mx.float32)
     # The blocked kernel needs whole 16-row tiles and k a multiple of 16; otherwise fall back to 8x8 tiles.
     step = 16 if k % 16 == 0 else 8
     dot_k = (_kernel("kmeans_dot_tiles16", ["X", "Ct", "row0"], ["dot"], _DOT_TILES16_SRC) if step == 16
@@ -608,10 +630,14 @@ def _tiles_nearest(x, Cm, n, k, d):
                           grid=(m, 1, 1), threadgroup=(64, 1, 1),
                           output_shapes=[(m,), (m,)], output_dtypes=[mx.uint32, mx.float32])
         mx.eval(lab, bst)                    # bound memory: one dot chunk alive at a time
+        if lb_out is not None:
+            lb_out.append(_lb_from_dot(x, r0, dot, csq, m, k, d, gamma_f))
         labels.append(lab)
         best.append(bst)
     if whole < n:
         lab, bst = _rows_kernel(x, Cm, whole, n - whole, k, d)
+        if lb_out is not None:
+            lb_out.append(_lb_from_dot(x, whole, x[whole:] @ Ct, csq, n - whole, k, d, gamma_f))
         labels.append(lab)
         best.append(bst)
     return (labels[0], best[0]) if len(labels) == 1 else (mx.concatenate(labels), mx.concatenate(best))
@@ -1013,8 +1039,8 @@ def _approx_prepare(parts):
         st = None                                       # same shape, different data
     if st is None:
         _approx_state.clear()                           # one dataset at a time; the copies are large
-        st = _approx_state[key] = {"refs": _held(parts), "half": None,
-                                   "xsqmax": max(float(mx.max(mx.sum(p * p, axis=1))) for p in parts)}
+        st = _hold(_approx_state, key, {"half": None,
+                                        "xsqmax": max(float(mx.max(mx.sum(p * p, axis=1))) for p in parts)}, parts)
     return st
 
 
@@ -1217,7 +1243,7 @@ def _cascade_nearest(x, Cm, C, Xm, order, prev, n, k, d, m):
     return out[0], out[1], surv
 
 
-def _nearest(x, Cm, method, fb_out=None):
+def _nearest(x, Cm, method, fb_out=None, lb_out=None):
     """Nearest center and its distance for every row of one slice -> (labels uint32, best float32)."""
     mx = _mx()
     n, d = x.shape
@@ -1227,7 +1253,7 @@ def _nearest(x, Cm, method, fb_out=None):
     if method == "tiles1":
         return _tiles1_nearest(x, Cm, n, k, d, fb_out)
     if method == "tiles":
-        return _tiles_nearest(x, Cm, n, k, d)
+        return _tiles_nearest(x, Cm, n, k, d, lb_out)
     if method == "rows":
         return _rows_kernel(x, Cm, 0, n, k, d)
     pairs = _kernel("kmeans_pairs", ["X", "C", "row0"], ["dist"], _PAIRS_SRC)
@@ -1487,7 +1513,204 @@ def _tiles1_ok(d, k):
     return TILES1_DIMS[0] <= d <= top and k >= TILES1_MIN_K
 
 
-def _gpu_pass(parts, C, method="auto", accumulate="auto"):
+# 5. Per-centre distance bounds between iterations (Elkan 2003), for the exact path at high dims.
+#
+# After the first iteration or two, almost none of the n x k distances a Lloyd pass computes can change an
+# assignment: measured on GIST 300k x 960, k=1024, the triangle inequality rules out 97.5% of the pairs at
+# iteration 1 and 99.3% from iteration 2 (benchmarks/NOTES.md, "The per-pass benchmark hides the largest lever
+# left"). Group bounds (Yinyang) are far weaker on the same data - a group inherits its biggest mover, and
+# drift is heavy-tailed - so the bounds are kept per centre: one float32 lower bound per (row, centre), n x k
+# in all, which is what limits where the path is offered (BOUNDS_MAX_BYTES).
+#
+# State per dataset: labels, the exact distance to the assigned centre (ub), the lower bounds (lb, in the row
+# chunks the tiles path produced them in), and the centres those bounds were computed against. A pass with
+# new centres C' subtracts each centre's drift |c' - c| from its column of lb, recomputes every row's own
+# distance exactly (so ub is tight and the inertia exact), and visits only the centres whose bound fell
+# below it. Labels stay exact: a centre that is not visited provably cannot be nearer. What differs from the
+# full pass is the tie rule - a row keeps its label unless a visited centre is strictly nearer in the computed
+# distance, and an exact tie with an unvisited centre cannot be seen - so on constructed ties the two paths
+# can disagree; on real data that set has measure zero, and either label is within float32 of optimal.
+#
+# Floating point: computed squared distances carry a relative error up to gamma = D*eps/(1-D*eps); stored
+# bounds are scaled by (1 - 2*gamma) and the own distance by (1 + 2*gamma) before any comparison, and drifts
+# are rounded up, so every skip is justified in exact arithmetic. The bounds initialised from the tiles path's
+# dot products use the expanded form's bound, 3*gamma*(|x|^2 + |c|^2), the same one its candidate test uses.
+#
+# Not tried yet: fp16 bounds (halves the memory and the traffic; needs round-toward-zero conversion) and
+# rewriting only the rows that visited something.
+_bounds_state = {}
+
+
+def _bounds_ok(parts, k, d):
+    return (BOUNDS_MIN_DIMS <= d <= BOUNDS_MAX_DIMS and k >= TILES_MIN_K and k % 8 == 0 and d % 8 == 0
+            and sum(p.shape[0] for p in parts) * k * 4 + DIST_BYTES <= BOUNDS_MAX_BYTES)
+
+
+def _bounds_chunk(k):
+    step = 16 if k % 16 == 0 else 8                 # the tiles path's chunking, so lb chunks line up with its rows
+    return max(step, (DIST_BYTES // (4 * k)) // step * step)
+
+
+# One simdgroup per row, lanes striding over the centres: the dot chunk is read once, coalesced, and the
+# row's |x|^2 is formed on the way. As a chain of MLX elementwise ops this was seven passes over each 512 MB
+# chunk and cost more than the multiply that produced it (a bounds-building pass took 106-125 ms against 57).
+_LB_INIT_SRC = """
+    uint i = thread_position_in_grid.x / 32, lane = thread_position_in_grid.x % 32;
+    uint xi = (row0[0] + i) * D;
+    float xs = 0;
+    for (uint j = lane; j < D; j += 32) xs += X[xi + j] * X[xi + j];
+    xs = simd_sum(xs);
+    float g3 = pads[0], lo = pads[1];
+    for (uint j = lane; j < K; j += 32) {
+        float sq = xs + csq[j];
+        float v = sq - 2 * dot[i * K + j] - g3 * sq;
+        lb[i * K + j] = sqrt(max(v, 0.0f)) * lo;
+    }
+"""
+
+
+def _lb_from_dot(x, r0, dot, csq, m, k, d, gamma):
+    """Lower bound on the distance from each of m rows (from r0) to each centre, from expanded-form dot products."""
+    mx = _mx()
+    kern = _kernel("kmeans_lb_init", ["X", "dot", "csq", "row0", "pads"], ["lb"], _LB_INIT_SRC)
+    pads = mx.array([3 * gamma, 1 - 2 * gamma], dtype=mx.float32)
+    lb = kern(inputs=[x, dot, csq, _u32(r0), pads], template=[("D", d), ("K", k)], grid=(m * 32, 1, 1),
+              threadgroup=(256, 1, 1), output_shapes=[(m * k,)], output_dtypes=[mx.float32])[0]
+    mx.eval(lb)
+    return lb
+
+
+# Both kernels hold the row across the 32 lanes of a simdgroup (D/32 values each) and give each lane every
+# 32nd centre's bound, so the bound row is read coalesced and a distance is one lane-parallel pass over the
+# row plus a simd_sum. The set of centres to visit in a block of 32 is gathered into a mask with simd_sum of
+# one bit per lane and walked with ctz, ascending, so computed-equal ties resolve to the lowest index.
+_BOUNDS_HEAD = """
+    uint i = thread_position_in_grid.x / 32, lane = thread_position_in_grid.x % 32;
+    const uint DPL = (D + 31) / 32;
+    uint r = row0[0] + STRIDE * i;
+    if (r >= row_end[0]) return;
+    float xv[DPL];
+    for (uint c = 0; c < DPL; c++) { uint j = lane + c * 32; xv[c] = (j < D) ? X[r * D + j] : 0.0f; }
+    uint l = labels_in[LOCAL];
+    float s = 0;
+    for (uint c = 0; c < DPL; c++) { uint j = lane + c * 32; float q = xv[c] - ((j < D) ? C[l * D + j] : 0.0f); s += q * q; }
+    s = simd_sum(s);
+    float lo = pads[0], hi = pads[1];
+    float dl = sqrt(s), ub = dl * hi;
+"""
+
+_BOUNDS_COUNT_SRC = _BOUNDS_HEAD.replace("STRIDE", "stride[0]").replace("LOCAL", "STRIDE * i".replace("STRIDE", "stride[0]")) + """
+    uint cnt = 0;
+    for (uint w = 0; w < K; w += 32) {
+        uint j = w + lane;
+        float v = (j < K) ? lb_in[(STRIDE * i) * K + j] - drift[j] : INFINITY;
+        cnt += (j != l && v < ub) ? 1u : 0u;
+    }
+    cnt = simd_sum(cnt);
+    if (lane == 0) count[i] = cnt;
+""".replace("STRIDE", "stride[0]")
+
+_BOUNDS_STEP_SRC = _BOUNDS_HEAD.replace("STRIDE * i", "i").replace("LOCAL", "i") + """
+    uint bl = l; float sbest = s;
+    uint nvis = 0;
+    for (uint w = 0; w < K; w += 32) {
+        uint j = w + lane;
+        float v = (j < K) ? lb_in[i * K + j] - drift[j] : INFINITY;
+        if (j == l) v = dl * lo;
+        uint m = simd_sum((j != l && v < ub) ? (1u << lane) : 0u);
+        while (m) {
+            uint t = ctz(m); m &= m - 1;
+            uint cc = w + t, ci = cc * D;
+            float s2 = 0;
+            for (uint c = 0; c < DPL; c++) { uint jj = lane + c * 32; float q = xv[c] - ((jj < D) ? C[ci + jj] : 0.0f); s2 += q * q; }
+            s2 = simd_sum(s2);
+            float dcc = sqrt(s2);
+            if (lane == t) v = dcc * lo;
+            if (s2 < sbest) { sbest = s2; bl = cc; ub = dcc * hi; }
+            nvis++;
+        }
+        if (j < K) lb_out[i * K + j] = v;
+    }
+    if (lane == 0) { labels[i] = bl; best_d[i] = sbest; ub_out[i] = sqrt(sbest); visited[i] = nvis; }
+"""
+
+
+def _bounds_drift(C, C0):
+    """|c' - c| per centre, rounded up to float32."""
+    dr = np.sqrt(((C.astype(np.float64) - C0.astype(np.float64)) ** 2).sum(1)).astype(np.float32)
+    return np.nextafter(dr, np.float32(np.inf))
+
+
+def _bounds_pads(d):
+    eps = float(np.finfo(np.float32).eps)
+    g = 2 * d * eps / (1 - d * eps)
+    return _mx().array([1 - g, 1 + g], dtype=_mx().float32)
+
+
+def _bounds_count(st, parts, C, k, d):
+    """-> fraction of the n x k centre distances the step would compute, estimated on strided rows."""
+    mx = _mx()
+    drift = mx.array(_bounds_drift(C, st["C"]))
+    pads = _bounds_pads(d)
+    kern = _kernel("kmeans_bounds_count", ["X", "C", "drift", "labels_in", "lb_in", "row0", "row_end", "stride", "pads"],
+                   ["count"], _BOUNDS_COUNT_SRC)
+    total, seen = 0.0, 0
+    for x, labs, lbs in zip(parts, st["labels"], st["lb"]):
+        n = x.shape[0]
+        stride = max(1, n // BOUNDS_SAMPLE_ROWS)
+        r0 = 0
+        for lab, lb in zip(labs, lbs):
+            m = lab.shape[0]
+            ns = -(-m // stride)
+            cnt = kern(inputs=[x, C_mx(C), drift, lab, lb, _u32(r0), _u32(r0 + m), _u32(stride), pads],
+                       template=[("D", d), ("K", k)], grid=(ns * 32, 1, 1), threadgroup=(256, 1, 1),
+                       output_shapes=[(ns,)], output_dtypes=[mx.uint32])[0]
+            total += float(mx.sum(cnt)); seen += ns
+            r0 += m
+    return total / (seen * k)
+
+
+def C_mx(C):
+    return _mx().array(C)
+
+
+def _bounds_pass(st, parts, C, k, d, accumulate):
+    """One assignment pass from the stored bounds -> (totals, nearest), and the state moved to C."""
+    mx = _mx()
+    Cm = C_mx(C)
+    drift = mx.array(_bounds_drift(C, st["C"]))
+    pads = _bounds_pads(d)
+    kern = _kernel("kmeans_bounds_step", ["X", "C", "drift", "labels_in", "lb_in", "row0", "row_end", "pads"],
+                   ["labels", "best_d", "ub_out", "lb_out", "visited"], _BOUNDS_STEP_SRC)
+    tot = np.zeros((k, d + 2), dtype=np.float64)
+    nearest, nvis = [], 0
+    try:
+        for pi, x in enumerate(parts):
+            labs, bests, r0 = [], [], 0
+            for ci, (lab, lb) in enumerate(zip(st["labels"][pi], st["lb"][pi])):
+                m = lab.shape[0]
+                lab2, best2, ub2, lb2, vis = kern(inputs=[x, Cm, drift, lab, lb, _u32(r0), _u32(r0 + m), pads],
+                                                  template=[("D", d), ("K", k)], grid=(m * 32, 1, 1), threadgroup=(256, 1, 1),
+                                                  output_shapes=[(m,), (m,), (m,), (m * k,), (m,)],
+                                                  output_dtypes=[mx.uint32, mx.float32, mx.float32, mx.float32, mx.uint32])
+                mx.eval(lab2, best2, ub2, lb2)
+                nvis += int(mx.sum(vis))
+                st["labels"][pi][ci], st["ub"][pi][ci], st["lb"][pi][ci] = lab2, ub2, lb2   # in place: one chunk over, not 2x
+                labs.append(lab2); bests.append(best2)
+                r0 += m
+            labels = labs[0] if len(labs) == 1 else mx.concatenate(labs)
+            best = bests[0] if len(bests) == 1 else mx.concatenate(bests)     # squared, as the accumulators take it
+            tot += _accumulate(x, labels, best, k, accumulate)
+            nearest.append((labels, best))
+    except Exception:
+        _bounds_state.clear()                           # chunks moved to C and chunks still at the old centres cannot mix
+        raise
+    st["C"] = np.array(C, dtype=np.float32, copy=True)
+    st["visited"] = nvis / (sum(p.shape[0] for p in parts) * k)
+    return tot, nearest
+
+
+def _gpu_pass(parts, C, method="auto", accumulate="auto", iterate=False):
     """One assignment pass -> (float64 totals (k, d+2), [(labels, best) per slice] as MLX arrays)."""
     mx = _mx()
     k, d = C.shape
@@ -1531,6 +1754,18 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
             nearest.append((lab, best))
         return tot, nearest
     casc = None
+    build_bounds = False
+    if method == "auto" and _bounds_ok(parts, k, d):
+        bk = (tuple(p.shape for p in parts), k, d)
+        st = _bounds_state.get(bk)
+        if st is not None and not _holds(st, parts):
+            st = None
+        if st is not None and _bounds_count(st, parts, C, k, d) <= BOUNDS_MAX_VISITED:
+            return _bounds_pass(st, parts, C, k, d, accumulate)
+        if iterate:                                  # a single pass (predict) never allocates n x k for nothing
+            _bounds_state.clear()                    # one dataset at a time; the bounds are large
+            build_bounds = True
+            method = "tiles"                         # the full pass that also yields the bounds
     forced = method == "cascade"                     # by name: used by the accuracy suite
     if (method == "auto" or forced) and _cascade_ok(d, k):
         # The cascade needs two things the caller does not supply: which dimensions carry the variance, and
@@ -1547,9 +1782,8 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
             var = _host(mx.var(parts[0][::step], axis=0))
             order = np.argsort(-var).astype(np.int64)
             _cascade_state.clear()                       # one dataset at a time; the buffers are large
-            st = {"refs": _held(parts), "m": m, "order": order, "Xm": [_cascade_prefix(p, order, m) for p in parts],
-                  "labels": None, "ok": True}
-            _cascade_state[ck] = st
+            st = _hold(_cascade_state, ck, {"m": m, "order": order, "Xm": [_cascade_prefix(p, order, m) for p in parts],
+                                            "labels": None, "ok": True}, parts)
         if st["labels"] is None and forced:
             Cb = mx.array(C)                         # bootstrap here so the path can be exercised directly
             base = ("tiles" if k >= TILES_MIN_K and d >= TILES_MIN_DIMS and d % 8 == 0 and k % 8 == 0
@@ -1586,6 +1820,7 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
     Cm = mx.array(C)
     tot = np.zeros((k, d + 2), dtype=np.float64)
     nearest = []
+    bounds_parts = []
     fb = [] if key is not None else None
     plan = _fused_plan(d, k) if accumulate == "auto" and method == "rows" else None
     if casc is not None:
@@ -1610,9 +1845,26 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
             except Exception:                 # a GPU that will not take the threadgroup allocation
                 _fused_broken.add((d, k))
                 plan = None
-        labels, best = _nearest(x, Cm, method, fb)
+        lbs = [] if build_bounds else None
+        labels, best = _nearest(x, Cm, method, fb, lbs)
         tot += _accumulate(x, labels, best, k, accumulate)
         nearest.append((labels, best))
+        if build_bounds:
+            bounds_parts.append((labels, best, lbs))
+    if build_bounds:
+        chunk = _bounds_chunk(k)
+        st = {"C": np.array(C, dtype=np.float32, copy=True), "labels": [], "ub": [], "lb": []}
+        step = 16 if k % 16 == 0 else 8
+        for (labels, best, lbs), x in zip(bounds_parts, parts):
+            n = x.shape[0]
+            whole = n // step * step                 # the tiles path: whole tiles in chunks, then the tail rows
+            edges = list(range(0, whole, chunk)) + [whole] + ([n] if whole < n else [])
+            assert len(edges) - 1 == len(lbs), (edges, len(lbs))
+            st["labels"].append([labels[a:b] for a, b in zip(edges, edges[1:])])
+            st["ub"].append([mx.sqrt(best[a:b]) for a, b in zip(edges, edges[1:])])
+            st["lb"].append(lbs)
+            mx.eval(*st["labels"][-1], *st["ub"][-1])
+        _hold(_bounds_state, (tuple(p.shape for p in parts), k, d), st, parts)
     for ck, st in _cascade_state.items():
         if st["labels"] is None and ck[1] == k and ck[2] == d:
             st["labels"] = [lab for lab, _ in nearest]     # bootstrap: the next pass can prune
@@ -1624,7 +1876,7 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
                 del _tiles1_slow[dead]
             if len(_tiles1_slow) > 256:
                 _tiles1_slow.clear()                    # the verdict is only a hint
-        _tiles1_slow[key] = {"refs": _held(parts), "slow": rate > TILES1_MAX_FALLBACK}
+        _hold(_tiles1_slow, key, {"slow": rate > TILES1_MAX_FALLBACK}, parts)
     return tot, nearest
 
 
@@ -1640,13 +1892,17 @@ def assign_mlx(parts, C, method="auto", return_labels=False, accumulate="auto"):
 def lloyd_step(parts, C, method="auto", accumulate="auto"):
     """One exact Lloyd iteration on the GPU -> (new centers float32, inertia, number of empty clusters).
 
+    Consecutive calls on the same data at BOUNDS_MIN_DIMS+ dims keep per-centre distance bounds between them and
+    skip the centres those bounds rule out (section 5 above); the labels stay exact, and only the tie rule differs
+    from a single pass. The state follows the arrays by identity, so a different dataset starts afresh.
+
     Empty clusters follow scikit-learn's rules (_relocate_empty_clusters_dense, _average_centers): each empty cluster
     takes one of the points farthest from their assigned centers, which leaves its old cluster; a cluster still empty
     after that (only when every point sits on its center) goes to the largest cluster's center. One deliberate
     difference: when several clusters empty at once, scikit-learn pairs them with far points in np.argpartition's
     unspecified order; here the farthest point goes to the lowest-numbered empty cluster (ties: lower row index).
     """
-    tot, nearest = _gpu_pass(parts, C, method, accumulate)
+    tot, nearest = _gpu_pass(parts, C, method, accumulate, iterate=True)
     sums, counts, inertia = tot[:, 2:], np.rint(tot[:, 0]).astype(np.int64), float(tot[:, 1].sum())
     empty = np.flatnonzero(counts == 0)
     if len(empty):

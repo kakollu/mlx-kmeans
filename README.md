@@ -285,9 +285,12 @@ experiments recorded in `benchmarks/NOTES.md`, not fresh ablations in the Septem
 | **Seeding without a host sync per round** | Each of the k rounds does little work, so waiting for it made seeding cost k GPU round trips regardless of data size — 16 ms of a 19 ms fit at k=64 on 1k rows. Leaving the rounds unevaluated lets MLX pipeline them: 2–4× faster seeding, and the centers are bit-identical across k=8–1024 because only the timing of evaluation changed. What it saves is a fixed few tens of milliseconds per fit, so complete fits measured 1.1–1.9× faster between 1k and 100k rows and the gain fades to a few percent at millions of rows, where the fit is long enough that seeding was never the problem. |
 | **GPU-generated input** | The billion-row CLI creates data on the GPU, avoiding a NumPy input copy. NumPy input through the public API can require additional storage. |
 
+| **Per-center distance bounds between iterations** (Elkan's lower bounds, kept for every row × center) | After the first iteration or two, 97–99% of the n × k distances a pass computes cannot change any assignment; the bounds skip them, exactly. GIST 1M, k=1024: one iteration 175 → 43–55 ms in steady state, 20 iterations 3.51 → 1.64 s; a fit to tolerance on GIST 300k 1.87 → 1.08 s. A 5-iteration benchmark barely moves, which is why this stayed hidden. Offered at 256+ dims where the n × k bounds fit (3.9M rows at k=1024), released with the data; a one-shot `predict` never allocates them. |
+
 `benchmarks/NOTES.md` is the full record, including what *didn't* work: cache tiling (1.4×, so cache misses weren't
-the cause), branch-free argmin (no effect), triangle-inequality pruning (78% of centers survive at 960 dims), and a
-matmul hybrid abandoned on precision grounds.
+the cause), branch-free argmin (no effect), the center-to-center triangle-inequality test inside one pass (78% of
+centers survive at 960 dims; the bounds carried *between* passes, above, are a different quantity), and a matmul
+hybrid abandoned on precision grounds.
 
 ## Accuracy
 
@@ -296,7 +299,7 @@ it also tests rows/atomic accumulation where supported. Labels must be optimal w
 tolerance; center and inertia errors must be within 1e-6 under the suite's metrics. Empty-cluster relocation is
 checked against an independent reference, with one case also checked against scikit-learn. The multi-buffer
 test's configuration wiring was repaired on September 19. These finite tests are evidence, not a proof for all inputs.
-The suite passes **17/17 cases** on the measured M5 Max; the verification directory contains the full log. A second suite, `tests/reuse.py`, checks the fit-here-predict-there pattern: a second array of the same shape, batched predictions with one batch rescaled, and sliced inputs sharing a first part must never be served the previous array's cached state, and bad input must raise rather than abort the process.
+The suite passes **20/20 cases** on the measured M5 Max, three of them multi-step sequences through the between-iteration bounds path (including a restart with unrelated centers mid-sequence and empty-cluster relocations); the verification directory contains the full log. A second suite, `tests/reuse.py`, checks the fit-here-predict-there pattern: a second array of the same shape, batched predictions with one batch rescaled, and sliced inputs sharing a first part must never be served the previous array's cached state, and bad input must raise rather than abort the process.
 
 ## Demos on real public data
 

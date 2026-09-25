@@ -889,5 +889,78 @@ sparse residual - realistically 12-18 ms, so 3-5x per later iteration on the exa
 path. Iteration 0 and k-means++ initialisation are untouched and become the dominant cost. The suite and the
 per-pass comparisons measure seconds per pass over 5 fixed iterations, where the bound is worth 0 at
 iteration 0 and ~88% at iteration 1, which is why none of this showed. A fit to `tol` on GIST runs 20-50
-iterations. Not started: it touches the core iteration loop and is a design decision, not a tuning.
+iterations. Built the same day; the next section is the record.
+
+## Per-centre bounds between iterations: built (September 25, 2026, AC power)
+
+Section 5 of core.py. The design measurement first, because it overturned the plan. Group bounds (Yinyang: one
+lower bound per row per group of centres, so n x t memory) were the intended form for memory reasons.
+Measured on the same GIST 300k x 960, k=1024 sequence, with the row's own distance recomputed exactly each
+iteration (prototypes/bounds_group_probe.py), the fraction of the n x k pairs that still have to be visited:
+
+| iter | per-centre bounds | groups of 8, random | groups of 8, spatially coherent | groups of 16, coherent |
+|---|---|---|---|---|
+| 1 | 2.5% | 70% | 51% | 68% |
+| 2 | 0.7% | 40% | 27% | 45% |
+| 5 | 0.24% | 13% | 7.7% | 18% |
+| 11 | 0.14% | 1.9% | 1.3% | 3.4% |
+
+A group inherits its biggest mover, and drift is heavy-tailed (a few centres move 20-40x the median every
+iteration), so grouping throws away most of the gain. The bounds are therefore per centre - Elkan's - with the
+n x k float32 array that implies, and the path is offered only where that fits (BOUNDS_MAX_BYTES, 16 GB
+including one chunk in flight: 3.9M rows at k=1024). The state is dropped the moment any of its arrays is freed,
+so fit() on numpy input leaves nothing behind.
+
+How it runs. Iteration 0 is the ordinary tiles pass; its dot-product chunks also yield the bounds through one
+extra kernel (kmeans_lb_init, one coalesced read of each chunk - as a chain of MLX elementwise ops it was seven
+passes and cost more than the multiply). Each later iteration: a strided count pass (65k rows) estimates how
+many pairs the bounds would visit; above BOUNDS_MAX_VISITED it runs the full pass instead and rebuilds, which
+is what makes an n_init restart or a large early drift safe. Below it, one kernel per row: subtract each
+centre's drift from its bound, recompute the own distance exactly (so the inertia is exact and the upper bound
+tight), gather the centres whose bound fell below it into a 32-bit mask with simd_sum, walk it with ctz, and
+visit only those. The accumulation kernels run unchanged on the labels it produces. Only lloyd_step builds the
+state; a one-shot predict never allocates n x k.
+
+Costs, GIST 300k x 960, k=1024 (theta_sweep, rebuilds disabled so the visited fraction drifts on its own):
+a bounds pass costs about 20 ms + 3.8 ms per percent of pairs visited (0.84%: 22 ms; 4.9%: 37 ms; 21%: 98 ms;
+47%: 201 ms), against 57 ms for the plain pass and 75 ms for the pass that also builds the bounds. Left alone,
+the visited fraction falls monotonically as the run converges (47% right after a random-row init, 5% by
+iteration 9, 0.8% by iteration 39); after a rebuild it starts near 0.3% and creeps up as unvisited bounds decay,
+which is what the threshold catches. The threshold itself hardly matters: a fit to tol=1e-4 (26 iterations)
+took 1.05-1.15 s at every value from 3% to 20%; it stays at 5%.
+
+Results, same machine, old tree against new, interleaved:
+
+| | plain | bounds | |
+|---|---|---|---|
+| GIST 300k, k=1024, fit to tol=1e-4 (26 iterations both) | 1.87 s | 1.08 s | 1.73x |
+| GIST 1M, k=1024, 5 iterations | 0.89 s | 0.84 s | 1.06x |
+| GIST 1M, k=1024, 20 iterations | 3.51 s | 1.64 s | 2.14x |
+| GIST 1M, k=1024, one iteration in steady state | 175 ms | 43-55 ms | 3.2-4.1x |
+
+The 5-iteration row is the suite's metric, and it barely moves - iteration 0 is a full pass plus the build,
+iteration 1 rebuilds because the first drift after a random-row start is huge, and one more rebuild usually
+follows - which is exactly why this lever was invisible to the per-pass benchmark.
+
+Exactness. tests/accuracy.py has three multi-step cases on the path (60k x 960 k=1024 with unrelated centres
+injected at step 6, three slices at 256 dims, and one with nine empty-cluster relocations): at every step the
+labels are float64-optimal to the suite's float32 tolerance and the centres match the float64 reference step
+within 1e-7. What changes is the tie rule: a row keeps its label unless a visited centre is strictly nearer in
+the computed distance, and the bounds kernel sums a distance lane-parallel where the tiles kernel sums it
+sequentially, so a float32-level tie can land differently. On the 300k sequence the two paths agreed on every
+label for four iterations, then one row flipped (squared-distance gap 7e-7 relative) and the runs followed
+different, equally valid trajectories to final inertias 5e-5 apart. On the 1M sequence they agreed to seven
+digits through 20 iterations. Both paths are deterministic run to run.
+
+This reconciles with the earlier finding that "triangle-inequality pruning is useless at 960 dims" (78% of
+centres survive): that was the centre-to-centre test |c - c_a| > 2 d_a inside one pass. The bound that works
+is the one carried between passes - last iteration's distance to each centre, minus that centre's drift -
+which is a different quantity, and at 960 dims it removes 97-99% of the work.
+
+Not done, in the order it would pay: the 3.8 ms per percent is centre reads from cache, one full row per
+visit, and would fall several-fold if the visited pairs of eight rows were evaluated as simdgroup tiles;
+fp16 bounds (halves the 4 GB at 1M rows and the rewrite traffic; needs round-toward-zero conversion, and an
+unvisited bound loses a half-ulp per iteration); building the bounds inside the margin kernel instead of a
+second read of the dot chunk (+27 ms per rebuild at 1M rows); and the count pass's sample (1.5 ms at 300k)
+could be smaller. Below 256 dims the path is not offered and has not been measured.
 
