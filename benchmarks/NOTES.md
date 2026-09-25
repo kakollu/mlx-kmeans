@@ -495,6 +495,59 @@ six suite configs (`logs`, 1.29x). The rest are out of range and each needs diff
 Padding is exact rather than approximate: trailing zero dimensions add `+0.0f` terms at the end of each
 sum, which cannot change a float32 accumulator, so labels and distances stay bit-identical.
 
+## Accumulation: where its bandwidth was going (September 24, 2026, AC power)
+
+After the assignment kernels got faster, accumulation was 40-70% of a Lloyd step and ran at 5-9x the cost
+of one pass over the data. Decomposing it on 2M x 50, k=64 (floor 0.89 ms, one read of X):
+
+| Kernel | Time | Notes |
+|---|---:|---|
+| read only, no scatter | 1.97 ms | a dependent chain of adds into one register - slower than scattering |
+| threadgroup scatter, non-atomic | 1.57 ms | **wrong results**, priced only to isolate the scatter: 1.8x floor |
+| threadgroup scatter, atomic (shipped) | 2.88 ms | atomicity costs 1.8x on top |
+| sorted (the default) | 4.55 ms | |
+
+So the scatter was never the problem. Two things were.
+
+**Atomics were only needed because of how lanes were assigned.** The on-chip kernel gives each lane a row,
+so 32 lanes race for one cluster slot. Give each lane a *dimension* and the 32 lanes of a row write 32
+different addresses - no conflict, no atomics, rows consumed in index order, and the Kahan carry can sit on
+chip beside each entry because every entry now has exactly one writer. Throughput is identical either way.
+
+**The sorted path kept its running totals in device memory.** A segment belongs to one cluster, so its
+accumulator is dims+2 floats, not k*(dims+2) - small enough to live in a simdgroup's registers. It was
+instead read-modify-writing dims+2 floats in device memory per row, in the sums and again in the carries:
+four times the traffic of the data. Fixing it was worth 5.6x on GIST1M, landing at 1.1x the memory floor.
+
+Rejected along the way:
+
+- **Plain float32 in the tile**, no compensation: 1.6 ms against 3.2 ms, but 7.6e-8 against float64 where
+  the compensated version is 1.1e-16. Not a default.
+- **Several simdgroups per threadgroup, each with its own tile**, to raise occupancy: slower (1.39 ms
+  against 1.08 ms). N private tiles cost a core exactly what N threadgroups do, so there is no gain; only a
+  *shared* tile would raise occupancy, and that brings the conflicts back.
+- **One row at a time per simdgroup without lookahead**: 4.8 ms. The store address depends on a load of
+  `labels[i]`, so the simdgroup has one row of memory parallelism. Loading 8 rows before adding any of them
+  - the adds still sequential and in order - takes it to 1.6 ms.
+- **Tuning rows-per-block**: the wrong knob. What matters is the block *count* - ~500 was best at 500k, 2M
+  and 10M rows alike - because every extra block re-zeroes and writes out another tile. Fixing rows per
+  block instead cost up to 2.4x at 10M rows.
+
+### The register-candidate trick does not transfer to the margin kernel
+
+Replacing `uint cand[M]` with candidates in named registers was worth 2x in the fused assignment kernel, so
+the same change was tried in the margin kernel, which collects candidates the same way. It **lost**: GIST1M
+went from 920 ms to 1010 ms for the suite config, and the suite total from 1319 ms to 1406 ms. Reverted.
+
+Two reasons, both absent in the fused kernel. The margin kernel is memory-bound streaming a k-wide row of
+dot products, so the scratch-memory traffic the array costs is hidden behind that read, while the extra ALU
+of a four-deep insertion network is not. And keeping only the R smallest means discarded centres cannot be
+tested individually, so the escape test has to use the largest |c|^2 over all centres - conservative enough
+at 960 dims to send far more rows down the full-rescan path than the array version's per-centre test did.
+
+The lesson is narrower than "registers beat arrays": it holds when the kernel is compute-bound and the
+array is the only thing touching memory, and reverses when the kernel is already streaming.
+
 ## Input limits, measured
 
 Behaviour on degenerate input, worth knowing before trusting a result:
