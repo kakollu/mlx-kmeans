@@ -299,8 +299,11 @@ _DOT_TILES_SRC = """
 """
 # Same arithmetic with 2x2 register blocking: one simdgroup owns a 16x16 output block, so each X tile and each
 # center tile it loads feeds two accumulators instead of one. That halves the tile loads per multiply-accumulate,
-# which is what the 8x8 version is short of - measured 9.5 -> 12.7 TFLOP/s at 128 dims and 10.0 -> 14.5 at 960,
-# against 14.4 and 36.8 for MLX's `@` (which is not usable here: ~6600x eps against this kernel's ~6x).
+# which is what the 8x8 version is short of - measured 9.5 -> 12.7 TFLOP/s at 128 dims and 10.0 -> 14.5 at 960.
+# There is no more to get here: a loop of simdgroup_multiply_accumulate with no loads at all, enough
+# accumulators to fill the pipeline and enough simdgroups to fill the GPU, tops out at 15.7 TFLOP/s on this
+# machine, so this kernel runs at 94% of what the instruction can do. MLX's `@` reaches 28.7 at 960 dims by
+# using different hardware, and is not usable here: ~5900x eps against this kernel's ~9x.
 # Each output element still accumulates over D in the same order, so results are bit-identical to the 8x8 path.
 _DOT_TILES16_SRC = """
     uint sg = thread_position_in_grid.x / 32;

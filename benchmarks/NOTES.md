@@ -490,7 +490,7 @@ six suite configs (`logs`, 1.29x). The rest are out of range and each needs diff
 | satellite 10M x 12 | 12 dims | pad to 16, but at k=32 that shape measured 0.38x |
 | single-cell 2M x 50 | 50 dims | pad to 56; d=48/k=64 measured 1.60x, so this one should pay |
 | sift 1M x 128 | above 96 dims | stage the row tiles in threadgroup memory instead of registers |
-| gist 1M x 960 | above 96 dims | not the bottleneck: at 960 dims the pass is 138 ms of multiply and only 18 ms of distance-matrix traffic, so fusing saves 8% - the lever there is GEMM efficiency (14.5 of 39.9 TFLOP/s), not fusion |
+| gist 1M x 960 | above 96 dims | not the bottleneck: at 960 dims the pass is 138 ms of multiply and only 18 ms of distance-matrix traffic, so fusing saves 8%. It is not GEMM efficiency either - see the section below, which measures the ceiling and finds this kernel already at 94% of it |
 
 Padding is exact rather than approximate: trailing zero dimensions add `+0.0f` terms at the end of each
 sum, which cannot change a float32 accumulator, so labels and distances stay bit-identical.
@@ -547,6 +547,61 @@ at 960 dims to send far more rows down the full-rescan path than the array versi
 
 The lesson is narrower than "registers beat arrays": it holds when the kernel is compute-bound and the
 array is the only thing touching memory, and reverses when the kernel is already streaming.
+
+## The tile matmul is at 94% of the hardware ceiling (September 24, 2026, AC power)
+
+With assignment and accumulation both improved, the suite was 93-94% assignment on the two high-dimensional
+configs, and 81% of *that* was the multiply: GIST1M spends 131.6 ms of a 175 ms Lloyd step in
+`kmeans_dot_tiles16`, at 14.9 TFLOP/s. This repository had "about 40 TFLOP/s" on record as the machine's
+peak, which made that look like a 2.7x inefficiency and kept it on the list of things to fix. **That number
+was wrong, and the search it motivated was chasing nothing.**
+
+Two measurements settle it.
+
+**The multiply is not waiting on memory.** Holding the tile loads exactly constant and repeating each
+accumulate into the same accumulator - which cannot be optimised away, since each depends on the last -
+scales the arithmetic with the traffic fixed:
+
+| MACs per load | Time (65536 x 960, k=1024) | vs 1x | Issued |
+|---:|---:|---:|---:|
+| 1x | 8.77 ms | 1.00x | 14.7 TFLOP/s |
+| 2x | 16.21 ms | 1.85x | 15.9 TFLOP/s |
+| 4x | 31.89 ms | 3.64x | 16.2 TFLOP/s |
+
+Time tracks the multiply count almost exactly, and the issued rate is flat at ~16. Hoisting the X tiles out
+of the loop - halving the tile loads, same multiplies - buys 6% at 960 dims.
+
+**And ~16 TFLOP/s is all the instruction does.** A loop of `simdgroup_multiply_accumulate` with *no loads in
+it at all*, sweeping the number of independent accumulators so the pipeline is full, and the simdgroup count
+and threadgroup size so the GPU is full:
+
+| Accumulators | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---:|---:|---:|---:|---:|---:|
+| TFLOP/s | 3.0 | 7.4 | 9.1 | 14.6 | 15.2 | 15.2 |
+
+It saturates at **15.7 TFLOP/s** (best over threadgroup sizes and simdgroup counts). Eight independent
+accumulators are needed to get there, which the 2x2-blocked kernel already has via its four accumulators
+plus the loop's own overlap. So `kmeans_dot_tiles16` at 14.7 is at **94% of the ceiling**, and the earlier
+finding that 4x4 register blocking bought only 15.1 against 14.6 was not a failure to optimise - it was the
+ceiling, seen from below.
+
+MLX's `@` does reach 28.7 TFLOP/s at 960 dims, so the *chip* can go faster - through different hardware, not
+through this instruction. It is still not usable: its error is 5909x eps against this kernel's 9.4x, and a
+candidate window widened by 630x admits every one of the 1024 centres, which is exactly what the earlier
+NAX experiment measured (0.02-0.08x). Emulating float32 from it costs three of those matmuls, which at
+3/28.7 against 1/14.7 is slower than just doing the work correctly.
+
+**What this closes.** There is no large win left in exact assignment at high dimensions on this machine. The
+remaining 19% of GIST's assignment is the margin kernel streaming the dot matrix, and sizing that matrix to
+stay in cache does not help either - the chunk sweep below is monotonic the wrong way, because smaller
+chunks cost more in dispatch and synchronisation than they save in traffic:
+
+| Dot chunk | GIST 1M x 960 | SIFT 1M x 128 | logs 10M x 32 |
+|---|---:|---:|---:|
+| 512 MB (current) | 161.9 ms | 33.3 ms | 55.5 ms |
+| 128 MB | 173.5 ms | 40.1 ms | 65.7 ms |
+| 32 MB | 207.7 ms | 57.4 ms | 85.6 ms |
+| 8 MB | 361.1 ms | 160.9 ms | 245.8 ms |
 
 ## Input limits, measured
 
