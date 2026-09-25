@@ -1005,3 +1005,21 @@ about 1.4 ms for each of its two guarantees. Closing it means one exact kernel t
 in a single read of X at this k*w, with accumulators shared across a simdgroup rather than private per
 thread - not a tuning of either existing stage.
 
+What the two guarantees cost, measured on four shapes (same data and start; assignment exact = the auto
+kernel, fp16 = our approximate path forced; accumulation deterministic = auto, scatter-add = MLX's
+`zeros.at[labels].add(x)` for sums, counts and inertia):
+
+| shape | pass | assign exact | assign fp16 | accumulate det. | accumulate scatter-add | both dropped |
+|---|---|---|---|---|---|---|
+| single-cell 2M x 50, k=64 | 4.08 | 1.92 | 1.47 | 2.32 | 1.78 | ~3.25 |
+| logs 10M x 32, k=256 | 22.7 | 17.5 | 23.3 | 5.19 | 6.49 | slower |
+| geo 10M x 6, k=8 | 2.08 | 0.82 | 3.05 | 3.71 (fused pass reads once) | 12.2 | much slower |
+| SIFT1M 1M x 128, k=1024 | 21.7 | 22.6 | invalid (fp16 guard fails: 0.06% agree) | 1.93 | 1.49 | 21.3 |
+
+So determinism costs at most 0.5 ms of a pass (single-cell, 13%; SIFT, 2%) and is free or better at logs
+and geo, where the deterministic kernels beat atomics outright; exactness costs 0.45 ms at single-cell, is
+free below and above it, and cannot be dropped on SIFT at all. A "result-only" pass with both dropped is
+3.25 ms at single-cell - still behind the 2.7 ms that MLX's own primitives reach there - and slower than
+the exact, deterministic pass on every other shape. The single-cell gap is structural (two reads of X and
+the host round trips between them), not the price of the guarantees.
+
