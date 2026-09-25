@@ -296,7 +296,7 @@ it also tests rows/atomic accumulation where supported. Labels must be optimal w
 tolerance; center and inertia errors must be within 1e-6 under the suite's metrics. Empty-cluster relocation is
 checked against an independent reference, with one case also checked against scikit-learn. The multi-buffer
 test's configuration wiring was repaired on September 19. These finite tests are evidence, not a proof for all inputs.
-The repaired suite passed **16/16 cases** on the measured M5 Max; the verification directory contains the full log.
+The suite passes **17/17 cases** on the measured M5 Max; the verification directory contains the full log. A second suite, `tests/reuse.py`, checks the fit-here-predict-there pattern: a second array of the same shape, batched predictions with one batch rescaled, and sliced inputs sharing a first part must never be served the previous array's cached state, and bad input must raise rather than abort the process.
 
 ## Demos on real public data
 

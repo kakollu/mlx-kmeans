@@ -12,15 +12,17 @@ Usage:
   python3 kmeans.py --rows 100_000_000 --backend numpy
 """
 import time
+import weakref
 
 import numpy as np
 
 SLICE_ROWS = 100_000_000  # data is held as slices of at most this many rows
+PART_MAX_ELEMENTS = 2**32 - 1  # and at most this many elements: the kernels address one slice with 32-bit offsets
 
 
 def slice_rows(dims):
     """Rows per slice: at most SLICE_ROWS, and few enough that row * dims fits the kernels' uint32 indices."""
-    return min(SLICE_ROWS, (2**32 - 1) // dims)
+    return min(SLICE_ROWS, PART_MAX_ELEMENTS // dims)
 
 
 # ---------------------------------------------------------------- data
@@ -530,6 +532,23 @@ SORTED_ALWAYS_KW = 4096                 # ...unless the buffers are this large, 
 SEGMENT_ROWS = 256                      # rows per GPU thread in sorted accumulation
 
 
+def _held(parts):
+    """-> weak references to each part: a cache entry's proof that it belongs to THIS data.
+
+    id() is recycled the moment an array is freed, and the ordinary pattern - fit on one array, predict on the
+    next one of the same shape - hands the second array the first one's id. An entry keyed on the id alone then
+    serves the previous dataset's float16 copy, or its prefix and last labels, to the new one: wrong labels,
+    silently. A weak reference cannot be recycled - it goes dead with the array - and a live one is checked
+    by identity, part by part, so sliced inputs that share a first part are told apart too.
+    """
+    return [weakref.ref(p) for p in parts]
+
+
+def _holds(st, parts):
+    refs = st.get("refs")
+    return refs is not None and len(refs) == len(parts) and all(r() is p for r, p in zip(refs, parts))
+
+
 def _host(a, dtype=None):
     """MLX array -> numpy, with the evaluation forced BEFORE numpy asks for the buffer.
 
@@ -988,12 +1007,14 @@ _approx_state = {}
 def _approx_prepare(parts):
     """-> per-dataset state: max |x|^2 (computed once), float16 copies (built on first use, kept)."""
     mx = _mx()
-    key = (id(parts[0]), tuple(p.shape for p in parts))
+    key = tuple(p.shape for p in parts)
     st = _approx_state.get(key)
+    if st is not None and not _holds(st, parts):
+        st = None                                       # same shape, different data
     if st is None:
         _approx_state.clear()                           # one dataset at a time; the copies are large
-        st = _approx_state[key] = {"xsqmax": max(float(mx.max(mx.sum(p * p, axis=1))) for p in parts),
-                                   "half": None}
+        st = _approx_state[key] = {"refs": _held(parts), "half": None,
+                                   "xsqmax": max(float(mx.max(mx.sum(p * p, axis=1))) for p in parts)}
     return st
 
 
@@ -1470,9 +1491,20 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
     """One assignment pass -> (float64 totals (k, d+2), [(labels, best) per slice] as MLX arrays)."""
     mx = _mx()
     k, d = C.shape
-    bad = [p.shape[1] for p in parts if p.ndim != 2 or p.shape[1] != d]
+    for p in parts:
+        if p.ndim != 2:
+            raise ValueError(f"each part must be 2-D (rows, dims), got {p.ndim}-D")
+    bad = [p.shape[1] for p in parts if p.shape[1] != d]
     if bad:
         raise ValueError(f"data has {bad[0]} columns but the centers have {d}; fit and predict need the same features")
+    big = [p.shape for p in parts if p.size > PART_MAX_ELEMENTS]
+    if big:
+        raise ValueError(f"a slice of shape {big[0]} has more than {PART_MAX_ELEMENTS:,} elements, and the kernels "
+                         f"address one slice with 32-bit offsets; pass the data as a list of slices of at most "
+                         f"slice_rows(dims) = {slice_rows(d):,} rows (KMeans does this itself)")
+    if method == "tiles" and (k % 8 or d % 8):
+        raise ValueError(f"method='tiles' needs k and dims to be multiples of 8 (got k={k}, dims={d}); 'auto' picks it "
+                         f"only where it applies")
     if method == "approx":
         # Two crossovers, because the fp16 multiply is ~1.4x faster than fp32 and moves where the
         # approximate path starts to pay: 64 dims if the data admits fp16, 256 if it does not.
@@ -1505,15 +1537,17 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
         # where each row was last time. Both are properties of the data, so they are built once and kept
         # until a different dataset arrives. The first pass over a dataset runs normally and records its
         # labels; every pass after that can prune.
-        ck = (id(parts[0]), tuple(p.shape for p in parts), k, d)
+        ck = (tuple(p.shape for p in parts), k, d)
         st = _cascade_state.get(ck)
+        if st is not None and not _holds(st, parts):
+            st = None                                    # same shape, different data
         if st is None:
             m = _cascade_m(d)
             step = max(1, parts[0].shape[0] // 65536)
             var = _host(mx.var(parts[0][::step], axis=0))
             order = np.argsort(-var).astype(np.int64)
             _cascade_state.clear()                       # one dataset at a time; the buffers are large
-            st = {"m": m, "order": order, "Xm": [_cascade_prefix(p, order, m) for p in parts],
+            st = {"refs": _held(parts), "m": m, "order": order, "Xm": [_cascade_prefix(p, order, m) for p in parts],
                   "labels": None, "ok": True}
             _cascade_state[ck] = st
         if st["labels"] is None and forced:
@@ -1532,8 +1566,9 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
         # centre inside the window and every row takes the exact fallback, which costs 3x the rows kernel.
         # The answer stays exact either way, so rather than model it, the kernel reports how often it
         # happened and a dataset that goes over the limit is not offered this path again.
-        seen = (id(parts[0]), tuple(p.shape for p in parts), k, d)
-        verdict = _tiles1_slow.get(seen)
+        seen = (tuple(id(p) for p in parts), tuple(p.shape for p in parts), k, d)
+        ent = _tiles1_slow.get(seen)
+        verdict = ent["slow"] if ent is not None and _holds(ent, parts) else None
         if verdict is not True:
             method = "tiles1"
             key = seen if verdict is None else None     # measure once per dataset, then trust it
@@ -1579,14 +1614,17 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
         tot += _accumulate(x, labels, best, k, accumulate)
         nearest.append((labels, best))
     for ck, st in _cascade_state.items():
-        if st["labels"] is None and ck[2] == k and ck[3] == d:
+        if st["labels"] is None and ck[1] == k and ck[2] == d:
             st["labels"] = [lab for lab, _ in nearest]     # bootstrap: the next pass can prune
     if fb:
         groups = sum(f.size for f in fb)
         rate = sum(float(mx.sum(f)) for f in fb) / groups if groups else 0.0
         if len(_tiles1_slow) > 256:
-            _tiles1_slow.clear()                        # ids get reused; the verdict is only a hint
-        _tiles1_slow[key] = rate > TILES1_MAX_FALLBACK
+            for dead in [s for s, e in _tiles1_slow.items() if any(r() is None for r in e["refs"])]:
+                del _tiles1_slow[dead]
+            if len(_tiles1_slow) > 256:
+                _tiles1_slow.clear()                    # the verdict is only a hint
+        _tiles1_slow[key] = {"refs": _held(parts), "slow": rate > TILES1_MAX_FALLBACK}
     return tot, nearest
 
 

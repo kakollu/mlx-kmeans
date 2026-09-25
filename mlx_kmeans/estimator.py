@@ -95,7 +95,8 @@ class KMeans:
         if isinstance(X, list) and X and type(X[0]).__module__.startswith("mlx"):
             parts = X                                     # already slices on the GPU
         elif type(X).__module__.startswith("mlx"):
-            parts = [X]
+            per = core.slice_rows(X.shape[1]) if X.ndim == 2 else len(X)
+            parts = [X] if len(X) <= per else [X[s:s + per] for s in range(0, len(X), per)]
         else:
             if not isinstance(X, np.ndarray):
                 X = np.asarray(X.to_numpy() if hasattr(X, "to_numpy") else X)   # pandas/polars/lists

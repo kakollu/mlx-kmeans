@@ -818,3 +818,76 @@ other reasons, avoids all three.
 Capacity per GPU slice, set by uint32 indexing in the kernels (row * dims must fit): 100M rows up to 42
 dims, 33.5M at 128 dims, 4.47M at 960 dims. Above that the data is held as several slices, which the API
 accepts as a list of MLX arrays; the billion-row regression uses this.
+
+## Reuse audit: what broke when the library was used from outside (September 25, 2026)
+
+A 104-agent adversarial review of the library as something other projects would import, covering the API,
+the exact and approximate paths, accumulation, the claims in the docs, robustness and reuse. The kernels came
+through clean: every exact path (rows, pairs, both tile variants, tiles1 register and reload, the cascade with
+stale bounds and 55-62% label churn, ragged n, k and d) matched a float64 reference with zero wrong labels
+and identical tie-breaking; the counting sort matched numpy's stable argsort at every k and n boundary tried;
+determinism held bit-for-bit across processes on twelve default-path shapes. The defects were all in module
+state and dispatch, and all in the fit-here-predict-there pattern that a single-dataset suite never exercises:
+
+- **Blocker, fixed.** `_approx_state`, `_cascade_state` and `_tiles1_slow` were keyed on `id(parts[0])`.
+  Python recycles an id the moment the array is freed, so `fit(A)` then `predict(B)` on a same-shaped
+  array handed B the fp16 copy of A (97% wrong labels, 3x inertia) or A's cascade prefix and last labels
+  (mislabels or a "please report this" error that blamed the user's data). Entries now carry weak references
+  to every part and are checked by identity; a dead or different reference means a rebuild. `tests/reuse.py`
+  reproduces the failure on the old code (1.5-3% label agreement) and passes on the new.
+- **Major, fixed.** A feature-count mismatch between fit and predict aborted the interpreter: the fused
+  kernel was sized from the centres, the data was wider, the threadgroup allocation overflowed, and the
+  Metal error surfaced inside numpy's buffer request, where a C++ exception cannot propagate. Every
+  MLX-to-numpy conversion now evaluates first (`_host`), which turns any Metal error into a RuntimeError the
+  fallbacks can catch, and the estimator and `assign_mlx` both check the feature count.
+- **Major, fixed.** A single MLX array over 2^32 elements (5M x 960 = 19 GB) wrapped the kernels' uint32
+  indexing silently; the estimator now slices MLX input like numpy input, and `assign_mlx` refuses an
+  oversized part. `method="tiles"` forced by name with k or d not a multiple of 8 was silently wrong; it
+  now raises.
+- **Open (the fp16 guard bounds the range of the product, not its precision).** With `exact=False`,
+  uncentred data with |x||c| around 1e4 passes the Cauchy-Schwarz guard and gets 63% wrong labels; data
+  below ~1e-5 collapses into fp16 subnormals (98% wrong); one finite coordinate above 65504 converts to
+  inf and surfaces as a misleading error. All three need the guard to look at the operands' magnitude
+  spread, not just the product's range. Also open: `_approx_prepare` peaks at 2x the dataset and keeps the
+  fp16 copy after X is deleted; with `APPROX_FP16_ACCUMULATE=True` the inertia and centres come from the
+  fp16 copy (7e-7 and 2.7e-4 relative on GIST) while a docstring says otherwise; the docstring's per-pass
+  error figures are 8x too optimistic for the fp16 path (1.2% labels, 2.4e-5 inertia measured on GIST).
+
+## The per-pass benchmark hides the largest lever left (September 25, 2026, AC power)
+
+At 300k x 960, k=1024 the exact path spends 49.8 ms of a 57.6 ms iteration in the GEMM+argmin (11.8 of the
+15.7 TFLOP/s ceiling); everything else - grouping, sums, centre update - is 7.8 ms. Any implementation that
+runs the full n x k x d GEMM every iteration sits at this wall once the data is large enough for launch,
+sync and materialised-matrix costs to have amortised away; the wins recorded above are all of that second
+kind, and they do not move the wall.
+
+The masked fact: after iteration 1 almost none of that GEMM is needed. On GIST 300k x 960, k=1024 from a
+random-row start, with a 20k-row sample and the full previous-iteration distance matrix (prototypes/bounds_probe.py, run from the repo root):
+
+| iter | ms | labels changed | max centre drift | median drift | n x k distances needed (per-centre bounds) |
+|---|---|---|---|---|---|
+| 0 | 144 | 52% | 6.21 | 0.77 | 93% |
+| 1 | 58 | 21% | 1.21 | 0.15 | 12% |
+| 2 | 58 | 13% | 0.84 | 0.08 | 2.9% |
+| 3 | 57 | 9% | 0.59 | 0.05 | 1.3% |
+| 5 | 57 | 6% | 0.54 | 0.03 | 0.55% |
+| 8 | 56 | 4% | 0.20 | 0.02 | 0.30% |
+| 13 | 57 | 2% | 0.66 | 0.01 | 0.19% |
+
+"Needed" counts the centres j with d_old(x, j) - drift_j < d_old(x, own) + drift_own, before tightening the
+upper bound with one exact distance: the pairs the triangle inequality cannot rule out. A single global
+bound (Hamerly) rules out ~0% of points here, because every iteration a few centres move 20-40x the median;
+it has to be per-centre (Elkan) or per-group (Yinyang) bounds. Elkan's bounds are n x k float32 - 1.2 GB at
+this shape, impossible at 100M rows - so the scalable form is Yinyang's n x t group bounds with t around
+k/10. It fits the exact path: stored float32 distances and drifts padded by the same gamma bound the tie
+tolerance uses keep the labels provably exact. It does not make the approximate path exact; its stored
+distances are fp16-derived.
+
+The honest ceiling: bounds remove only the GEMM. Iterations from 2 on would drop from ~57 ms to the 7.8 ms
+floor plus bound maintenance, one exact distance per point (a re-read of X, ~2.4 ms at 490 GB/s) and the
+sparse residual - realistically 12-18 ms, so 3-5x per later iteration on the exact path and ~2x on the fp16
+path. Iteration 0 and k-means++ initialisation are untouched and become the dominant cost. The suite and the
+per-pass comparisons measure seconds per pass over 5 fixed iterations, where the bound is worth 0 at
+iteration 0 and ~88% at iteration 1, which is why none of this showed. A fit to `tol` on GIST runs 20-50
+iterations. Not started: it touches the core iteration loop and is a design decision, not a tuning.
+
