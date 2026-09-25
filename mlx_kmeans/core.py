@@ -513,14 +513,16 @@ LANES_BLOCKS = 512                      # simdgroups to split the rows over. Wha
                                         # since every extra block re-zeroes and writes out a k*(dims+2) tile.
 LANES_MIN_ROWS = 256                    # ...but not so few rows each that the tile overhead dominates
 LANES_SMALL_KW = 1536                   # k*(dims+2) up to which lanes wins at every row count measured
-LANES_ROWS_PER_SLOT = 4000              # ...and above it, the rows per slot from which it wins anyway.
+LANES_ROWS_PER_SLOT = 10000             # ...and above it, the rows per slot from which it wins anyway.
                                         # Two costs trade off. The sorted path pays an argsort - 0.6 ns a
                                         # row, 6 ms at 10M, and slightly superlinear - but then accumulates
                                         # in registers. lanes needs no sort but re-zeroes and writes out a
                                         # k*(dims+2) tile per block, and a bigger tile also means fewer
                                         # threadgroups resident. So a small tile wins outright, and a large
-                                        # one only once there are enough rows: measured lanes ahead at
-                                        # kw=1088 from 2M rows, kw=2176 from 8M, kw=3328 from 16M.
+                                        # one only once there are enough rows. Re-measured after the
+                                        # counting sort made grouping 4-6x cheaper: sorted now beats lanes
+                                        # at kw=2176 even at 10M rows (5.6 vs 7.3 ms), so this moved from
+                                        # 4000 to 10000; lanes still wins outright below LANES_SMALL_KW.
 LANES_ROWS_AHEAD = 8                    # rows loaded before any is added, to overlap their loads
 SORTED_MIN_KW = 1024                    # k*(dims+2) from which sorting by label can beat per-block buffers
 SORTED_MAX_ROWS = 2_000_000             # above this the argsort costs more than the buffers it saves...
