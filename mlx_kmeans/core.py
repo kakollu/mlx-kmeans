@@ -473,6 +473,15 @@ TILES1_MAX_FALLBACK = 0.10              # simdgroup fallback rate past which thi
                                         # about what the rows kernel costs for its 16 rows, so break-even is
                                         # near 1/3; this leaves a wide margin.
 TILES1_PROBE_ROWS = 1 << 18             # rows a new dataset is measured on before the rest of the pass
+CASCADE_MIN_DIMS = 128                  # below this the one-pass path already fuses the whole distance
+CASCADE_MAX_DIMS = 256                  # above this the prefix cannot be a useful share of the row: the
+                                        # prefix tiles have to fit in registers, so it caps at 96 dims,
+                                        # which is 10% of GIST's 960 and prunes nothing (70% survive)
+CASCADE_MIN_K = 256                     # and below this k there is too little to prune for the bound to pay
+CASCADE_MAX_SURVIVORS = 0.15            # survivor fraction past which pruning costs more than it saves:
+                                        # survivors are scored irregularly, at about a sixth of the dense
+                                        # rate, so break-even is near 1/6 once the prefix pass is counted
+_cascade_state = {}                     # per dataset: variance order, prefix buffer, last pass's labels
 APPROX_MIN_DIMS = 384                   # dims from which giving up exactness buys anything at all. Below it
                                         # the exact kernels beat an unverified matmul-and-argmin anyway,
                                         # because they never materialise the n x k product: measured 0.57x
@@ -770,6 +779,166 @@ def _approx_nearest(x, Cm, n, k, d):
     return lab, best
 
 
+# Two-stage exact assignment for dimensions the one-pass path cannot reach.
+#
+# A partial sum over the first m dimensions lower-bounds the full squared distance, because the remaining
+# terms are non-negative. So if that partial already exceeds a distance the row has ACHIEVED - the centre it
+# held last iteration, scored exactly - the centre cannot be the nearest, and it never has to be finished.
+# Stage 1 runs the same fused tile multiply as the one-pass path but over only those m dims, and writes one
+# bit per centre. Stage 2 walks the set bits and scores those centres exactly. Nothing approximate survives
+# into the answer: the bound decides only what to skip.
+#
+# Which m dims matters enormously. Ordered by variance, 4.2% of centres survive on SIFT1M at 128 dims with
+# m=64; in the order given, 11.4%. On data with no variance structure at all - isotropic Gaussians - a half
+# prefix is half of every distance and nothing prunes, so the kernel reports how many survived and the
+# dataset drops back to the ordinary path.
+#
+# Measured on SIFT1M with a genuinely stale bound (6.9% of labels out of date), zero wrong labels:
+#     1M x 128 k=1024, m=64   33.5 -> 18.0 ms   1.86x      1M x 128 k=4096, m=64  132.6 -> 57.2 ms  2.32x
+_CASCADE_MASK_SRC = """
+    uint sg = thread_position_in_grid.x / 32, lane = thread_position_in_grid.x % 32;
+    uint rbase = sg * 16, xrow = (row0[0] + rbase) * M;
+    const uint MK = MP / 8, MFULL = M / 8;
+    threadgroup float tile[SGPG * 256];
+    threadgroup float *T = tile + (thread_position_in_threadgroup.x / 32) * 256;
+    simdgroup_float8x8 a0[MK], a1[MK];
+    for (uint kk = 0; kk < MFULL; kk++) {
+        simdgroup_load(a0[kk], Xm + xrow + kk * 8, M);
+        simdgroup_load(a1[kk], Xm + xrow + 8 * M + kk * 8, M);
+    }
+    if (MFULL < MK) {
+        for (uint e = lane; e < 128; e += 32) {
+            uint r = e / 8, j = MFULL * 8 + (e % 8);
+            T[e] = (j < M) ? Xm[xrow + r * M + j] : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_load(a0[MFULL], T, 8);
+        simdgroup_load(a1[MFULL], T + 64, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint i = rbase + lane, xi = (row0[0] + i) * M;
+    float xsq = 0;
+    if (lane < 16) for (uint j = 0; j < M; j++) xsq += Xm[xi + j] * Xm[xi + j];
+    float g3 = 3 * gamma[0];
+    float u = (lane < 16) ? ub[i] : 0.0f;
+    uint word = 0, nkeep = 0;
+    for (uint ct = 0; ct < KP / 16; ct++) {
+        uint c0 = ct * 16;
+        simdgroup_float8x8 b0, b1;
+        simdgroup_float8x8 acc00 = simdgroup_float8x8(0.0f), acc01 = simdgroup_float8x8(0.0f);
+        simdgroup_float8x8 acc10 = simdgroup_float8x8(0.0f), acc11 = simdgroup_float8x8(0.0f);
+        for (uint kk = 0; kk < MK; kk++) {
+            simdgroup_load(b0, Ct + kk * 8 * KP + c0, KP);
+            simdgroup_load(b1, Ct + kk * 8 * KP + c0 + 8, KP);
+            simdgroup_multiply_accumulate(acc00, a0[kk], b0, acc00);
+            simdgroup_multiply_accumulate(acc01, a0[kk], b1, acc01);
+            simdgroup_multiply_accumulate(acc10, a1[kk], b0, acc10);
+            simdgroup_multiply_accumulate(acc11, a1[kk], b1, acc11);
+        }
+        simdgroup_store(acc00, T, 16);
+        simdgroup_store(acc01, T + 8, 16);
+        simdgroup_store(acc10, T + 8 * 16, 16);
+        simdgroup_store(acc11, T + 8 * 16 + 8, 16);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < 16) {
+            uint bits = 0;
+            for (uint t = 0; t < 16; t++) {
+                uint c = c0 + t;
+                float a = xsq + csq[c] - 2 * T[lane * 16 + t];
+                if (!(a - g3 * (xsq + csq[c]) > u)) { bits |= (1u << t); nkeep++; }
+            }
+            word |= bits << ((ct & 1u) * 16);
+            if (ct & 1u) { mask[i * (KP / 32) + (ct >> 1)] = word; word = 0; }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane < 16) nsurv[i] = nkeep;
+"""
+
+# Stage 2: walk the surviving bits and score those centres exactly. The row is held once across the lanes,
+# so X is read once rather than once per candidate, and both reads coalesce.
+_CASCADE_SCORE_SRC = """
+    uint i = thread_position_in_grid.x / 32, lane = thread_position_in_grid.x % 32;
+    const uint DPL = (D + 31) / 32, W = KP / 32;
+    float xv[DPL];
+    for (uint c = 0; c < DPL; c++) { uint j = lane + c * 32; xv[c] = (j < D) ? X[(row0[0] + i) * D + j] : 0.0f; }
+    float best = INFINITY; uint bl = 0;
+    for (uint w = 0; w < W; w++) {
+        uint bits = mask[i * W + w];
+        while (bits) {
+            uint t = ctz(bits);
+            bits &= bits - 1;
+            uint cc = w * 32 + t, ci = cc * D;
+            float s = 0;
+            for (uint c = 0; c < DPL; c++) {
+                uint j = lane + c * 32;
+                float q = xv[c] - ((j < D) ? C[ci + j] : 0.0f);
+                s += q * q;
+            }
+            s = simd_sum(s);
+            bool lt = (s < best) || (s == best && cc < bl);
+            best = select(best, s, lt); bl = select(bl, cc, lt);
+        }
+    }
+    if (lane == 0) { labels[i] = bl; best_d[i] = best; }
+"""
+
+
+def _cascade_m(d):
+    """Prefix width to prune on: half the dimensions, capped where the tiles stop fitting in registers."""
+    return min(TILES1_DIMS[1], max(8, (d // 2) // 8 * 8))
+
+
+def _cascade_ok(d, k):
+    return CASCADE_MIN_DIMS <= d <= CASCADE_MAX_DIMS and k >= CASCADE_MIN_K
+
+
+def _cascade_prefix(x, order, m):
+    mx = _mx()
+    return mx.contiguous(mx.take(x, mx.array(order[:m].astype(np.uint32)), axis=1))
+
+
+def _cascade_nearest(x, Cm, C, Xm, order, prev, n, k, d, m):
+    """Exact nearest centre by pruning on the prefix -> (labels, best, survivor fraction)."""
+    mx = _mx()
+    eps = float(np.finfo(np.float32).eps)
+    mp, kp = -(-m // 8) * 8, -(-k // 32) * 32
+    Cm_pref = np.ascontiguousarray(C[:, order[:m]])
+    Ctp = np.zeros((mp, kp), dtype=np.float32)
+    Ctp[:m, :k] = Cm_pref.T
+    csq = np.full(kp, np.inf, dtype=np.float32)          # padded centres never survive the bound
+    csq[:k] = (Cm_pref.astype(np.float64) ** 2).sum(1)
+    gamma = mx.array([mp * eps / (1 - mp * eps)], dtype=mx.float32)
+    dist = _kernel("kmeans_label_dist", ["X", "C", "labels", "row0"], ["best_d"], _LABEL_DIST_SRC)
+    whole = n // 16 * 16
+    labels, best = [], []
+    surv = 0.0
+    if whole:
+        ub = dist(inputs=[x, Cm, prev, _u32(0)], template=[("D", d)], grid=(whole, 1, 1),
+                  threadgroup=(64, 1, 1), output_shapes=[(whole,)], output_dtypes=[mx.float32])[0]
+        k1 = _kernel(f"kmeans_cascade_mask_{m}", ["Xm", "Ct", "csq", "ub", "row0", "gamma"],
+                     ["mask", "nsurv"], _CASCADE_MASK_SRC)
+        mask, nsurv = k1(inputs=[Xm, mx.array(Ctp), mx.array(csq), ub, _u32(0), gamma],
+                         template=[("M", m), ("MP", mp), ("KP", kp), ("SGPG", TILES1_SIMDGROUPS)],
+                         grid=((whole // 16) * 32, 1, 1), threadgroup=(TILES1_SIMDGROUPS * 32, 1, 1),
+                         output_shapes=[(whole * (kp // 32),), (whole,)],
+                         output_dtypes=[mx.uint32, mx.uint32])
+        k2 = _kernel(f"kmeans_cascade_score_{d}", ["X", "C", "mask", "row0"], ["labels", "best_d"],
+                     _CASCADE_SCORE_SRC)
+        lab, bst = k2(inputs=[x, Cm, mask, _u32(0)], template=[("D", d), ("KP", kp)],
+                      grid=(whole * 32, 1, 1), threadgroup=(256, 1, 1),
+                      output_shapes=[(whole,), (whole,)], output_dtypes=[mx.uint32, mx.float32])
+        labels.append(lab)
+        best.append(bst)
+        surv = float(mx.sum(nsurv)) / (whole * k)
+    if whole < n:
+        lab, bst = _rows_kernel(x, Cm, whole, n - whole, k, d)
+        labels.append(lab)
+        best.append(bst)
+    out = (labels[0], best[0]) if len(labels) == 1 else (mx.concatenate(labels), mx.concatenate(best))
+    return out[0], out[1], surv
+
+
 def _nearest(x, Cm, method, fb_out=None):
     """Nearest center and its distance for every row of one slice -> (labels uint32, best float32)."""
     mx = _mx()
@@ -1045,8 +1214,35 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
     k, d = C.shape
     if method == "approx" and d < APPROX_MIN_DIMS:
         method = "auto"           # below the crossover the exact kernels are faster as well as exact
+    casc = None
+    forced = method == "cascade"                     # by name: used by the accuracy suite
+    if (method == "auto" or forced) and _cascade_ok(d, k):
+        # The cascade needs two things the caller does not supply: which dimensions carry the variance, and
+        # where each row was last time. Both are properties of the data, so they are built once and kept
+        # until a different dataset arrives. The first pass over a dataset runs normally and records its
+        # labels; every pass after that can prune.
+        ck = (id(parts[0]), tuple(p.shape for p in parts), k, d)
+        st = _cascade_state.get(ck)
+        if st is None:
+            m = _cascade_m(d)
+            step = max(1, parts[0].shape[0] // 65536)
+            var = np.array(mx.var(parts[0][::step], axis=0))
+            order = np.argsort(-var).astype(np.int64)
+            _cascade_state.clear()                       # one dataset at a time; the buffers are large
+            st = {"m": m, "order": order, "Xm": [_cascade_prefix(p, order, m) for p in parts],
+                  "labels": None, "ok": True}
+            _cascade_state[ck] = st
+        if st["labels"] is None and forced:
+            Cb = mx.array(C)                         # bootstrap here so the path can be exercised directly
+            base = ("tiles" if k >= TILES_MIN_K and d >= TILES_MIN_DIMS and d % 8 == 0 and k % 8 == 0
+                    else "pairs" if d >= PAIRS_MIN_DIMS else "rows")
+            st["labels"] = [_nearest(p, Cb, base)[0] for p in parts]
+        if (st["ok"] or forced) and st["labels"] is not None:
+            casc = st
+    if method == "cascade":
+        method = "auto"                              # if it could not apply, fall through to the usual rules
     key = None
-    if method == "auto" and _tiles1_ok(d, k):
+    if method == "auto" and casc is None and _tiles1_ok(d, k):
         # Whether this path pays is a property of the data, not of the shape: its candidate window scales
         # with |x|^2, so data that was never centred - a sensor column reading around 3000, say - puts every
         # centre inside the window and every row takes the exact fallback, which costs 3x the rows kernel.
@@ -1057,7 +1253,7 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
         if verdict is not True:
             method = "tiles1"
             key = seen if verdict is None else None     # measure once per dataset, then trust it
-    if method == "auto":
+    if method == "auto" and casc is None:
         # Two separate thresholds, both measured. Tiles beats rows from ~40 dims once k >= 64 (48 dims, k=256:
         # 46.4 vs 25.7 ms). Pairs beats tiles at small k from ~64 dims (64 dims, k=8: 2.7 vs 1.5 ms; 960 dims,
         # k=32: 50.4 vs 36.1 ms). Between them - 40 to 63 dims with k < 64 - rows and pairs trade places
@@ -1073,6 +1269,18 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
     nearest = []
     fb = [] if key is not None else None
     plan = _fused_plan(d, k) if accumulate == "auto" and method == "rows" else None
+    if casc is not None:
+        worst = 0.0
+        for j, x in enumerate(parts):
+            labels, best, surv = _cascade_nearest(x, Cm, C, casc["Xm"][j], casc["order"],
+                                                  casc["labels"][j], x.shape[0], k, d, casc["m"])
+            worst = max(worst, surv)
+            tot += _accumulate(x, labels, best, k, accumulate)
+            nearest.append((labels, best))
+        casc["labels"] = [lab for lab, _ in nearest]
+        if worst > CASCADE_MAX_SURVIVORS:
+            casc["ok"] = False        # this data has no usable variance structure; stop offering the path
+        return tot, nearest
     for x in parts:
         if plan is not None:
             try:
@@ -1086,6 +1294,9 @@ def _gpu_pass(parts, C, method="auto", accumulate="auto"):
         labels, best = _nearest(x, Cm, method, fb)
         tot += _accumulate(x, labels, best, k, accumulate)
         nearest.append((labels, best))
+    for ck, st in _cascade_state.items():
+        if st["labels"] is None and ck[2] == k and ck[3] == d:
+            st["labels"] = [lab for lab, _ in nearest]     # bootstrap: the next pass can prune
     if fb:
         groups = sum(f.size for f in fb)
         rate = sum(float(mx.sum(f)) for f in fb) / groups if groups else 0.0

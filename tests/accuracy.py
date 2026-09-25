@@ -73,6 +73,9 @@ def check(name, X, C, slice_rows=None, dist_bytes=None):
         combos += [("tiles", "blocks"), ("tiles", "sorted")]
     if km.core._tiles1_ok(C.shape[1], len(C)):
         combos += [("tiles1", "blocks"), ("tiles1", "sorted")]
+    if km.core._cascade_ok(C.shape[1], len(C)):
+        km.core._cascade_state.clear()
+        combos += [("cascade", "blocks")]
     for method, accumulate in combos:
         sums, counts, inertia, labels = km.assign_mlx(parts, C, method=method, return_labels=True, accumulate=accumulate)
         d_lab = ((X64 - C64[labels]) ** 2).sum(1)
@@ -186,8 +189,11 @@ def main():
     results.append(check("tiny n=7 d3 k5", X, X[:5].copy()))
     X = (blobs(rng, 100_000, 8, 16, 10, 1) + 1000).astype(np.float32)  # large offset stresses float32 cancellation
     results.append(check("offset +1000 d8 k64", X, X[rng.choice(len(X), 64, replace=False)]))
-    X = rng.random((60_000, 128), dtype=np.float32) * 255  # SIFT-like range
+    X = rng.random((60_000, 128), dtype=np.float32) * 255  # SIFT-like range, isotropic: nothing to prune
     results.append(check("uniform 0-255 d128 k1024", X, X[rng.choice(len(X), 1024, replace=False)]))
+    X = blobs(rng, 120_000, 128, 64, 4, 1)                 # anisotropic: the cascade's prefix bites here
+    X *= np.linspace(8.0, 0.05, 128).astype(np.float32)    # variance concentrated in the leading dims
+    results.append(check("anisotropic d128 k256", X, X[rng.choice(len(X), 256, replace=False)]))
     X = blobs(rng, 20_000, 960, 50, 1, 1)                  # GIST-like dims
     results.append(check("high dims d960 k304", X, X[rng.choice(len(X), 304, replace=False)]))
     X = blobs(rng, 60_000, 64, 64, 1, 1)                   # overlapping at 64 dims: near-ties for the tiles path
