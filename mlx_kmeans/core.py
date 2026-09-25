@@ -408,13 +408,32 @@ _ATOMIC_SRC = """
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint e = lid; e < KW; e += TG) sums[b * KW + e] = atomic_load_explicit(&tile[e], memory_order_relaxed);
 """
+# One simdgroup per segment, with the running totals in registers. A segment belongs to exactly one cluster,
+# so its accumulator is dims+2 floats - not k*(dims+2) - and ceil((dims+2)/32) of them fit in each lane's
+# registers along with their Kahan carries. The row then costs one coalesced read of X and nothing else.
+# The previous version gave a segment to a single thread and kept its totals in device memory, so every row
+# read-modify-wrote dims+2 floats there, in both the sums and the carries: four times the traffic of the data
+# itself, which is where the bandwidth went. Same arithmetic in the same order, so results are unchanged;
+# measured 1.5x at 32 dims, 2.2x at 128, and 5.6x on GIST1M at 960 dims, where it lands within 10% of one
+# pass over the data.
 _SEGMENT_SRC = """
-    uint s = thread_position_in_grid.x, W = D + 2, o = s * W;
+    uint s = thread_position_in_grid.x / 32, lid = thread_position_in_grid.x % 32;
+    const uint W = D + 2;
+    float acc[DPL], carry[DPL];
+    for (uint c = 0; c < DPL; c++) { acc[c] = 0.0f; carry[c] = 0.0f; }
     for (uint p = seg_start[s]; p < seg_end[s]; p++) {
         uint r = perm[p], xi = r * D;
-        sums[o] += 1;
-        KAHAN_ADD(sums[o + 1], comp[o + 1], best_d[r]);
-        for (uint j = 0; j < D; j++) KAHAN_ADD(sums[o + 2 + j], comp[o + 2 + j], X[xi + j]);
+        for (uint c = 0; c < DPL; c++) {
+            uint e = lid + c * 32;
+            if (e < W) {
+                float v = (e >= 2) ? X[xi + e - 2] : ((e == 0) ? 1.0f : best_d[r]);
+                KAHAN_ADD(acc[c], carry[c], v);
+            }
+        }
+    }
+    for (uint c = 0; c < DPL; c++) {
+        uint e = lid + c * 32;
+        if (e < W) { sums[s * W + e] = acc[c]; comp[s * W + e] = carry[c]; }
     }
 """
 _SEGMENT_REDUCE_SRC = """
@@ -470,6 +489,15 @@ LANES_BLOCKS = 512                      # simdgroups to split the rows over. Wha
                                         # 2M and 10M rows alike, i.e. enough to fill the GPU and no more,
                                         # since every extra block re-zeroes and writes out a k*(dims+2) tile.
 LANES_MIN_ROWS = 256                    # ...but not so few rows each that the tile overhead dominates
+LANES_SMALL_KW = 1536                   # k*(dims+2) up to which lanes wins at every row count measured
+LANES_ROWS_PER_SLOT = 4000              # ...and above it, the rows per slot from which it wins anyway.
+                                        # Two costs trade off. The sorted path pays an argsort - 0.6 ns a
+                                        # row, 6 ms at 10M, and slightly superlinear - but then accumulates
+                                        # in registers. lanes needs no sort but re-zeroes and writes out a
+                                        # k*(dims+2) tile per block, and a bigger tile also means fewer
+                                        # threadgroups resident. So a small tile wins outright, and a large
+                                        # one only once there are enough rows: measured lanes ahead at
+                                        # kw=1088 from 2M rows, kw=2176 from 8M, kw=3328 from 16M.
 LANES_ROWS_AHEAD = 8                    # rows loaded before any is added, to overlap their loads
 SORTED_MIN_KW = 1024                    # k*(dims+2) from which sorting by label can beat per-block buffers
 SORTED_MAX_ROWS = 2_000_000             # above this the argsort costs more than the buffers it saves...
@@ -734,11 +762,12 @@ def _accumulate(x, labels, best, k, method="auto"):
         # Between the two deterministic paths: sorting pays for itself when the per-block buffers are large
         # (k*(dims+2) >= 1024) but the argsort is O(n log n), so at many rows with a small k the blocks path wins -
         # measured at 10M rows: blocks 5.8 ms vs sorted 9.0 ms for k*w = 1536.
-        if 2 * k * w <= TG_FLOATS:
-            method = "lanes"                  # deterministic, compensated, and on chip - preferred where it fits
-        else:
-            big_buffers = k * w >= SORTED_MIN_KW
-            method = "sorted" if big_buffers and (n <= SORTED_MAX_ROWS or k * w >= SORTED_ALWAYS_KW) else "blocks"
+        # Both remaining choices are deterministic and compensated. "blocks" is no longer reachable from here:
+        # once the segment kernel stopped read-modify-writing device memory, sorted beat it everywhere
+        # measured, by 1.4x at 200k rows and 4133 ms to 9 ms on GIST1M. It stays available by name.
+        fits = 2 * k * w <= TG_FLOATS
+        small = k * w <= LANES_SMALL_KW or n >= LANES_ROWS_PER_SLOT * k * w
+        method = "lanes" if fits and small else "sorted"
     if method == "lanes":
         return _accumulate_lanes(x, labels, best, k)
     if method == "atomic":
@@ -854,7 +883,7 @@ def _accumulate_sorted(x, labels, best, k):
     ns = len(starts)
     seg = _kernel("kmeans_segments", ["X", "best_d", "perm", "seg_start", "seg_end"], ["sums", "comp"], _SEGMENT_SRC, _KAHAN)
     sums, comp = seg(inputs=[x, best, perm, mx.array(starts.astype(np.uint32)), mx.array(ends.astype(np.uint32))],
-                     template=[("D", d)], grid=(ns, 1, 1), threadgroup=(64, 1, 1), init_value=0,
+                     template=[("D", d), ("DPL", -(-w // 32))], grid=(ns * 32, 1, 1), threadgroup=(256, 1, 1),
                      output_shapes=[(ns * w,), (ns * w,)], output_dtypes=[mx.float32, mx.float32])
     red = _kernel("kmeans_segment_reduce", ["sums", "comp", "seg_first"], ["total", "total_comp"], _SEGMENT_REDUCE_SRC, _KAHAN)
     total, total_comp = red(inputs=[sums, comp, mx.array(seg_first.astype(np.uint32))], template=[("W", w)],
