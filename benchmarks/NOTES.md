@@ -623,6 +623,46 @@ would be a correctness risk, not just a performance one, because a stale |x|^2 m
 and can change labels rather than merely slowing things down. It has to be threaded explicitly from the
 estimator, which owns the arrays for the life of a fit, rather than cached by identity.
 
+## Reconciling "94% of the ceiling" with the shrinking lead at large k and d
+
+The benchmark lead falls monotonically with dimension - 9.4x at 12 dims, 7.0x at 32, 4.5x at 128, 2.8x at
+960 - which looks like it contradicts the ceiling result above. It does not, and the difference matters for
+what to build next.
+
+Measured against what an approximate implementation on this machine can do (`mx.matmul` in the expanded
+form, argmin taken on trust, no verification), 500k rows and k=1024:
+
+| dims | ours, exact | approximate | ratio | our TFLOP/s | its TFLOP/s |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 16.9 ms | 28.6 ms | **0.59x** | 7.8 | 4.6 |
+| 256 | 26.6 ms | 29.7 ms | 0.90x | 9.8 | 8.8 |
+| 384 | 36.5 ms | 33.4 ms | 1.09x | 10.8 | 11.8 |
+| 512 | 47.2 ms | 34.6 ms | 1.37x | 11.1 | 15.2 |
+| 960 | 81.8 ms | 46.0 ms | **1.78x** | 12.0 | 21.4 |
+
+Three things follow.
+
+**Our absolute efficiency rises with dimension, it does not fall** - 7.8 to 12.0 TFLOP/s. The shrinking lead
+over scikit-learn, FAISS and fast-pytorch-kmeans is mostly those libraries getting *better*: at low
+dimensions their per-row overheads dominate and we look 9x faster, while at 960 dims the problem is a pure
+GEMM where their BLAS and MPS paths are at least respectable.
+
+**Below about 320 dims, exactness is free.** We beat even the unverified approximate path, because it has to
+materialise an n x k matrix and reduce it while our kernels do not. There is nothing to trade away here.
+
+**Above about 320 dims there is a real gap, and it is precision, not verification.** At 960 dims ours is
+162.2 ms (131.6 multiply + 30.5 margin) against 91.2 ms (68.6 multiply + ~22 argmin). Even with a *free*
+verification we would still be 1.44x behind, because the multiply alone is 1.92x: 14.9 TFLOP/s through
+`simdgroup_multiply_accumulate`, whose ceiling is 15.7, against 28.7 through the hardware MLX reaches. The
+tax is being obliged to compute the dot product accurately enough for the error bound to be usable, and it
+cannot be recovered by tuning - only by choosing a different guarantee. (Emulating float32 from the fast
+path needs three of its matmuls, 3/28.7 against 1/14.7, which is slower.)
+
+At 960 dims and k=1024 the approximate path disagreed with exact labels on 4,038 rows out of 1,000,000
+(0.4%). Whether that matters is a question about the application - for IVF training it plausibly does not -
+which is the argument for an opt-in approximate mode confined to high dimensions, and the argument against
+making it the default anywhere.
+
 ## Input limits, measured
 
 Behaviour on degenerate input, worth knowing before trusting a result:
