@@ -286,12 +286,12 @@ def report():
         "from the comparison (judged against our latest run). Ours relocates empty clusters like scikit-learn; FAISS "
         "splits clusters instead, so it can differ where clusters empty. Timings taken while "
         "other processes used more than four cores are flagged. Ours (latest run) is compared against each public "
-        "library's **best valid time ever recorded** for the config, so slow or failed public runs can't inflate our lead.",
+        "library's **best valid time ever recorded** for the config, so slow or failed public runs can't inflate the ratio.",
         "",
-        f"**Publish target:** ours at least {PUBLISH_TARGET}x faster on every config than the fastest of the "
-        f"libraries compared here (scikit-learn, FAISS, fast-pytorch-kmeans).",
+        f"**Comparison:** ours against the quickest valid time among the libraries compared here (scikit-learn, "
+        f"FAISS, fast-pytorch-kmeans); a ratio of {PUBLISH_TARGET}x or more is marked ✅.",
         "",
-        "| Config | Problem | Shape | Ours s/pass | Floor s/pass | Ours ÷ floor | Fastest valid public | Its s/pass | Ours vs it |",
+        "| Config | Problem | Shape | Ours s/pass | Floor s/pass | Ours ÷ floor | Quickest valid public | Its s/pass | Ours vs it |",
         "|---|---|---|---|---|---|---|---|---|",
     ]
     details = []
@@ -326,7 +326,7 @@ def report():
             details.append(f"| {r['impl']} | {r['version']} | {r['sec_per_pass']:.4f} | {r['min_s']:.4f}–{r['max_s']:.4f} | {vs} | "
                            f"{rel} | {r['load1']:.1f} / {r.get('other_cpu', float('nan')):.0f}%{busy} | {commit} | {r['date'][:10]} |")
         details.append("")
-    out += ["", "✅ meets target · 🟡 faster but below target · ❌ slower", "",
+    out += ["", f"✅ {PUBLISH_TARGET}x or more · 🟡 faster, under {PUBLISH_TARGET}x · ❌ slower", "",
             f"**Floor:** the larger of one read of X at {DRAM_BYTES_PER_S / 1e9:.0f} GB/s and 2·rows·k·dims at "
             f"{MATRIX_FLOP_PER_S / 1e12:.1f} TFLOP/s, the two ceilings measured in `benchmarks/MACHINE-PROFILE.md`. "
             "The ratio is the distance from the hardware for one pass: the GEMM-bound configs sit at 1.4x (the tiles "

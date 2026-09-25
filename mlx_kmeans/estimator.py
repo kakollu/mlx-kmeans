@@ -21,11 +21,15 @@ class KMeans:
     normalised embeddings, not of raw SIFT) the approximate path wins from 64 dimensions (1.14x at 64, 1.34x
     at 96, 2.68x on a GIST1M fit at 960); if not, it wins from 256 (1.97x at 256, 2.16x at 960 in fp32).
     Below those the flag does nothing. The reason is that MLX's matmul reaches hardware these kernels cannot,
-    at about 630x the error. Labels stop being provably optimal - about 0.15% of rows get a different
-    centre in a pass, costing 1e-7 of the distance - and inertia_ is still the TRUE inertia of the labels
-    returned, so an approximate run stays comparable with an exact one. On GIST1M at k=1024 it fits 2.68x
-    faster for 0.003% more inertia and recall@10 through a FAISS IVF index that is the same to within noise
-    (92.43% against 92.44% at nprobe 32). scripts/compare_exact_approx.py reproduces that.
+    at about 630x the error. Labels stop being provably optimal: on GIST1M the float16 path gives about 1.2% of
+    rows a different centre per pass, at 2.4e-5 of the inertia (the float32 path far less), and when the
+    float16 path runs the inertia and the new centres are summed from the float16 copy as well (7e-7 and
+    2.7e-4 relative on GIST1M; APPROX_FP16_ACCUMULATE=False in core.py sums them from the float32 data). The
+    fit still lands where the exact one does: on GIST1M at k=1024 it is 2.68x faster for 0.003% more inertia
+    and recall@10 through a FAISS IVF index the same to within noise (92.43% against 92.44% at nprobe 32).
+    scripts/compare_exact_approx.py reproduces that. A fit at 256+ dims also keeps per-centre distance bounds
+    between iterations on the exact path (core.py, section 5); labels stay exact, and only ties can resolve
+    differently from a single pass.
 
     accumulate="atomic" sums cluster totals in threadgroup memory: ~1.7-4.5x faster at small k * dims, at the cost
     of bit-reproducibility (centers move by ~1e-8 relative between identical runs, which can change which local

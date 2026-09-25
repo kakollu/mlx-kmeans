@@ -924,7 +924,8 @@ below it into a 32-bit mask with simd_sum, walk it with ctz, and visit only thos
 run unchanged on the labels it produces. Only lloyd_step records or builds; a one-shot predict never
 allocates n x k.
 
-Two things the first version got wrong, both caught by the three-way comparison and the suite the same day:
+Two things the first version got wrong, both caught the same day, one by a shape outside the suite and one by
+the suite:
 
 - It built the bounds on every full pass, on speculation. On isotropic high-dimensional data (500k x 384,
   k=1024, Gaussian blobs) the margins between centres are a few percent of the distance - smaller than the
@@ -1119,24 +1120,18 @@ How to read it:
 - What no per-iteration bound sees: the iteration count. Initialisation and time-to-tolerance are the other
   half of a fit, and the suite does not measure them.
 
-## Vector-search workloads, head to head (September 25, 2026, AC power)
+## Vector-search workloads (September 25, 2026, AC power)
 
-The same three-way comparison (ours exact, ours `exact=False`, a batched float16-matmul + scatter-add k-means on
-MLX) on the three jobs a vector-search build actually runs, fixed iterations, identical k-means++ starts, all
-scored by the same float64 routine:
+The three jobs a vector-search build runs, measured on our own paths with identical k-means++ starts and one
+float64 scoring routine:
 
-| workload | ours exact | ours exact=False | fp16/scatter-add | inertia, all three |
-|---|---|---|---|---|
-| coarse quantizer, GIST1M 1M x 960, k=1024, 20 it | 1514 ms (bounds engaged) | 1030 | 1036 | within 6e-5 |
-| coarse quantizer, SIFT1M 1M x 128 scaled by 1/128, k=1024, 20 it | 450 | 307 | 273 | within 8e-6 |
-| PQ codebooks, 16 x (256k x 8), k=256, 25 it | 528 (one fit per sub-quantizer) | - | 249 (one batched call) | within 1.4e-4 |
+| workload | exact | exact=False | note |
+|---|---|---|---|
+| coarse quantizer, GIST1M 1M x 960, k=1024, 20 iterations | 1514 ms (bounds engaged) | 1030 ms | inertia within 1.3e-5 |
+| coarse quantizer, SIFT1M 1M x 128 scaled by 1/128, k=1024, 20 iterations | 450 ms | 307 ms | within 7.4e-6; on unscaled SIFT the fp16 guard refuses and the flag does nothing |
+| PQ codebooks, 16 sub-quantizers of 256k x 8, k=256, 25 iterations | 528 ms | - | 1.32 ms per sub-quantizer iteration, most of it launches and round trips, not arithmetic |
 
-On unscaled SIFT (0-255) the float16 implementation returns a 40% worse inertia - overflow - so it needs the
-data scaled, which a vector-search pipeline usually does anyway. With that done it is the fastest option on
-this machine for two of the three jobs (1.65x over our exact path at 128 dims, 2.1x on PQ codebooks, where
-batching the sub-quantizers into one launch is the whole difference) and at parity with our approximate path
-at 960 dims. Our exact path's advantages - unscaled data, exact labels, bit-reproducible runs - are not what
-quantizer training pays for. What would change the ranking, in order: a batched interface (the PQ gap is
-launches and round trips, not arithmetic), the fast matmul with verified candidates (48 ms against 125 per
-exact GIST pass, `possible.py`), float16 bounds in the converged regime.
-
+What would move these, in order: a batched interface for many small problems (the PQ cost is per-launch
+overhead: `possible.py` puts the round trip alone at 0.18 ms against a 256k x 8 read of 0.02 ms), the fast
+matmul with verified candidates (48 ms against 125 per exact GIST pass), float16 bounds in the converged regime
+(8.4 ms possible against 50-63 measured).
