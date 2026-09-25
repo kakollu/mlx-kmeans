@@ -701,6 +701,42 @@ The honest summary for a user: above 384 dims this is a real speedup and the clu
 worse in a way that did not reach the downstream metric; below 384 dims there is nothing to trade, because
 exact is already faster.
 
+## Four things that should have worked and did not (September 24, 2026, AC power)
+
+After the cascade and the cache-reload path landed, the next four ideas all measured out too small to keep.
+Recorded because each is the obvious next thing to try.
+
+**float16 for the approximate matmul.** This machine does fp16 matmul at 52 TFLOP/s against 36.2 for fp32,
+and the quality holds: on GIST1M the fitted inertia was *better* than the fp32 approximate path
+(+1.3e-05 against +1.9e-04) and recall@10 was 92.36% against 92.44% exact. But the fit only went 0.99s to
+0.93s - **1.06x** - because assignment is already a minority of an approximate fit. Not worth a new failure
+mode for 6%, and the failure mode is sharp: SIFT's |x|^2 is 2.6e5 against float16's 6.55e4 ceiling, so
+every row overflows and 499,409 of 500,000 labels come back wrong. A Cauchy-Schwarz guard
+(sqrt(max|x|^2) * sqrt(max|c|^2) < 65504/4) predicts both cases exactly, and would be the right guard if
+this were ever worth having.
+
+**Multi-row lanes for small dimensions.** The accumulator gives each lane one dimension, so at 4 dims it
+uses 6 lanes of 32 and runs at 13.2x its memory floor - the worst ratio anywhere in the library. Giving each
+simdgroup 32/(dims+2) rows at once, with same-cluster collisions resolved by rank so it stays deterministic,
+raises utilisation to 30/32 and measures **1.36x at 4 dims, 1.22x at 6, and 0.76-1.03x everywhere else**.
+The lanes were never the constraint: the existing kernel hides memory latency by loading 8 rows ahead, and
+the multi-row version spends that parallelism on width instead. Winning would need both, which is not worth
+it for 0.6% of the suite.
+
+**A per-slice maximum |x|^2 in the margin kernel.** It recomputes |x|^2 for every row on every pass, a
+second full read of X. Substituting a single maximum is safe by construction - a larger value only widens
+the error window, so it can never discard the true nearest - and labels were indeed identical. Worth
+**1.12x on the margin kernel, 1.7% of the GIST step.** Not worth a cached norm and its staleness risk.
+Note the window widens a lot for a typical row (GIST's max |x|^2 is 9.3x its mean) and the result still did
+not change, which says something about how loose the bound already is.
+
+**Cache-blocking by dispatching smaller chunks.** Covered above: monotonically worse, because each chunk
+costs another 150 us round trip.
+
+The pattern across all four: this library is no longer losing time to things that can be fixed by choosing
+better constants or better instructions. What is left is either at a hardware ceiling (the 15.7 TFLOP/s
+multiply) or below the noise floor of the measurements.
+
 ## Input limits, measured
 
 Behaviour on degenerate input, worth knowing before trusting a result:
