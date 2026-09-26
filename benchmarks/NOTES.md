@@ -1241,7 +1241,9 @@ the run, and row stride makes no difference (no set conflicts to pad away). The 
 sort's permutation, so consecutive simdgroups work rows of the same cluster and visit the same centres) took
 45-48 ms per converged iteration against 48-50 in natural order - about 4%, inside the noise of the
 profile above. The centre table is on-chip either way, and a simdgroup's own working set (some 30 centres,
-57 KB) is far past what a core's L1 holds, so locality between neighbouring rows buys nothing. This closes
-the converged regime at 46-49 ms against a 37 ms bound: the remaining distance is the kernel's arithmetic
-between loads, not the cache.
+57 KB) is far past what a core's L1 holds, so locality between neighbouring rows buys nothing. One more idea the curve suggested was tried: the probe reads small tables slower than 4-11 MB ones (many
+simdgroups on the same lines), so the float16 centre table was replicated and each row's simdgroup read its
+own copy. 1, 2 and 4 replicas: 44-46 ms, within noise; 8 and 16: 52 and 65 ms as the table leaves the sweet
+spot. Labels identical throughout. Not kept. This closes the converged regime at 46-49 ms against a 37 ms
+bound: the remaining distance is the kernel's arithmetic between loads, not the cache.
 
