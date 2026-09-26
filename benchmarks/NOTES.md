@@ -1169,3 +1169,37 @@ centre's row from cache once per row that visits it - about 120 GB per iteration
 where the 50 ms goes. The lever there is evaluating visited pairs as tiles (eight rows sharing each centre
 read), which is the same structure as the fused kernel below.
 
+## tiles1's assignment inside the fused kernel: exact, and parity (September 25, 2026, AC power)
+
+The third named step: the one-hot accumulation multiplying the X tiles that tiles1 already holds in registers
+for its 16 rows, with one staged [1, best] tile for counts and inertia, in a persistent loop with partials
+(prototypes/fused_tiles1_onehot.py). Labels and best bit-identical to tiles1, totals within 1e-9 of the sorted
+path, on every shape. Best of three medians, a full pass, against the current auto path:
+
+| shape | auto | fused tiles1 | |
+|---|---|---|---|
+| single-cell 2M x 50, k=64 | 4.24 | 4.20 | 1.01x |
+| 2M x 50, k=32 | 2.47 | 2.53 | 0.98x |
+| 2M x 30, k=64 | 2.60 | 2.51 | 1.03x |
+| satellite 10M x 12, k=32 (auto is the one-hot kernel) | 2.80 | 3.64 | 0.77x |
+| geo-trips 10M x 4, k=256 | 9.91 | 19.9 | 0.50x |
+
+Not adopted. Why it is parity rather than the 1.5x hoped for: the one-hot accumulation does k x W x 8
+multiply-adds per 8 rows on the matrix unit - the assignment's k x d x 8 over again - so with tiles1's
+assignment at about 40% of the unit's ceiling and the accumulation at a similar fraction, each is about 2 ms
+at single-cell and the pass lands where the two-stage path does. Three designs now reach the same 4.2 ms
+there (tiles1 + sorted, the one-hot kernel, this), which makes it a floor of the building blocks rather than
+of any one of them: an exact, deterministic pass costs the assignment's arithmetic twice. At k=256 the loss
+is tiles1's epilogue - sixteen candidate updates per row per centre tile, 256 per row - which the rows loop
+does not pay at d=4. What would move single-cell is an assignment at the matrix unit's ceiling rather than
+40% of it, and an accumulation that reads the data once without repeating the arithmetic: a sort of the
+16-row tile by label so that each cluster present gets one lane-parallel add, with the accumulator in
+threadgroup memory - which MACHINE-PROFILE's occupancy table rules out at k x W = 3328 floats. Below that
+size (satellite is 512) the one-hot kernel already wins, and that is where the low-dimensional gains are.
+
+The three named steps, closed: the fast matmul is not float32 arithmetic (no exact path on it); float16 bounds
+halve memory and not time, and located the converged-regime cost in row-at-a-time evaluation of visited
+pairs; the fused tiles1 assignment is exact and parity. The lever left with a mechanism behind it is the
+converged high-dimensional regime: evaluating the bounds' visited pairs as tiles, eight rows per centre read,
+against the ~120 GB of cache reads per iteration measured at 3% visited on GIST 1M.
+
