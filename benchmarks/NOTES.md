@@ -1157,3 +1157,15 @@ cannot be built on it; `exact=False` is where it belongs and already is. Closed.
 inputs would recover float32-like error at three multiplies - about 100 ms against the kernel's 125 - and
 still without a bound on the unit's accumulation order.)
 
+## float16 bounds: memory halved, speed unchanged (September 25, 2026)
+
+The per-centre bounds are now stored as float16 rounded toward zero (a stored bound is never above the value
+it stands for; one ulp of slack, 2.4e-4 relative, per rewrite). Exact on all three multi-step suite cases and
+the reuse suite. Memory halves, so the path is offered to twice the rows (7.8M at k=1024). Speed: GIST 1M,
+k=1024, 20 iterations 1.62 -> 1.57 s; the converged-regime iteration 50-63 ms with either width; GIST 300k
+27-40 ms either way. `possible.py` priced this regime at 17 ms float32 / 8.4 ms float16 on the bound traffic
+alone, and the measurement says the traffic was never the cost: at 3% visited the step reads each visited
+centre's row from cache once per row that visits it - about 120 GB per iteration at 1M x 960 - and that is
+where the 50 ms goes. The lever there is evaluating visited pairs as tiles (eight rows sharing each centre
+read), which is the same structure as the fused kernel below.
+

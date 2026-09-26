@@ -509,7 +509,7 @@ TILE_THREADGROUP = 512                  # threads per threadgroup in the tiles p
 DIST_BYTES = 512 << 20                  # largest (rows x k) float32 distance chunk in the pairs path
 BOUNDS_MIN_DIMS = 256                   # per-centre bounds: below this the bound traffic costs more than the multiply it saves
 BOUNDS_MAX_DIMS = 2048                  # the step kernel holds a row in registers, D/32 per lane
-BOUNDS_MAX_BYTES = 16 << 30             # n x k float32 lower bounds, plus one DIST_BYTES chunk while it is rewritten
+BOUNDS_MAX_BYTES = 16 << 30             # n x k float16 lower bounds, plus one DIST_BYTES chunk while it is rewritten
 BOUNDS_MAX_VISITED = 0.05               # centres the count pass expects to visit, as a fraction of n x k; above it, full pass
 BOUNDS_SAMPLE_ROWS = 8192               # rows the count and prediction passes look at (strided); the step counts exactly
 ACC_BYTES = 256 << 20                   # budget for per-block accumulation buffers
@@ -1683,7 +1683,12 @@ def _tiles1_ok(d, k):
 # Floating point: computed squared distances carry a relative error up to gamma = D*eps/(1-D*eps); stored
 # bounds are scaled by (1 - 2*gamma) and the own distance by (1 + 2*gamma) before any comparison, and drifts
 # are rounded up, so every skip is justified in exact arithmetic. Bounds built from dot products use the
-# expanded form's bound, 3*gamma*(|x|^2 + |c|^2), the same one the tiles path's candidate test uses.
+# expanded form's bound, 3*gamma*(|x|^2 + |c|^2), the same one the tiles path's candidate test uses. The
+# bounds are stored as float16 rounded toward zero (HALF_DOWN), so a stored bound is never above the value it
+# stands for: half the memory (so twice the rows are eligible) at a half-ulp (2.4e-4 relative) of slack per
+# rewrite. It did not change the speed - GIST 1M, k=1024, 20 iterations: 1.62 s float32, 1.57 s float16, the
+# converged-regime iteration 50-63 ms either way - which says the cost of that regime is evaluating the
+# visited pairs a row at a time, not the bound traffic.
 #
 # Not tried yet: fp16 bounds (halves the memory and the traffic; needs round-toward-zero conversion) and
 # rewriting only the rows that visited something.
@@ -1692,7 +1697,7 @@ _bounds_state = {}
 
 def _bounds_ok(parts, k, d):
     return (BOUNDS_MIN_DIMS <= d <= BOUNDS_MAX_DIMS and k >= TILES_MIN_K and k % 8 == 0 and d % 8 == 0
-            and sum(p.shape[0] for p in parts) * k * 4 + DIST_BYTES <= BOUNDS_MAX_BYTES)
+            and sum(p.shape[0] for p in parts) * k * 2 + DIST_BYTES <= BOUNDS_MAX_BYTES)
 
 
 def _bounds_chunk(k):
@@ -1712,7 +1717,7 @@ _LB_INIT_SRC = """
     for (uint j = lane; j < K; j += 32) {
         float sq = xs + csq[j];
         float v = sq - 2 * dot[i * K + j] - g3 * sq;
-        lb[i * K + j] = sqrt(max(v, 0.0f)) * lo;
+        lb[i * K + j] = HALF_DOWN(sqrt(max(v, 0.0f)) * lo);
     }
 """
 
@@ -1720,10 +1725,10 @@ _LB_INIT_SRC = """
 def _lb_from_dot(x, r0, dot, csq, m, k, d, gamma):
     """Lower bound on the distance from each of m rows (from r0) to each centre, from expanded-form dot products."""
     mx = _mx()
-    kern = _kernel("kmeans_lb_init", ["X", "dot", "csq", "row0", "pads"], ["lb"], _LB_INIT_SRC)
+    kern = _kernel("kmeans_lb_init", ["X", "dot", "csq", "row0", "pads"], ["lb"], _LB_INIT_SRC, _HALF_DOWN)
     pads = mx.array([3 * gamma, 1 - 2 * gamma], dtype=mx.float32)
     lb = kern(inputs=[x, dot, csq, _u32(r0), pads], template=[("D", d), ("K", k)], grid=(m * 32, 1, 1),
-              threadgroup=(256, 1, 1), output_shapes=[(m * k,)], output_dtypes=[mx.float32])[0]
+              threadgroup=(256, 1, 1), output_shapes=[(m * k,)], output_dtypes=[mx.float16])[0]
     mx.eval(lb)
     return lb
 
@@ -1732,6 +1737,15 @@ def _lb_from_dot(x, r0, dot, csq, m, k, d, gamma):
 # 32nd centre's bound, so the bound row is read coalesced and a distance is one lane-parallel pass over the
 # row plus a simd_sum. The set of centres to visit in a block of 32 is gathered into a mask with simd_sum of
 # one bit per lane and walked with ctz, ascending, so computed-equal ties resolve to the lowest index.
+_HALF_DOWN = """
+inline half half_down_(float v) {
+    half h = half(v);
+    if ((float)h > v) h = as_type<half>((ushort)(as_type<ushort>(h) - 1));   // one ulp down; inf -> 65504
+    return h;
+}
+#define HALF_DOWN(v) half_down_(v)
+"""
+
 _BOUNDS_HEAD = """
     uint i = thread_position_in_grid.x / 32, lane = thread_position_in_grid.x % 32;
     const uint DPL = (D + 31) / 32;
@@ -1751,7 +1765,7 @@ _BOUNDS_COUNT_SRC = _BOUNDS_HEAD.replace("STRIDE", "stride[0]").replace("LOCAL",
     uint cnt = 0;
     for (uint w = 0; w < K; w += 32) {
         uint j = w + lane;
-        float v = (j < K) ? lb_in[(STRIDE * i) * K + j] - drift[j] : INFINITY;
+        float v = (j < K) ? (float)lb_in[(STRIDE * i) * K + j] - drift[j] : INFINITY;
         cnt += (j != l && v < ub) ? 1u : 0u;
     }
     cnt = simd_sum(cnt);
@@ -1763,7 +1777,7 @@ _BOUNDS_STEP_SRC = _BOUNDS_HEAD.replace("STRIDE * i", "i").replace("LOCAL", "i")
     uint nvis = 0;
     for (uint w = 0; w < K; w += 32) {
         uint j = w + lane;
-        float v = (j < K) ? lb_in[i * K + j] - drift[j] : INFINITY;
+        float v = (j < K) ? (float)lb_in[i * K + j] - drift[j] : INFINITY;
         if (j == l) v = dl * lo;
         uint m = simd_sum((j != l && v < ub) ? (1u << lane) : 0u);
         while (m) {
@@ -1777,7 +1791,7 @@ _BOUNDS_STEP_SRC = _BOUNDS_HEAD.replace("STRIDE * i", "i").replace("LOCAL", "i")
             if (s2 < sbest) { sbest = s2; bl = cc; ub = dcc * hi; }
             nvis++;
         }
-        if (j < K) lb_out[i * K + j] = v;
+        if (j < K) lb_out[i * K + j] = HALF_DOWN(max(v, 0.0f));
     }
     if (lane == 0) { labels[i] = bl; best_d[i] = sbest; ub_out[i] = sqrt(sbest); visited[i] = nvis; }
 """
@@ -1811,7 +1825,9 @@ def _lb_chunk(x, Cm, Ct, csq, a, b, k, d, gamma):
     pairs = _kernel("kmeans_pairs", ["X", "C", "row0"], ["dist"], _PAIRS_SRC)
     dist = pairs(inputs=[x, Cm, _u32(a)], template=[("D", d), ("K", k)], grid=(k, m, 1), threadgroup=(16, 16, 1),
                  output_shapes=[(m, k)], output_dtypes=[mx.float32])[0]
-    lb = mx.sqrt(dist).reshape(m * k) * (1 - 2 * gamma)
+    v = mx.sqrt(dist).reshape(m * k) * (1 - 2 * gamma)
+    h = v.astype(mx.float16)                          # nearest; step one ulp down where that rounded up
+    lb = mx.where(h.astype(mx.float32) > v, (h.view(mx.uint16) - 1).view(mx.float16), h)
     mx.eval(lb)
     return lb
 
@@ -1844,7 +1860,7 @@ def _bounds_predict(st, parts, C, k, d):
     drift = mx.array(_bounds_drift(C, st["C"]))
     pads = _bounds_pads(d)
     kern = _kernel("kmeans_bounds_count", ["X", "C", "drift", "labels_in", "lb_in", "row0", "row_end", "stride", "pads"],
-                   ["count"], _BOUNDS_COUNT_SRC)
+                   ["count"], _BOUNDS_COUNT_SRC, _HALF_DOWN)
     total, seen = 0.0, 0
     step = 16 if k % 16 == 0 else 8
     for x, labs in zip(parts, st["labels"]):
@@ -1880,7 +1896,7 @@ def _bounds_count(st, parts, C, k, d):
     drift = mx.array(_bounds_drift(C, st["C"]))
     pads = _bounds_pads(d)
     kern = _kernel("kmeans_bounds_count", ["X", "C", "drift", "labels_in", "lb_in", "row0", "row_end", "stride", "pads"],
-                   ["count"], _BOUNDS_COUNT_SRC)
+                   ["count"], _BOUNDS_COUNT_SRC, _HALF_DOWN)
     total, seen = 0.0, 0
     for x, labs, lbs in zip(parts, st["labels"], st["lb"]):
         n = x.shape[0]
@@ -1908,7 +1924,7 @@ def _bounds_pass(st, parts, C, k, d, accumulate):
     drift = mx.array(_bounds_drift(C, st["C"]))
     pads = _bounds_pads(d)
     kern = _kernel("kmeans_bounds_step", ["X", "C", "drift", "labels_in", "lb_in", "row0", "row_end", "pads"],
-                   ["labels", "best_d", "ub_out", "lb_out", "visited"], _BOUNDS_STEP_SRC)
+                   ["labels", "best_d", "ub_out", "lb_out", "visited"], _BOUNDS_STEP_SRC, _HALF_DOWN)
     tot = np.zeros((k, d + 2), dtype=np.float64)
     nearest, nvis = [], 0
     try:
@@ -1919,7 +1935,7 @@ def _bounds_pass(st, parts, C, k, d, accumulate):
                 lab2, best2, ub2, lb2, vis = kern(inputs=[x, Cm, drift, lab, lb, _u32(r0), _u32(r0 + m), pads],
                                                   template=[("D", d), ("K", k)], grid=(m * 32, 1, 1), threadgroup=(256, 1, 1),
                                                   output_shapes=[(m,), (m,), (m,), (m * k,), (m,)],
-                                                  output_dtypes=[mx.uint32, mx.float32, mx.float32, mx.float32, mx.uint32])
+                                                  output_dtypes=[mx.uint32, mx.float32, mx.float32, mx.float16, mx.uint32])
                 mx.eval(lab2, best2, ub2, lb2)
                 nvis += int(mx.sum(vis))
                 st["labels"][pi][ci], st["ub"][pi][ci], st["lb"][pi][ci] = lab2, ub2, lb2   # in place: one chunk over, not 2x
