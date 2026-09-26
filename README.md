@@ -293,7 +293,7 @@ python3 -m venv --system-site-packages .venv
 .venv/bin/pip install . scikit-learn faiss-cpu torch fast-pytorch-kmeans
 python3 scripts/get_data.py sift gist      # public benchmark sets, no account needed
 .venv/bin/python bench.py --suite          # regenerates BENCHMARKS.md
-.venv/bin/python tests/accuracy.py         # 20 correctness cases against float64
+.venv/bin/python tests/accuracy.py         # 22 correctness cases against float64
 .venv/bin/python tests/reuse.py            # fit here, predict there: cached state, input checks
 ```
 
@@ -335,7 +335,7 @@ it also tests rows/atomic accumulation where supported. Labels must be optimal w
 tolerance; center and inertia errors must be within 1e-6 under the suite's metrics. Empty-cluster relocation is
 checked against an independent reference, with one case also checked against scikit-learn. The multi-buffer
 test's configuration wiring was repaired on September 19. These finite tests are evidence, not a proof for all inputs.
-The suite passes **20/20 cases** on the measured M5 Max, three of them multi-step sequences through the between-iteration bounds path (including a restart with unrelated centers mid-sequence and empty-cluster relocations); the verification directory contains the full log. A second suite, `tests/reuse.py`, checks the fit-here-predict-there pattern: a second array of the same shape, batched predictions with one batch rescaled, and sliced inputs sharing a first part must never be served the previous array's cached state, and bad input must raise rather than abort the process.
+The suite passes **22/22 cases** on the measured M5 Max, five of them through the between-iteration bounds path (multi-step sequences with a restart mid-sequence and empty-cluster relocations, a subnormal-scale column with the float16 screen forced off, and centre coordinates past float16's range); the verification directory contains the full log. A second suite, `tests/reuse.py`, checks the fit-here-predict-there pattern: a second array of the same shape, batched predictions with one batch rescaled, and sliced inputs sharing a first part must never be served the previous array's cached state, and bad input must raise rather than abort the process.
 
 ## Demos on real public data
 

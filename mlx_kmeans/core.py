@@ -1789,14 +1789,17 @@ _BOUNDS_STEP_SRC = _BOUNDS_HEAD.replace("STRIDE * i", "i").replace("LOCAL", "i")
         while (m) {
             uint t = ctz(m); m &= m - 1;
             uint cc = w + t, ci = cc * D;
-            float s2 = 0;
-            for (uint c = 0; c < DPL; c++) { uint jj = lane + c * 32; float q = xv[c] - ((jj < D) ? (float)C16[ci + jj] : 0.0f); s2 += q * q; }
-            s2 = simd_sum(s2);
-            float lbc = sqrt(s2) * lo - ec[cc];
-            if (lane == t) v = lbc;
+            float lbc = -INFINITY;
+            if (SCREEN) {
+                float s2 = 0;
+                for (uint c = 0; c < DPL; c++) { uint jj = lane + c * 32; float q = xv[c] - ((jj < D) ? (float)C16[ci + jj] : 0.0f); s2 += q * q; }
+                s2 = simd_sum(s2);
+                lbc = sqrt(s2) * lo - ec[cc];
+                if (lane == t) v = lbc;
+            }
             nvis++;
             if (lbc < ub) {
-                s2 = 0;
+                float s2 = 0;
                 for (uint c = 0; c < DPL; c++) { uint jj = lane + c * 32; float q = xv[c] - ((jj < D) ? C[ci + jj] : 0.0f); s2 += q * q; }
                 s2 = simd_sum(s2);
                 float dcc = sqrt(s2);
@@ -1807,7 +1810,7 @@ _BOUNDS_STEP_SRC = _BOUNDS_HEAD.replace("STRIDE * i", "i").replace("LOCAL", "i")
         }
         if (j < K) lb_out[i * K + j] = HALF_DOWN(max(v, 0.0f));
     }
-    if (lane == 0) { labels[i] = bl; best_d[i] = sbest; ub_out[i] = sqrt(sbest); visited[i] = nvis | (nfull << 16); }
+    if (lane == 0) { labels[i] = bl; best_d[i] = sbest; ub_out[i] = sqrt(sbest); visited[i] = min(nvis, 65535u) | (min(nfull, 65535u) << 16); }
 """
 
 
@@ -1935,13 +1938,18 @@ def _bounds_pass(st, parts, C, k, d, accumulate):
     """One assignment pass from the stored bounds -> (totals, nearest), and the state moved to C."""
     mx = _mx()
     Cm = C_mx(C)
-    C16 = Cm.astype(mx.float16)
+    C16 = mx.clip(Cm, -65504.0, 65504.0).astype(mx.float16)  # a coordinate past float16's range would make the screen NaN
     ec = np.sqrt(((C.astype(np.float64) - np.array(C16).astype(np.float64)) ** 2).sum(1)).astype(np.float32)
-    ec = mx.array(np.nextafter(ec, np.float32(np.inf)))     # |c - c16| per centre, rounded up
+    ec = mx.array(np.nextafter(ec, np.float32(np.inf)))     # |c - c16| per centre, rounded up; the clipped amount is in it
+    # On data whose centres are far from the origin the screen decides little - |c - c16| grows with |c| - and
+    # every visit pays both reads. The previous pass reports how many visits reached float32; past half, the
+    # next pass skips the screen.
+    screen = st.get("full", 0.0) <= 0.5 * max(st.get("visited", 1.0), 1e-12)
     drift = mx.array(_bounds_drift(C, st["C"]))
     pads = _bounds_pads(d)
     kern = _kernel("kmeans_bounds_step", ["X", "C", "C16", "ec", "drift", "labels_in", "lb_in", "row0", "row_end", "pads"],
                    ["labels", "best_d", "ub_out", "lb_out", "visited"], _BOUNDS_STEP_SRC, _HALF_DOWN)
+    st["screened"] = screen
     tot = np.zeros((k, d + 2), dtype=np.float64)
     nearest, nvis, nfull = [], 0, 0
     try:
@@ -1950,7 +1958,7 @@ def _bounds_pass(st, parts, C, k, d, accumulate):
             for ci, (lab, lb) in enumerate(zip(st["labels"][pi], st["lb"][pi])):
                 m = lab.shape[0]
                 lab2, best2, ub2, lb2, vis = kern(inputs=[x, Cm, C16, ec, drift, lab, lb, _u32(r0), _u32(r0 + m), pads],
-                                                  template=[("D", d), ("K", k)], grid=(m * 32, 1, 1), threadgroup=(256, 1, 1),
+                                                  template=[("D", d), ("K", k), ("SCREEN", 1 if screen else 0)], grid=(m * 32, 1, 1), threadgroup=(256, 1, 1),
                                                   output_shapes=[(m,), (m,), (m,), (m * k,), (m,)],
                                                   output_dtypes=[mx.uint32, mx.float32, mx.float32, mx.float16, mx.uint32])
                 mx.eval(lab2, best2, ub2, lb2)

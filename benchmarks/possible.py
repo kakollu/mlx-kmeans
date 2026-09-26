@@ -17,15 +17,16 @@ LAUNCH = 5e-6           # s, one kernel launch
 # mx.matmul on each config's GEMM (rows x dims @ dims x k), measured 2026-09-25: TFLOP/s reached, fp32 and fp16.
 MATMUL = {"geo-trips": (1.0, 2.0), "satellite": (2.0, 3.9), "logs": (6.4, 13.7), "single-cell": (6.5, 12.1),
           "sift-k1024": (19.5, 32.3), "gist-k1024": (41.1, 57.7)}
-SUITE = {"geo-trips": (10_000_000, 4, 256, 9.2), "satellite": (10_000_000, 12, 32, 3.2), "logs": (10_000_000, 32, 256, 27.8),
-         "single-cell": (2_000_000, 50, 64, 4.4), "sift-k1024": (1_000_000, 128, 1024, 22.8), "gist-k1024": (1_000_000, 960, 1024, 176.0)}
+# rows, dims, k, measured ms per pass, measured ms per converged-regime iteration (None where the bounds do not engage)
+SUITE = {"geo-trips": (10_000_000, 4, 256, 9.2, None), "satellite": (10_000_000, 12, 32, 3.2, None), "logs": (10_000_000, 32, 256, 27.8, None),
+         "single-cell": (2_000_000, 50, 64, 4.4, None), "sift-k1024": (1_000_000, 128, 1024, 22.8, None), "gist-k1024": (1_000_000, 960, 1024, 176.0, 47.5)}
 VISITED = 0.03          # fraction of the n x k distances a converged-regime iteration still evaluates with per-centre bounds (measured 0.3-3.6%)
 ONCHIP = 1.6e12         # B/s the visit phase reads centre rows from cache at, scattered (measured on GIST 1M: 52 GB in 33 ms)
 VISIT_BYTES = 2         # per element of a visited centre: the float16 screen decides 99.99% of visits
 
 print(f"{'config':>12} | {'measured':>8} | {'exact, our kernels':>18} | {'exact via matmul':>16} | {'converged, bounds fp32/fp16':>27} | {'result-only':>11} | {'small-data floor':>16}")
 print(f"{'':>12} | {'ms/pass':>8} | {'ms  (x off)':>18} | {'ms  (x off)':>16} | {'ms  (x off)':>27} | {'ms  (x off)':>11} | {'round trip':>16}")
-for name, (n, d, k, measured) in SUITE.items():
+for name, (n, d, k, measured, converged) in SUITE.items():
     read = n * d * 4 / DRAM
     gemm = 2.0 * n * k * d
     exact = max(read, gemm / SIMD)                                          # one read, all distances on the matrix unit
@@ -40,5 +41,6 @@ for name, (n, d, k, measured) in SUITE.items():
     result_only = max(read, gemm / (max(f16, f32) * 1e12)) if max(f16, f32) * 1e12 > SIMD else exact
     floor_small = ROUND_TRIP + LAUNCH
     m = measured / 1e3
+    mc = (converged if converged is not None else measured) / 1e3    # the converged column against the converged iteration
     print(f"{name:>12} | {measured:8.1f} | {exact*1e3:6.2f}  ({m/exact:4.1f}x) | {via_mm*1e3:6.2f}  ({m/via_mm:4.1f}x) | "
-          f"{conv32*1e3:6.2f} / {conv16*1e3:5.2f}  ({m/conv32:4.1f}x/{m/conv16:4.1f}x) | {result_only*1e3:5.2f} ({m/result_only:4.1f}x) | {floor_small*1e3:5.2f} ms")
+          f"{conv32*1e3:6.2f} / {conv16*1e3:5.2f}  ({mc/conv32:4.1f}x/{mc/conv16:4.1f}x{' vs ' + str(converged) + ' ms' if converged else ''}) | {result_only*1e3:5.2f} ({m/result_only:4.1f}x) | {floor_small*1e3:5.2f} ms")

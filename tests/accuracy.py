@@ -168,7 +168,7 @@ def check_relocation(name, X, C0, steps=8, vs_sklearn=False):
     return passed
 
 
-def check_bounds(name, X, C0, steps=10, slice_rows=None, inject_at=None, rng=None):
+def check_bounds(name, X, C0, steps=10, slice_rows=None, inject_at=None, rng=None, unscreen_at=None):
     """Consecutive Lloyd steps through the per-centre bounds path (dims >= 256): the same checks as check_relocation
     at every step, plus the path must actually engage. With inject_at, unrelated centres replace the sequence at
     that step - the n_init restart - and the pass must fall back to a full evaluation and stay exact.
@@ -189,6 +189,8 @@ def check_bounds(name, X, C0, steps=10, slice_rows=None, inject_at=None, rng=Non
             C = X[rng.choice(len(X), len(C), replace=False)].copy()
         for st in core._bounds_state.values():
             st.pop("visited", None)
+            if unscreen_at is not None and step >= unscreen_at:
+                st["visited"], st["full"] = 1.0, 1.0          # as if every visit reached float32: the next pass skips the screen
         ours, _, n_empty = km.lloyd_step(parts, C)
         on_bounds += any("visited" in st for st in core._bounds_state.values())
         st = next(iter(core._bounds_state.values()))
@@ -206,6 +208,40 @@ def check_bounds(name, X, C0, steps=10, slice_rows=None, inject_at=None, rng=Non
     print(f"{'PASS' if passed else 'FAIL'}  {name:50s} {on_bounds}/{steps} steps on bounds, {empties} relocated  "
           f"center err vs float64 reference {ref_err:.1e}")
     return passed
+
+
+def check_bounds_overflow(name, rng):
+    """The float16 screen with centres a float16 cannot hold: two centres get coordinates at 1e5 and 7e4 after the
+    bounds exist, so their drift makes every row visit them; the screen must clip them, keep the clipped amount in
+    |c - c16|, and pass them to the float32 read. Labels checked against float64, screened and unscreened."""
+    mx = km._mx()
+    X = blobs(rng, 40_000, 256, 30, 3, 1)
+    parts = [mx.array(X)]
+    core._bounds_state.clear()
+    C = X[rng.choice(len(X), 64, replace=False)].copy()
+    for _ in range(20):                                     # until the bounds exist (the predictor decides when)
+        C, _, _ = km.lloyd_step(parts, C)
+        st = next(iter(core._bounds_state.values()))
+        if st["lb"] is not None:
+            break
+    ok = st["lb"] is not None
+    C2 = C.copy(); C2[0, 0] = 1e5; C2[0, 1] = 7e4               # one centre every row must now visit, past float16 twice
+    worst, saved = 0.0, core.BOUNDS_MAX_VISITED
+    core.BOUNDS_MAX_VISITED = 0.5                                # the decision under test is the screen's, not the count's
+    for forced_off in (False, True):
+        st["visited"], st["full"] = (1.0, 1.0) if forced_off else (1.0, 0.0)
+        labels = km.assign_mlx(parts, C2, return_labels=True)[3]
+        ok &= ("visited" in st) and (st.get("screened") is (not forced_off))
+        _, ref_best = reference(X, C2)
+        X64, C64 = X.astype(np.float64), C2.astype(np.float64)
+        d_lab = ((X64 - C64[labels]) ** 2).sum(1)
+        excess = d_lab / np.maximum(ref_best, 1e-300) - 1
+        worst = max(worst, float(excess.max()))
+        ok &= not (d_lab > ref_best + 8 * EPS32 * ((X64 ** 2).sum(1) + (C64[labels] ** 2).sum(1))).any()
+    core.BOUNDS_MAX_VISITED = saved
+    print(f"{'PASS' if ok else 'FAIL'}  {name:50s} bounds path {'engaged' if st['lb'] is not None else 'NOT engaged'}, "
+          f"worst label excess {worst:.1e} (screen on and off)")
+    return ok
 
 
 def blobs(rng, n, d, true_k, spread, noise):
@@ -270,6 +306,11 @@ def main():
     X = blobs(rng, 80_000, 256, 30, 10, 1)
     C0 = np.concatenate([X[rng.choice(len(X), 60, replace=False)], rng.uniform(900, 1000, (4, 256)).astype(np.float32)])
     results.append(check_bounds("bounds with relocation d256 k64", X, C0, steps=8))
+    X = blobs(rng, 60_000, 256, 40, 3, 1)                  # a column at subnormal scale; from step 5 the screen is forced off,
+    X[:, 7] *= 1e-6                                         # which covers the unscreened kernel
+    results.append(check_bounds("bounds, subnormal column, screen off from step 5 d256 k64", X,
+                                X[rng.choice(len(X), 64, replace=False)], steps=8, unscreen_at=5))
+    results.append(check_bounds_overflow("bounds screen with centre coordinates past float16", rng))
     print(f"\n{sum(results)}/{len(results)} cases passed")
     sys.exit(0 if all(results) else 1)
 
