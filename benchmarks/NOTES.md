@@ -1203,3 +1203,31 @@ pairs; the fused tiles1 assignment is exact and parity. The lever left with a me
 converged high-dimensional regime: evaluating the bounds' visited pairs as tiles, eight rows per centre read,
 against the ~120 GB of cache reads per iteration measured at 3% visited on GIST 1M.
 
+## The converged regime, mapped (September 25, 2026, AC power)
+
+Pursuing the last lever - the visited pairs of the bounds step - on GIST 1M, k=1024 in the converged regime
+(2.7-3.6% of pairs visited, about 30 per row). The step is 57.9 ms; the same rows with no visits (row read,
+own distance, bound row read and rewrite) are 13.7 ms, close to their floor; the visit phase is 44 ms of
+centre rows read from cache, 104 GB at 2.4 TB/s. Five things were then built and measured, all exact:
+
+| change | converged iteration | 20 iterations | kept |
+|---|---|---|---|
+| float16 bounds | 48-62 (unchanged) | 1.57 s | yes, for the memory |
+| four visits per trip within a 32-centre chunk | 64-74 | 1.75 | no: at 3% a chunk holds one visit, three chains redo it |
+| **float16 screen** (d(x,c) >= d(x,c16) - \|c - c16\|; 0.01% reach float32) | **46-49** | **1.41** | **yes** |
+| half4 / float4 vectorised loop | 47-52 | 1.43 | no: nothing changed |
+| visits listed per row, four in flight across the row | 50-57 | 1.51 | no: slower |
+
+After the screen the visit phase is 33 ms for 52 GB - 1.6 TB/s - and neither instruction count nor latency
+moved it, so that is the rate scattered 1.9 KB reads get from the on-chip path. Two further byte-cutters were
+measured before building: tiles of eight rows sharing each centre read do not apply at 960 dims (the row
+tiles alone are 240 registers per lane), and a prefix screen does not prune - even in variance order 85% of
+visited pairs survive a 256-dim prefix, because a visited centre is one whose bound already fell within the
+row's own distance and only the full vector at lower precision separates it (which is what the float16 screen
+does; an int8 screen would take the 0.75x again at best).
+
+`possible.py` now carries the visit traffic and puts the converged GIST iteration at about 37 ms against the
+46-49 measured. What remains there is the visited fraction itself - Elkan's bounds decaying between refreshes
+- and the rebuild threshold sweep already showed that trading rebuilds against decay is flat. A different
+bound family would be a new design, not a step.
+
