@@ -1135,3 +1135,25 @@ What would move these, in order: a batched interface for many small problems (th
 overhead: `possible.py` puts the round trip alone at 0.18 ms against a 256k x 8 read of 0.02 ms), the fast
 matmul with verified candidates (48 ms against 125 per exact GIST pass), float16 bounds in the converged regime
 (8.4 ms possible against 50-63 measured).
+
+## The fast matmul cannot carry an exact path (September 25, 2026)
+
+`possible.py` put an exact GIST pass at 48 ms on `mx.matmul`'s 41 TFLOP/s float32 against 125 on the simdgroup
+kernel, if its candidates could be verified against a rigorous error bound. Measured against float64 on
+100k GIST rows x 1024 centres, error relative to |x||c|:
+
+| product | max | p99.99 | mean |
+|---|---|---|---|
+| `mx.matmul` float32 | 8.2e-4 (7.2 x gamma_D, 6900 x eps) | 6.6e-4 | 5.3e-4 |
+| `mx.matmul` float16 in, float32 out | 5.5e-4 | 4.1e-4 | 1.3e-4 |
+| `mx.matmul` bfloat16 in | 4.1e-3 | 3.3e-3 | 1.1e-3 |
+| our simdgroup tiles kernel | 2.4e-6 (20 x eps) | 1.4e-6 | 2.7e-7 |
+| numpy float32, sequential fma | 2.4e-6 | 1.4e-6 | 2.7e-7 |
+
+The float32 matmul's mean error is 5.3e-4 - the size of rounding the inputs to 11 bits - and it is worse than
+its own float16 path. It is not IEEE float32 arithmetic, so the float32 error bound (gamma_D |x||c|) does not
+apply to it, and a candidate window sized to a measured maximum on one dataset is not a proof. An exact path
+cannot be built on it; `exact=False` is where it belongs and already is. Closed. (A three-way split of the
+inputs would recover float32-like error at three multiplies - about 100 ms against the kernel's 125 - and
+still without a bound on the unit's accumulation order.)
+
