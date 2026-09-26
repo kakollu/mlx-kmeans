@@ -205,3 +205,21 @@ our custom kernels cannot reach (38-63 TFLOP/s on large GEMMs) - and it only exi
 Below about 128 dims the matmul path is slower than a simdgroup kernel; above it, 1.2-2.6x faster in float32
 and 2-3.7x in float16. `benchmarks/possible.py` turns these into per-config bounds.
 
+## On-chip bandwidth for scattered row reads, by working set (measured September 25, 2026)
+
+The bounds step's visit pattern: one simdgroup reads a random 1.9 KB row (960 float16) lane-parallel and
+reduces it, 64 rows per simdgroup, 32k simdgroups, rows drawn from a table of the stated size with a proper
+hash. GB/s delivered:
+
+| working set | 0.1 MB | 0.5 | 0.9 | 1.4 | 1.9 | 2.8 | 3.8 | 5.6 | 7.5 | 11 | 15 | 22 | 30 | 60 | 120 | 480 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GB/s | 1200 | 1460 | 1470 | 1980 | 1830 | 1660 | 1970 | 2130 | 2540 | 2240 | 1930 | 1450 | 1300 | 1110 | 850 | 610 |
+
+Run-to-run spread is about 20% (a 1.9 MB table read at 1830 in one run and 2690 in the next). Three things
+to take from it: the pattern's ceiling is about 2.5 TB/s, reached with working sets of 4-11 MB; small tables
+are slower, not faster, because many simdgroups then hit the same lines at once; and it falls to DRAM-like
+rates only past ~100 MB, with 480 MB still at 610 GB/s because the hot rows stay resident. Row stride does
+not matter: 1920, 2048, 2176, 2304 and 2560-byte strides at 1024 rows all read at 2.6-2.7 TB/s, so there is
+no set-conflict penalty to pad away. The bounds step's visit phase (52 GB at 1.6 TB/s on GIST 1M, k=1024, a
+2 MB float16 centre table) is therefore at 65-80% of what its own access pattern can get.
+

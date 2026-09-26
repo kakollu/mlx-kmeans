@@ -1231,3 +1231,17 @@ does; an int8 screen would take the 0.75x again at best).
 - and the rebuild threshold sweep already showed that trading rebuilds against decay is flat. A different
 bound family would be a new design, not a step.
 
+## Cache use in the visit phase: measured, nothing to take (September 25, 2026)
+
+Two questions after the screen: where the 2 MB float16 centre table sits in the hierarchy, and whether row
+order could keep a row's hot centres closer. MACHINE-PROFILE now has the working-set curve for exactly this
+access pattern: the ceiling is about 2.5 TB/s at 4-11 MB, a 2 MB table reads at 1.8-2.7 TB/s depending on
+the run, and row stride makes no difference (no set conflicts to pad away). The step's visit phase runs at
+1.6 TB/s, 65-80% of that. Row order: the step on GIST 1M with rows in label-sorted order (the counting
+sort's permutation, so consecutive simdgroups work rows of the same cluster and visit the same centres) took
+45-48 ms per converged iteration against 48-50 in natural order - about 4%, inside the noise of the
+profile above. The centre table is on-chip either way, and a simdgroup's own working set (some 30 centres,
+57 KB) is far past what a core's L1 holds, so locality between neighbouring rows buys nothing. This closes
+the converged regime at 46-49 ms against a 37 ms bound: the remaining distance is the kernel's arithmetic
+between loads, not the cache.
+
