@@ -1774,26 +1774,40 @@ _BOUNDS_COUNT_SRC = _BOUNDS_HEAD.replace("STRIDE", "stride[0]").replace("LOCAL",
 
 _BOUNDS_STEP_SRC = _BOUNDS_HEAD.replace("STRIDE * i", "i").replace("LOCAL", "i") + """
     uint bl = l; float sbest = s;
-    uint nvis = 0;
+    uint nvis = 0, nfull = 0;
     for (uint w = 0; w < K; w += 32) {
         uint j = w + lane;
         float v = (j < K) ? (float)lb_in[i * K + j] - drift[j] : INFINITY;
         if (j == l) v = dl * lo;
         uint m = simd_sum((j != l && v < ub) ? (1u << lane) : 0u);
+        // A visit reads the centre from cache, and at a few percent visited that traffic is the whole cost
+        // of the pass (104 GB at 2.4 TB/s for 44 of 58 ms on GIST 1M). So a visit first reads a float16
+        // copy of the centre, half the bytes: d(x, c) >= d(x, c16) - |c - c16| by the triangle inequality,
+        // with |c - c16| precomputed per centre and rounded up, so the screen is exact and its value is a
+        // valid lower bound to keep. Only a centre that could still beat the row's own distance is read in
+        // float32.
         while (m) {
             uint t = ctz(m); m &= m - 1;
             uint cc = w + t, ci = cc * D;
             float s2 = 0;
-            for (uint c = 0; c < DPL; c++) { uint jj = lane + c * 32; float q = xv[c] - ((jj < D) ? C[ci + jj] : 0.0f); s2 += q * q; }
+            for (uint c = 0; c < DPL; c++) { uint jj = lane + c * 32; float q = xv[c] - ((jj < D) ? (float)C16[ci + jj] : 0.0f); s2 += q * q; }
             s2 = simd_sum(s2);
-            float dcc = sqrt(s2);
-            if (lane == t) v = dcc * lo;
-            if (s2 < sbest) { sbest = s2; bl = cc; ub = dcc * hi; }
+            float lbc = sqrt(s2) * lo - ec[cc];
+            if (lane == t) v = lbc;
             nvis++;
+            if (lbc < ub) {
+                s2 = 0;
+                for (uint c = 0; c < DPL; c++) { uint jj = lane + c * 32; float q = xv[c] - ((jj < D) ? C[ci + jj] : 0.0f); s2 += q * q; }
+                s2 = simd_sum(s2);
+                float dcc = sqrt(s2);
+                if (lane == t) v = dcc * lo;
+                if (s2 < sbest) { sbest = s2; bl = cc; ub = dcc * hi; }
+                nfull++;
+            }
         }
         if (j < K) lb_out[i * K + j] = HALF_DOWN(max(v, 0.0f));
     }
-    if (lane == 0) { labels[i] = bl; best_d[i] = sbest; ub_out[i] = sqrt(sbest); visited[i] = nvis; }
+    if (lane == 0) { labels[i] = bl; best_d[i] = sbest; ub_out[i] = sqrt(sbest); visited[i] = nvis | (nfull << 16); }
 """
 
 
@@ -1921,23 +1935,26 @@ def _bounds_pass(st, parts, C, k, d, accumulate):
     """One assignment pass from the stored bounds -> (totals, nearest), and the state moved to C."""
     mx = _mx()
     Cm = C_mx(C)
+    C16 = Cm.astype(mx.float16)
+    ec = np.sqrt(((C.astype(np.float64) - np.array(C16).astype(np.float64)) ** 2).sum(1)).astype(np.float32)
+    ec = mx.array(np.nextafter(ec, np.float32(np.inf)))     # |c - c16| per centre, rounded up
     drift = mx.array(_bounds_drift(C, st["C"]))
     pads = _bounds_pads(d)
-    kern = _kernel("kmeans_bounds_step", ["X", "C", "drift", "labels_in", "lb_in", "row0", "row_end", "pads"],
+    kern = _kernel("kmeans_bounds_step", ["X", "C", "C16", "ec", "drift", "labels_in", "lb_in", "row0", "row_end", "pads"],
                    ["labels", "best_d", "ub_out", "lb_out", "visited"], _BOUNDS_STEP_SRC, _HALF_DOWN)
     tot = np.zeros((k, d + 2), dtype=np.float64)
-    nearest, nvis = [], 0
+    nearest, nvis, nfull = [], 0, 0
     try:
         for pi, x in enumerate(parts):
             labs, bests, r0 = [], [], 0
             for ci, (lab, lb) in enumerate(zip(st["labels"][pi], st["lb"][pi])):
                 m = lab.shape[0]
-                lab2, best2, ub2, lb2, vis = kern(inputs=[x, Cm, drift, lab, lb, _u32(r0), _u32(r0 + m), pads],
+                lab2, best2, ub2, lb2, vis = kern(inputs=[x, Cm, C16, ec, drift, lab, lb, _u32(r0), _u32(r0 + m), pads],
                                                   template=[("D", d), ("K", k)], grid=(m * 32, 1, 1), threadgroup=(256, 1, 1),
                                                   output_shapes=[(m,), (m,), (m,), (m * k,), (m,)],
                                                   output_dtypes=[mx.uint32, mx.float32, mx.float32, mx.float16, mx.uint32])
                 mx.eval(lab2, best2, ub2, lb2)
-                nvis += int(mx.sum(vis))
+                nvis += int(mx.sum(vis & 0xffff)); nfull += int(mx.sum(vis >> 16))
                 st["labels"][pi][ci], st["ub"][pi][ci], st["lb"][pi][ci] = lab2, ub2, lb2   # in place: one chunk over, not 2x
                 labs.append(lab2); bests.append(best2)
                 r0 += m
@@ -1951,6 +1968,7 @@ def _bounds_pass(st, parts, C, k, d, accumulate):
     st["C"] = np.array(C, dtype=np.float32, copy=True)
     st["life"] = st.get("life", 0) + 1
     st["visited"] = nvis / (sum(p.shape[0] for p in parts) * k)
+    st["full"] = nfull / (sum(p.shape[0] for p in parts) * k)      # of those, the ones the float16 screen let through
     return tot, nearest
 
 
