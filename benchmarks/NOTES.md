@@ -1247,3 +1247,33 @@ own copy. 1, 2 and 4 replicas: 44-46 ms, within noise; 8 and 16: 52 and 65 ms as
 spot. Labels identical throughout. Not kept. This closes the converged regime at 46-49 ms against a 37 ms
 bound: the remaining distance is the kernel's arithmetic between loads, not the cache.
 
+## Bound freshness, measured: where the converged regime's visits come from (September 26, 2026)
+
+A design was proposed for the converged regime: give the m largest movers fresh bounds through one dense
+n x m product on the tiles kernel (~4 ms at m=32) instead of per-row visits. Its premise was measured first,
+on GIST 300k, k=1024, iterations 4-13, with the actual visited set reconstructed from the stored bounds:
+
+| | share of visits |
+|---|---|
+| the 8 largest movers | 2-5% |
+| the 32 largest movers | 7-15% |
+| the 64 largest movers | 12-21% |
+
+Visits spread over hundreds of centres; the design does not apply. The same measurement answers what the
+visits are: with fresh bounds (the exact distance at the current centres) only 0.1-0.3% of them would
+remain. 99.7% of the visit phase - 33 of 47 ms - refreshes bounds that decayed, not candidates that are
+close. Bound freshness is the lever, and the reason it is expensive is that the drift decay assumes every
+centre moved straight at the row: the exact change is d(x,c')^2 = d^2 + |dC|^2 - 2<x - c, dC>, and in 960
+dims a random direction makes <x - c, dC> about |x - c||dC|/sqrt(960), thirty times smaller than the
+Cauchy-Schwarz decay charged. Recovering it per pair is the full multiply.
+
+The one way short of that: if the drift vectors were low-rank, a projection of each row onto the drift
+subspace would make <x - c, dC> cheap for the pairs about to be visited, with the residual bounded by
+Cauchy-Schwarz. Measured, the 1024 x 960 drift matrix's energy in its top r directions: r=32 70-85%, r=64
+82-91%, r=128 92-96% (a four-iteration displacement is the same). A rank-32 correction therefore halves the
+decay (residual norm ~sqrt(0.25) of the drift), not the thirty-fold that freshness would give; the estimate
+for the converged step is ~40 ms against 47, about 1.2x, for a design that needs a rank-r factorisation of
+the drift every iteration on the GPU and a second bound representation. Not worth it. The converged regime
+stays at 46-49 ms with its reason fully measured; a genuinely different bound family is the only remaining
+door, and it is a research question, not a step.
+

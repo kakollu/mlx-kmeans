@@ -1,6 +1,6 @@
 # mlx-kmeans — project state
 
-Last updated: 2026-09-25
+Last updated: 2026-09-26
 
 ## Where it stands
 
@@ -30,9 +30,11 @@ converged-regime iteration on the bounds path, 20 iterations 3.51 -> 1.41 s. The
   What would move it: an assignment at the matrix unit's ceiling (tiles1 is at ~40%) and an accumulation
   that does not repeat it - which MACHINE-PROFILE's occupancy table rules out in threadgroup memory above
   k x (dims+2) of a few hundred floats.
-- The converged high-dimensional regime is 46-49 ms against a ~37 ms bound; the rest is arithmetic between
-  loads in the visit loop. The visited fraction (3%) is Elkan's bound quality; a different bound family is a
-  new design.
+- The converged high-dimensional regime is 46-49 ms against a ~37 ms bound. 99.7% of its visits refresh bounds
+  that decayed rather than test close centres (NOTES, "Bound freshness, measured"); the largest movers get
+  only 7-15% of visits, and the drift matrix is only moderately low-rank (r=32: 70-85% energy), so a
+  low-rank correction is worth ~1.2x for an SVD in the loop. A different bound family is a research
+  question, not a step.
 - `mx.matmul` is not float32 arithmetic (8e-4 |x||c| error); no exact path can be built on it. Closed.
 - No batched interface for many small problems (PQ codebooks); no fit-to-tolerance config in the suite;
   small data (< a few hundred thousand rows) pays the 0.18 ms round trip per iteration.
