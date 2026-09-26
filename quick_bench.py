@@ -31,14 +31,36 @@ def machine():
     return chip, int(cores), mem, gpu
 
 
-def timed(fn, reps=3):
-    fn()
+def timed(fn, reps=5, warm_s=0.3):
+    """Median of reps after warming for at least warm_s: millisecond kernels measured after one call read up to
+    2x slow while the GPU clock is still ramping (1.1-2.0 ms for the same 1M x 8 pass, measured)."""
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < warm_s:
+        fn()
     ts = []
     for _ in range(reps):
         t = time.perf_counter()
         fn()
         ts.append(time.perf_counter() - t)
     return float(np.median(ts))
+
+
+_STREAM_SRC = """
+    uint i = thread_position_in_grid.x, T = threads_per_grid.x;
+    float s = 0.0f;
+    for (uint j = i; j < N; j += T) s += X[j];
+    out[i] = s;
+"""
+
+
+def stream_rate(mx, x):
+    """Bytes per second of a plain streaming read of x by a custom kernel - the rate a pass's floor is built on.
+    mx.sum reports a reduction rate instead, 265 against 490 GB/s on an M5 Max."""
+    kern = mx.fast.metal_kernel(name="stream_read", input_names=["X"], output_names=["out"], source=_STREAM_SRC)
+    threads = 1 << 18
+    run = lambda: mx.eval(kern(inputs=[x], template=[("N", x.size)], grid=(threads, 1, 1), threadgroup=(256, 1, 1),
+                                output_shapes=[(threads,)], output_dtypes=[mx.float32])[0])
+    return x.size * 4 / timed(run)
 
 
 def main():
@@ -54,8 +76,8 @@ def main():
     x = mx.zeros((250_000_000 if budget_gb > 16 else 50_000_000,), dtype=mx.float32)
     mx.eval(x)
     gb = x.size * 4 / 1e9
-    bw = gb / timed(lambda: mx.eval(mx.sum(x)))
-    print(f"memory read bandwidth: {bw:.0f} GB/s ({gb:.1f} GB in {gb/bw*1000:.1f} ms)\n")
+    bw = stream_rate(mx, x) / 1e9
+    print(f"memory read bandwidth: {bw:.0f} GB/s streaming ({gb:.1f} GB in {gb/bw*1000:.1f} ms)\n")
     del x
     mx.clear_cache()
 
