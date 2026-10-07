@@ -507,6 +507,9 @@ TILES_MIN_K = 64                        # ...and the k from which tiles beats pa
                                         # by a lot at high dims - 960 dims, k=32: pairs 36.6 ms vs tiles 51.8 ms)
 TILE_THREADGROUP = 512                  # threads per threadgroup in the tiles path (measured best)
 DIST_BYTES = 512 << 20                  # largest (rows x k) float32 distance chunk in the pairs path
+MASK_BYTES = 512 << 20                  # largest cascade pruning mask per launch: one bit per (row, centre), so
+                                        # rows x k/8 bytes; at k = 65,536 a 1M-row slice needs 8 GB and its word count
+                                        # passes MLX's 32-bit shape limit (an abort, not an exception). Rows go in chunks.
 BOUNDS_MIN_DIMS = 256                   # per-centre bounds: below this the bound traffic costs more than the multiply it saves
 BOUNDS_MAX_DIMS = 2048                  # the step kernel holds a row in registers, D/32 per lane
 BOUNDS_MAX_BYTES = 16 << 30             # n x k float16 lower bounds, plus one DIST_BYTES chunk while it is rewritten
@@ -1222,24 +1225,33 @@ def _cascade_nearest(x, Cm, C, Xm, order, prev, n, k, d, m):
     labels, best = [], []
     surv = 0.0
     if whole:
-        ub = dist(inputs=[x, Cm, prev, _u32(0)], template=[("D", d)], grid=(whole, 1, 1),
-                  threadgroup=(64, 1, 1), output_shapes=[(whole,)], output_dtypes=[mx.float32])[0]
         k1 = _kernel(f"kmeans_cascade_mask_{m}", ["Xm", "Ct", "csq", "ub", "row0", "gamma"],
                      ["mask", "nsurv"], _CASCADE_MASK_SRC)
-        mask, nsurv = k1(inputs=[Xm, mx.array(Ctp), mx.array(csq), ub, _u32(0), gamma],
-                         template=[("M", m), ("MP", mp), ("K", k), ("KP", kp),
-                                   ("SGPG", TILES1_SIMDGROUPS)],
-                         grid=((whole // 16) * 32, 1, 1), threadgroup=(TILES1_SIMDGROUPS * 32, 1, 1),
-                         output_shapes=[(whole * (kp // 32),), (whole,)],
-                         output_dtypes=[mx.uint32, mx.uint32])
         k2 = _kernel(f"kmeans_cascade_score_{d}", ["X", "C", "mask", "row0"], ["labels", "best_d"],
                      _CASCADE_SCORE_SRC)
-        lab, bst = k2(inputs=[x, Cm, mask, _u32(0)], template=[("D", d), ("KP", kp)],
-                      grid=(whole * 32, 1, 1), threadgroup=(256, 1, 1),
-                      output_shapes=[(whole,), (whole,)], output_dtypes=[mx.uint32, mx.float32])
-        labels.append(lab)
-        best.append(bst)
-        surv = float(mx.sum(nsurv)) / (whole * k)
+        Ct_mx, csq_mx = mx.array(Ctp), mx.array(csq)
+        step = max(16, MASK_BYTES // (4 * (kp // 32)) // 16 * 16)      # rows per launch, a multiple of 16
+        survivors = 0
+        for r0 in range(0, whole, step):
+            rows = min(step, whole - r0)
+            ub = dist(inputs=[x, Cm, prev[r0:r0 + rows], _u32(r0)], template=[("D", d)], grid=(rows, 1, 1),
+                      threadgroup=(64, 1, 1), output_shapes=[(rows,)], output_dtypes=[mx.float32])[0]
+            mask, nsurv = k1(inputs=[Xm, Ct_mx, csq_mx, ub, _u32(r0), gamma],
+                             template=[("M", m), ("MP", mp), ("K", k), ("KP", kp),
+                                       ("SGPG", TILES1_SIMDGROUPS)],
+                             grid=((rows // 16) * 32, 1, 1), threadgroup=(TILES1_SIMDGROUPS * 32, 1, 1),
+                             output_shapes=[(rows * (kp // 32),), (rows,)],
+                             output_dtypes=[mx.uint32, mx.uint32])
+            lab, bst = k2(inputs=[x, Cm, mask, _u32(r0)], template=[("D", d), ("KP", kp)],
+                          grid=(rows * 32, 1, 1), threadgroup=(256, 1, 1),
+                          output_shapes=[(rows,), (rows,)], output_dtypes=[mx.uint32, mx.float32])
+            labels.append(lab)
+            best.append(bst)
+            if whole > step:
+                mx.eval(lab, bst)              # the labels hold this chunk's mask: free it before the next chunk
+            # the survivor count runs past 2^32 at large rows x k, and MLX sums uint32 in uint32: sum in 64 bits
+            survivors += int(mx.sum(nsurv.astype(mx.uint64)).item())
+        surv = survivors / (whole * k)
     if whole < n:
         lab, bst = _rows_kernel(x, Cm, whole, n - whole, k, d)
         labels.append(lab)

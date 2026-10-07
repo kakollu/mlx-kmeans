@@ -1277,3 +1277,23 @@ the drift every iteration on the GPU and a second bound representation. Not wort
 stays at 46-49 ms with its reason fully measured; a genuinely different bound family is the only remaining
 door, and it is a research question, not a step.
 
+
+## The cascade at large k: an abort, fixed by chunking rows (October 6, 2026)
+
+Found by mlx-vsearch training an IVF coarse quantizer: `lloyd_step` with k = 65,536 on a 1.2M-row slice (128 dims, so
+the cascade path) aborted the whole process - `libc++abi: terminating due to uncaught exception of type
+nanobind::python_error: OverflowError: Integer value 2457600000 is outside the supported range`. The cascade's pruning
+mask is one bit per (row, centre), so `_cascade_nearest` launched its mask kernel with an output of rows x kp/32
+words: 1.2M x 2,048 = 2.46e9, past MLX's 32-bit shape limit; MLX raises inside a C++ callback, which terminates
+instead of throwing. Below the limit the same mask was still large: 1M rows at k = 65,536 is 8 GB.
+
+Fix: the cascade now runs in row chunks under `MASK_BYTES` (512 MB, as `DIST_BYTES`), each chunk's labels evaluated
+before the next so one mask is alive at a time (the kernels already took a row offset; a single chunk runs exactly
+as before). A second overflow on the way: the survivor count was `mx.sum` over uint32, which MLX keeps in uint32
+(3 x 2e9 sums to 1.7e9), so the survivor fraction that decides whether to keep offering the path was wrong at large
+rows x k; it is now summed in uint64.
+
+Checked: `tests/large_k.py` (k = 65,536 on 1.2M x 128) passes - the cascade 8.8 s, tiles 7.9 s, 2 labels differ, both
+float32 ties in float64, inertia within 3e-9 - and aborts with exit code 134 on the previous commit. `tests/accuracy.py`
+gains "anisotropic d128 k256, cascade in 75 chunks" (23/23 pass); `tests/reuse.py` passes. SIFT1M k = 1,024 (mask
+128 MB, one chunk): 22.8 ms per assignment pass before and after.

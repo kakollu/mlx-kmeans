@@ -1,8 +1,13 @@
 # mlx-kmeans — project state
 
-Last updated: 2026-09-26
+Last updated: 2026-10-06
 
 ## Where it stands
+
+2026-10-06: a fix while paused. The cascade aborted the process at large k (k = 65,536 on a 1.2M-row slice:
+its pruning mask passed MLX's 32-bit shape limit); it now runs in row chunks under `MASK_BYTES`, and its survivor
+count is summed in uint64. `tests/large_k.py` added. Details: `benchmarks/NOTES.md`, "The cascade at large k".
+
 
 Exact, deterministic k-means on Apple Silicon GPUs via MLX and custom Metal kernels. `main` on
 `kakollu/mlx-kmeans` is at the September 25 push (`a51fe01`); commits after it are local (see `git log

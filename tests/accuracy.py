@@ -51,10 +51,12 @@ def reference(X, C, chunk_terms=20_000_000):
     return best_c, best_d
 
 
-def check(name, X, C, slice_rows=None, dist_bytes=None):
+def check(name, X, C, slice_rows=None, dist_bytes=None, mask_bytes=None):
     km.core.SLICE_ROWS = slice_rows or 100_000_000
     if dist_bytes:
         km.core.DIST_BYTES = dist_bytes
+    if mask_bytes:
+        km.core.MASK_BYTES = mask_bytes
     mx = km._mx()
     per = km.slice_rows(X.shape[1])
     parts = [mx.array(X[s:s + per]) for s in range(0, len(X), per)]
@@ -99,7 +101,7 @@ def check(name, X, C, slice_rows=None, dist_bytes=None):
         print(f"{'PASS' if passed else 'FAIL'}  {name:36s} {method + '/' + accumulate:13s}  wrong labels {bad}  "
               f"(float32-level ties {strict - bad})  counts {'ok' if np.array_equal(counts, ref_counts) else 'MISMATCH'}  "
               f"center err {center_err:.1e}  inertia err {inertia_err:.1e}")
-    km.core.SLICE_ROWS, km.core.DIST_BYTES = 100_000_000, 512 << 20
+    km.core.SLICE_ROWS, km.core.DIST_BYTES, km.core.MASK_BYTES = 100_000_000, 512 << 20, 512 << 20
     return ok
 
 
@@ -273,6 +275,9 @@ def main():
     X = blobs(rng, 120_000, 128, 64, 4, 1)                 # anisotropic: the cascade's prefix bites here
     X *= np.linspace(8.0, 0.05, 128).astype(np.float32)    # variance concentrated in the leading dims
     results.append(check("anisotropic d128 k256", X, X[rng.choice(len(X), 256, replace=False)]))
+    # the cascade in row chunks (a mask budget of 1,600 rows: 75 launches), as at large k where one launch would not fit
+    results.append(check("anisotropic d128 k256, cascade in 75 chunks", X, X[rng.choice(len(X), 256, replace=False)],
+                         mask_bytes=4 * (256 // 32) * 1600))
     X = blobs(rng, 20_000, 960, 50, 1, 1)                  # GIST-like dims
     results.append(check("high dims d960 k304", X, X[rng.choice(len(X), 304, replace=False)]))
     X = blobs(rng, 60_000, 64, 64, 1, 1)                   # overlapping at 64 dims: near-ties for the tiles path
