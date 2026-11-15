@@ -37,10 +37,20 @@ class KMeans:
 
     X may be anything array-like - a NumPy array, a pandas DataFrame, a list of rows - or, for data larger than one
     GPU buffer, a list of MLX arrays of at most ~100M rows each.
+
+    algorithm="emeans" (opt-in, approximate) fits the centres with e-means instead (arXiv:2611.09501; see
+    docs/e-means.md and mlx_kmeans/emeans.py): mini-batch k-means with moving averages, run for a fixed number
+    of `epochs` with the batch size and step from the paper's scaling laws (`batch_size` overrides the law),
+    seeded with k random rows. Its centres are not a fixed point of Lloyd's iteration. labels_ and inertia_ still
+    come from the same final pass over the returned centres as Lloyd's (exact, or the matmul one with
+    exact=False); n_iter_ is the epoch count;
+    max_iter and tol do not apply; emeans_record_ holds the run's record (batch size, step, losses, timings).
+    exact=False makes its batch assignment the matmul one as well. spherical=True and accumulate="atomic" are
+    not offered with it. The default, algorithm="lloyd", is the exact algorithm above and is unchanged.
     """
 
     def __init__(self, n_clusters=8, n_init=1, max_iter=300, tol=1e-4, random_state=None, verbose=False,
-                 spherical=False, accumulate="auto", exact=True):
+                 spherical=False, accumulate="auto", exact=True, algorithm="lloyd", epochs=3, batch_size=None):
         self.n_clusters = n_clusters
         self.n_init = n_init
         self.max_iter = max_iter
@@ -50,6 +60,9 @@ class KMeans:
         self.spherical = spherical
         self.accumulate = accumulate
         self.exact = exact
+        self.algorithm = algorithm
+        self.epochs = epochs
+        self.batch_size = batch_size
 
     @property
     def _method(self):
@@ -136,6 +149,34 @@ class KMeans:
             prev = inertia
         return C, inertia, it + 1
 
+    # e-means takes its own deterministic accumulators; "sorted" maps to the same segment kernels planned on the GPU.
+    _EMEANS_ACCUMULATE = {"auto": "auto", "lanes": "lanes", "blocks": "blocks", "sorted": "segments"}
+
+    def _check_emeans(self):
+        algorithm = getattr(self, "algorithm", "lloyd")      # an estimator pickled before the option existed
+        if algorithm not in ("lloyd", "emeans"):
+            raise ValueError(f"algorithm must be 'lloyd' or 'emeans', got {algorithm!r}")
+        if algorithm != "emeans":
+            return
+        if isinstance(self.epochs, bool) or not isinstance(self.epochs, (int, np.integer)) or self.epochs < 1:
+            raise ValueError("epochs must be a positive integer")
+        if self.batch_size is not None and (isinstance(self.batch_size, bool) or
+                                            not isinstance(self.batch_size, (int, np.integer)) or self.batch_size < 1):
+            raise ValueError("batch_size must be None or a positive integer")
+        if self.spherical:
+            raise ValueError("spherical=True is not offered with algorithm='emeans'")
+        if self.accumulate not in self._EMEANS_ACCUMULATE:
+            raise ValueError(f"accumulate={self.accumulate!r} is not offered with algorithm='emeans' "
+                             f"(use one of {sorted(self._EMEANS_ACCUMULATE)})")
+
+    def _one_run_emeans(self, parts, rows, seed):
+        from . import emeans
+        if self.batch_size is not None and self.batch_size > rows:
+            raise ValueError(f"batch_size ({self.batch_size}) cannot exceed the number of rows ({rows})")
+        return emeans.emeans_fit(parts, self.n_clusters, epochs=self.epochs, seed=seed, batch_size=self.batch_size,
+                                 assign="exact" if self.exact else "approx",
+                                 accumulate=self._EMEANS_ACCUMULATE[self.accumulate], verbose=self.verbose)
+
     def fit(self, X, y=None):
         for name in ['n_clusters', 'n_init', 'max_iter']:
             value = getattr(self, name)
@@ -143,23 +184,34 @@ class KMeans:
                 raise ValueError(f'{name} must be a positive integer')
         if not np.isfinite(self.tol) or self.tol < 0:
             raise ValueError('tol must be finite and nonnegative')
+        self._check_emeans()
         parts = self._parts(X)
         rows = sum(p.shape[0] for p in parts)
         if rows < self.n_clusters:
             raise ValueError('n_clusters cannot exceed the number of rows')
+        emeans = getattr(self, "algorithm", "lloyd") == "emeans"
         best = None
         for run in range(self.n_init):                  # restarts reuse the data already on the GPU
             seed = None if self.random_state is None else self.random_state + run
-            C, inertia, iters = self._one_run(parts, rows, seed)
+            if emeans:
+                C, record = self._one_run_emeans(parts, rows, seed)
+                iters = self.epochs
+            else:
+                C, inertia, iters = self._one_run(parts, rows, seed)
             # A Lloyd step reports inertia before its center update. Score the final centers so restarts,
             # labels_, and inertia_ all describe the same fitted model.
             _, _, inertia, labels = core.assign_mlx(parts, C, method=self._method, return_labels=True,
                                                     accumulate=self.accumulate)
+            if emeans and not np.isfinite(inertia):
+                self._explain_nonfinite(parts)
             if self.verbose and self.n_init > 1:
-                print(f"start {run + 1}/{self.n_init}: inertia {inertia:.6e} after {iters} iterations")
+                print(f"start {run + 1}/{self.n_init}: inertia {inertia:.6e} after {iters} "
+                      f"{'epochs' if emeans else 'iterations'}")
             if best is None or inertia < best[1]:
-                best = (C, inertia, iters, labels)
-        self.cluster_centers_, self.inertia_, self.n_iter_, self.labels_ = best
+                best = (C, inertia, iters, labels) + ((record,) if emeans else ())
+        self.cluster_centers_, self.inertia_, self.n_iter_, self.labels_ = best[:4]
+        if emeans:
+            self.emeans_record_ = best[4]
         return self
 
     def predict(self, X):

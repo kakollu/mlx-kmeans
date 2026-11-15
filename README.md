@@ -388,7 +388,8 @@ the Metal kernels. Benchmark initialization, full fitting, and individual passes
 
 ```python
 KMeans(n_clusters=8, n_init=1, max_iter=300, tol=1e-4, random_state=None,
-       verbose=False, spherical=False, accumulate="auto", exact=True)
+       verbose=False, spherical=False, accumulate="auto", exact=True,
+       algorithm="lloyd", epochs=3, batch_size=None)
   .fit(X) / .predict(X) / .fit_predict(X)
   .cluster_centers_  .labels_  .inertia_  .n_iter_
   KMeans.from_centers(centers)        # a fitted model from centers you saved
@@ -431,6 +432,19 @@ default.
 
 For very large runs, `python3 -m mlx_kmeans --rows 1_000_000_000 --dims 8 --k 16` generates and clusters data without
 materialising it in NumPy first.
+
+### e-means (approximate, opt-in)
+
+`KMeans(algorithm="emeans", epochs=3)` fits the centres with e-means (arXiv:2611.09501): mini-batch k-means with
+moving averages, for a fixed number of epochs, with the batch size and step taken from the paper's scaling laws. It is
+approximate: its centres are not a fixed point of Lloyd's iteration, and it is off unless you ask for it. Exact Lloyd
+stays the default and the reference. `labels_` and `inertia_` still come from the same final pass over the returned
+centres as Lloyd's (exact, or the matmul pass with `exact=False`). First measurements (2026-11-14, M5 Max, 1M rows, SIFT
+k = 1,024-65,536 and GIST k = 1,024): at three epochs its training loss was 0.04-1.1% below that of our exact Lloyd from
+k-means++ (the default) at its tolerance stop, in between a third and a ninth of that run's time (seeding included). On
+GIST its held-out error was higher than Lloyd's at every epoch count tried (`benchmarks/NOTES.md`, "e-means, first
+measurements"; harness `emeans_bench.py`). The method in our own words, the choices made where the paper is silent, the GPU design, and what is and is not tested are in
+[docs/e-means.md](docs/e-means.md).
 
 ## License
 

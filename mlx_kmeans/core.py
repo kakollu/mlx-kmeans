@@ -1375,6 +1375,16 @@ def _lanes_src(u, dpl):
 
 
 def _accumulate_lanes(x, labels, best, k):
+    total, total_comp = _lanes_totals(x, labels, best, k)
+    return (_host(total, np.float64) + _host(total_comp, np.float64)).reshape(k, x.shape[1] + 2)
+
+
+def _lanes_totals(x, labels, best, k):
+    """The lanes accumulation up to its last kernel -> (total, total_comp) as MLX float32 arrays of k*(d+2).
+
+    Nothing is read back, so a caller can keep the totals on the GPU (e-means does, batch after batch);
+    _accumulate_lanes adds the two on the host in float64, as it always did.
+    """
     mx = _mx()
     n, d = x.shape
     w, kw = d + 2, k * (d + 2)
@@ -1391,7 +1401,7 @@ def _accumulate_lanes(x, labels, best, k):
     total, total_comp = red(inputs=[sums, comp, _u32(nb)], template=[("KW", kw)],
                             grid=(kw, 1, 1), threadgroup=(64, 1, 1),
                             output_shapes=[(kw,), (kw,)], output_dtypes=[mx.float32, mx.float32])
-    return (_host(total, np.float64) + _host(total_comp, np.float64)).reshape(k, w)
+    return total, total_comp
 
 
 def _accumulate_atomic(x, labels, best, k):
@@ -1432,6 +1442,12 @@ def _accumulate_sorted(x, labels, best, k):
 
 
 def _accumulate_blocks(x, labels, best, k):
+    total, total_comp = _blocks_totals(x, labels, best, k)
+    return (_host(total, np.float64) + _host(total_comp, np.float64)).reshape(k, x.shape[1] + 2)
+
+
+def _blocks_totals(x, labels, best, k):
+    """The blocks accumulation up to its last kernel -> (total, total_comp) as MLX float32 arrays of k*(d+2)."""
     mx = _mx()
     n, d = x.shape
     w = d + 2
@@ -1447,7 +1463,7 @@ def _accumulate_blocks(x, labels, best, k):
     total, total_comp = red(inputs=[sums, comp, _u32(nb)], template=[("KW", k * w)],
                             grid=(k * w, 1, 1), threadgroup=(64, 1, 1),
                             output_shapes=[(k * w,), (k * w,)], output_dtypes=[mx.float32, mx.float32])
-    return (_host(total, np.float64) + _host(total_comp, np.float64)).reshape(k, w)
+    return total, total_comp
 
 
 # Assigning and accumulating in one kernel. The two-kernel form reads X twice and every row does a
@@ -1633,6 +1649,14 @@ def _onehot_plan(n, d, k):
 def _onehot_pass(x, Cm, k, plan):
     """Assignment and accumulation in one read of X -> (totals (k, d+2) float64, labels, best)."""
     mx = _mx()
+    total, comp, labels, best = _onehot_totals(x, Cm, k, plan)
+    mx.eval(labels, best)
+    return (_host(total, np.float64) + _host(comp, np.float64)).reshape(k, x.shape[1] + 2), labels, best
+
+
+def _onehot_totals(x, Cm, k, plan):
+    """The one-hot fused pass up to its last kernel -> (total, comp, labels, best) as MLX arrays, nothing read back."""
+    mx = _mx()
     n, d = x.shape
     sgt, skip = plan
     td, wb = d % 8, d // 8 + 1
@@ -1648,8 +1672,7 @@ def _onehot_pass(x, Cm, k, plan):
     total, comp = red(inputs=[part], template=[("D", d), ("K", k), ("W", w), ("WPAD", wpad), ("NSG", nsg)],
                       grid=(-(-w // 32) * 32, k, 1), threadgroup=(32, 1, 1),
                       output_shapes=[(k * w,), (k * w,)], output_dtypes=[mx.float32, mx.float32])
-    mx.eval(labels, best)
-    return (_host(total, np.float64) + _host(comp, np.float64)).reshape(k, w), labels, best
+    return total, comp, labels, best
 
 
 _tiles1_slow = {}          # datasets whose error window is too wide for the one-pass path to pay off
