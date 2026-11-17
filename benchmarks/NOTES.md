@@ -1301,20 +1301,23 @@ gains "anisotropic d128 k256, cascade in 75 chunks" (23/23 pass); `tests/reuse.p
 ## e-means, first measurements (2026-11-14)
 
 `KMeans(algorithm="emeans")` (docs/e-means.md: the paper's method from its text, opt-in, approximate) timed in one
-GPU window, 15:16-15:42, by `emeans_bench.py` (repo root). Framing as bench_ann.py: wall time to a
+GPU window on 2026-11-14 (rows stamped 15:16:40 to 15:40:55), by `emeans_bench.py` (repo root). Framing as bench_ann.py: wall time to a
 finished set of centres, inertia of those centres by our exact pass for every method, held-out MSE on the dataset's
 query vectors (SIFT 10,000, GIST 1,000), recall@10 through a FAISS IVF index built from the centres (seed 0 only).
-`L#` is a line of `benchmarks/emeans_results.jsonl` (61 rows); the per-shape tables, with two reviews applied, are
-summarised below and in docs/e-means.md. Conditions: AC power, High Power mode
-throughout (no change in the window; nothing here pools with times taken before 2026-11-13 08:25, Automatic); commit
-9edfbe9 plus the uncommitted e-means work; other processes running the whole time (archive copies with hashing, a
-download, a verify job), 80-542% summed `ps` CPU at run starts, load average 2.9-9.5. e-means wall does not follow
+`L#` is a line of `benchmarks/emeans_results.jsonl` (L1-L61 here; L62-L74 are the FAISS default rows in the
+addendum below); the per-shape tables, with two reviews applied, are summarised below and in docs/e-means.md. Conditions: AC power
+(each row's `power` field), High Power mode throughout (power mode 2 in the session's run log at the start of each
+shape's run; that log is not in the repo and the rows do not record the mode; nothing here pools with times taken
+before 2026-11-13 08:25, Automatic); commit 9edfbe9 plus the uncommitted e-means work; other processes running the
+whole time (archive copies with hashing, a download, a verify job), 80-542% summed `ps` CPU at run starts (the rows'
+`other_cpu`). e-means wall does not follow
 that load within a T (GIST T=5: 312 / 314 / 540% gave 0.970 / 1.040 / 0.978 s, L31-L33); the FAISS times (CPU) are
 upper bounds. Every timed run starts with the per-dataset caches cleared, so every time is a cold fit. Lloyd "to
 convergence" is relative change <= 1e-4 per step; every Lloyd curve was still falling at its stop (last step
 7.6e-5 to 9.9e-5).
 
-Gates, before any timing: the core.py refactor for e-means (three accumulation helpers became wrappers) is
+Gates, before any timing (figures from the test runs' printed output, which is not stored in the repo): the core.py
+refactor for e-means (three accumulation helpers became wrappers) is
 bit-identical to 9edfbe9 on six configurations; accuracy.py 23/23; reuse.py passes; large_k.py passes (k = 65,536 on
 1.2M x 128: cascade 8.7 s, tiles 7.9 s, 2 labels differ, both float32 ties). tests/emeans.py read 70/71 on its
 first GPU run: the `N` part of the one-step check divided each cluster's error by the mean `N`, and on the
@@ -1327,12 +1330,12 @@ Training loss is e-means over our Lloyd from k-means++ to convergence; e-means a
 
 | 1M rows | e-means T=3 wall | Training loss | Our Lloyd to tol: k-means++; random start | Query MSE | recall@10 np 8: e-means seed 0; k-means++ Lloyd; random | Rows |
 |---|---|---|---|---|---|---|
-| SIFT, k=1,024 | 0.12-0.13 s | 0.99955-0.99964 | 0.83 s, 34 it; 0.75 s, 33 it | 0.9982-0.9994 | 84.94; 84.89; 85.01% | L7-L9, L16, L18 |
+| SIFT, k=1,024 | 0.12-0.13 s | 0.99955-0.99964 | 0.83 s, 34 it; 0.75 s, 33 it | 0.9982-0.9993 | 84.94; 84.89; 85.01% | L7-L9, L16, L18 |
 | GIST, k=1,024 | 0.62-0.67 s | 0.9963-0.9964 | 2.44 s, 31 it; 1.96 s, 27 it | 1.0088-1.0206 | 66.20; 68.48; 65.59% | L28-L30, L37, L39 |
 | SIFT, k=16,384 | 1.53-1.54 s | 0.9991-0.9994 | 14.50 s, 26 it (7.33 s k-means++); 7.60 s, 27 it | 0.9956-0.9964 | 61.30; 61.98; 61.41% | L47-L48, L51, L53 |
 | SIFT, k=65,536 | 6.21 s | 0.9893 | 44.90 s, 18 it (28.02 s k-means++); 16.38 s, 17 it | 0.9869 | 54.23; 57.02; 54.26% | L59-L61 |
 
-- **Training loss against time.** Read with compare.py's rule (the first Lloyd iterate at or below the e-means
+- **Training loss against time.** Read with the rule in `emeans_bench.py`'s summary (the first Lloyd iterate at or below the e-means
   loss, at the time those centres were in hand, k-means++ init included), e-means reached each of its losses first
   on every shape and T where Lloyd reached it at all, except k = 65,536, T = 1: random-start Lloyd 2 iterations,
   3.07 s, against e-means 3.32 s (L57, L61). Where Lloyd stopped above the e-means loss (T >= 3 on SIFT; GIST T >= 2
@@ -1340,11 +1343,12 @@ Training loss is e-means over our Lloyd from k-means++ to convergence; e-means a
   T = 10 against random start, which is level (1.86-1.90 s against 1.96 s, about 0.07 s of it the run-order effect
   below). The smallest gap between an e-means loss and any Lloyd curve point is 3.1e-6 relative (L29 against L39),
   and the curve's `lloyd_step` inertia and the exact score agree to 1.6e-8, so no hit depends on the metric.
-- **Held-out error does not follow everywhere.** GIST: query MSE above both Lloyd runs at every T, 1.0026-1.0343 of
+- **Held-out error does not follow everywhere.** GIST: query MSE above both Lloyd runs at every T, 1.0026-1.0342 of
   k-means++ Lloyd's while random-start Lloyd sat at 0.9979 (L22-L39); recall@10 at nprobe 8 63.83-66.65%, against
-  68.48% and 65.59%. SIFT k = 1,024: held-out ratio within 0.2% of the training ratio at T >= 2. SIFT k = 16,384 and
-  65,536: query MSE below k-means++ Lloyd's from T = 2 (0.9962-0.9975, 0.9870) while training was still above it at
-  T = 2 (1.0061, 1.0053); k-means++ Lloyd's train-to-query gap is wider (9,117 per point at k = 65,536, against
+  68.48% and 65.59%. SIFT k = 1,024: held-out ratio within 0.2% of the training ratio at T >= 2 (0.27-0.33% below it
+  at T = 1). Query MSE below k-means++ Lloyd's from T = 2 at k = 16,384 (0.9962-0.9975 at T = 2; 1.0041-1.0086 at
+  T = 1) and from T = 1 at k = 65,536 (0.9984 at T = 1, 0.9870 at T = 2, L57-L58), while training was still above it
+  at T = 2 (1.0061-1.0062, 1.0053); k-means++ Lloyd's train-to-query gap is wider (9,117 per point at k = 65,536, against
   8,673 for random start and 6,823-8,925 for e-means, L57-L61; at k = 16,384 3,607 against 3,477 and 2,323-3,478 at
   e-means T <= 3, but 3,686-3,749 at T = 5, where e-means' held-out ratio is above its training ratio). Recall at k = 65,536 did not follow the
   query MSE: 53.55 / 54.23% at T = 2 / 3 against 57.02% for k-means++ Lloyd (one seed).
@@ -1353,33 +1357,42 @@ Training loss is e-means over our Lloyd from k-means++ to convergence; e-means a
   1-2 (T = 2: 0.9979-0.9992 and 0.9985-0.9998); SIFT k = 65,536 1-2 against random-start Lloyd's stop at 17 it (no
   @25 row; 1.0073, 0.9958); SIFT k = 1,024 2-3 against ours (T = 2 median 1.00013, T = 3 0.99825-0.99938) and 1-2
   against FAISS (T = 2: 0.99797-0.99915), beside the paper's Table 10 value of 2.0 for SIFT at n/k = 1000; GIST not
-  reached by T = 10 (1.0045-1.0260 at T = 10, L34-L36; GIST1M is not one of the paper's datasets). On training loss against the
-  same baselines: SIFT k = 1,024 1-2, GIST 3-5, SIFT k = 16,384 and 65,536 2-3.
+  reached by T = 10 (1.0045-1.0259 at T = 10, L34-L36; GIST1M is not one of the paper's datasets). On training loss against the
+  same baselines: SIFT k = 1,024 1-2, GIST 3-5 (every seed against FAISS, 1.0003-1.0004 at T = 3; on the median
+  against ours, where seed 1 was already 3e-6 below at T = 3, L29), SIFT k = 16,384 and 65,536 2-3.
 - **Against the 2026-09-18 record above** ("the approximate to go faster tools lose here"). The scoring is the same
   (FAISS default 5.098748e10 then and now, L20; FAISS all rows 5.055848e10, L21). Every SIFT k = 1,024 e-means run,
   from T = 1 up, ended below FAISS default and below that record's MiniBatchKMeans (5.112828e10) on training loss;
   worst 5.089028e10 (L1). Times are not compared: that record is Automatic mode on older code (its 2.09 s for our
   Lloyd to convergence against L16's 0.83 s is not a speedup claim either).
-- **Per batch.** An e-means batch costs about one Lloyd pass without pruning state over the same rows: against
+- **Per batch.** Per row: e-means' `timings.train_s` less both permutation waits (`permutation_first_wait_s`,
+  `permutation_wait_s`), divided by its M x B batch rows, against a Lloyd step divided by the 1M rows (without
+  taking the waits out, SIFT k = 1,024 reads 1.10-2.68x against the first pass). An e-means batch costs about one
+  Lloyd pass without pruning state over the same rows: against
   k-means++ Lloyd's first pass 1.04-2.11x (SIFT k = 1,024), 1.00-1.17x (GIST), 0.98-1.40x (k = 16,384), 1.21-1.92x
   (65,536); against its median step 1.30-2.65x, 3.83-4.51x, 1.87-2.67x, 2.36-3.75x. Lloyd's later passes prune (the
   cascade at 128-256 dims, `core.py:1204`; per-centre bounds at 256-2048 dims, `core.py:1734`); batches cannot, since
-  that state is about the whole dataset. Lloyd's first three steps build it: 193 / 214 / 281 ms then a 50.2 ms
-  median on GIST (L37), 1,727 / 962 / 907 then 887 ms at k = 65,536 (L60), inside every cold Lloyd time above. The
-  wall-time difference comes from T reads of the data against Lloyd's 17-34.
+  that state is about the whole dataset. Lloyd's first three steps build it: 193 / 213 / 281 ms, then a 50.1 ms
+  median over all 31 steps (49.8 ms over steps 4 on), on GIST (L37); 1,727 / 962 / 907 ms, then an 887 ms median over
+  all steps, at k = 65,536 (L60); inside every cold Lloyd time above. Lloyd ran 17-34 iterations to its stop where
+  e-means read the data T times; Lloyd's time also includes its seeding (k-means++ 9.0%, 13.8%, 50.6% and 62.4% of
+  k-means++ Lloyd's time: SIFT k = 1,024, GIST, k = 16,384, 65,536), and an e-means batch costs 1.30-4.51x a median
+  Lloyd step per row (waits taken out, as above). How the wall-time difference splits among these was not measured.
 - **Initialisation.** k-means++ took 0.07, 0.34, 7.33 and 28.02 s on the four shapes (L16, L37, L51, L60), most of
-  k-means++ Lloyd's time at k >= 16,384; e-means' random rows 1-11 ms.
+  k-means++ Lloyd's time at k >= 16,384; e-means' random rows 1-11 ms (seed 0).
 - **Host permutation.** Waits for epochs 1 on: 0.0000-0.0001 s on every run, so the worker thread's build finished
   inside each GPU epoch (the docs' estimate that every epoch would wait was wrong). The first epoch's wait: 0-18 ms,
   24% of a 0.062 s fit at SIFT k = 1,024, T = 1 (L1), under 2% at k = 16,384, 0.1-0.2% at 65,536.
-- **FAISS's Lloyd** (faiss-cpu 1.15.1, CPU, 25 iterations; skipped at k = 65,536): SIFT k = 1,024 default 5.07 s
-  (1.0102), all rows 18.87 s (1.0017); GIST default 12.11 s (1.0052), all rows 42.82 s (0.9960, below both of our
-  Lloyd runs); SIFT k = 16,384 294 s in both settings (1.0017; 256 x k > n). L20-L21, L41-L42, L55-L56.
+- **FAISS's Lloyd** (CPU, 25 iterations, `bench_ann.faiss_kmeans`; these rows do not record the FAISS version or
+  thread count, which the addendum's rows do; skipped at k = 65,536 in this window, see the addendum):
+  SIFT k = 1,024 default 5.07 s (1.0102), all rows 18.87 s (1.0017); GIST default 12.11 s (1.0052), all rows 42.82 s (0.9960, below both of our
+  Lloyd runs); SIFT k = 16,384 294.19 s default and 294.52 s on all rows, with identical scores (1.0017; 256 x k > n).
+  L20-L21, L41-L42, L55-L56.
 
 What did not work, or was not run:
 - **T = 1** ended above Lloyd@25 on every shape with that row, by up to 3.8% (k = 16,384, L43), and 7.0% above
   random-start Lloyd's stop at k = 65,536 (L57).
-- **Run order inside compare.py.** It builds the FAISS index for recall on the CPU inside the timed loop's emit, for
+- **Run order inside `emeans_bench.py`.** It builds the FAISS index for recall on the CPU inside the timed loop's emit, for
   seed 0 of each T and every Lloyd row. The next k-row gather on the GPU is then slower: random-start Lloyd's init
   7.9 / 73.4 / 11.2 / 18.9 ms (L18, L39, L53, L61) against 1.2-11.0 ms for e-means seed 0; e-means seed 1's init
   60-78 ms on GIST against 2 ms. GPU clock-down while idle is a candidate, not tested. Recall should run after the
@@ -1396,3 +1409,82 @@ What did not work, or was not run:
   measured. On the benchmark data revivals ran 0-67 per run at SIFT k = 1,024, 150-443 on GIST, 5,198-7,871 at
   k = 16,384 and 28,273-37,879 at k = 65,536, with last-epoch empties only at k = 65,536 (117 / 17 / 7 at
   T = 1 / 2 / 3).
+
+## FAISS default k-means baseline (2026-11-15/17)
+
+FAISS's default k-means, run again as the baseline for e-means on the 2026-11-14 shapes, with several seeds and a
+timing check before each row: rows L62-L74 of `benchmarks/emeans_results.jsonl`, method "FAISS default k-means". The
+call is `faiss.Kmeans(d, k, niter=25, seed=s)` then `train(X)` on the 1M base vectors, faiss-cpu 1.15.1 on the CPU, 18
+OpenMP threads, FAISS's own `max_points_per_centroid` of 256: a 262,144-row sample at k = 1,024 and all 1,000,000 rows
+at k = 16,384 and 65,536 (256 x k > n; at k = 65,536 FAISS warned that it wants at least 2,555,904 points, its
+minimum of 39 per centre). Time is from
+creating the `faiss.Kmeans` object through `train`. Scored as in the e-means section: training loss by our exact pass
+over all rows, held-out MSE on the dataset's queries, recall@10 at nprobe 8 through a FAISS IVF index built from the
+centres (recall printed exactly). Ratios are to our Lloyd from k-means++ to tol on the same shape (L16, L37, L51, L60).
+The script that ran these rows is not in the repo; it does the call, the timing check and the scoring above.
+
+Conditions: Apple M5 Max, 128 GB, macOS 27.2; AC power, High Power mode (power mode 2) on every row; battery 100%,
+except 79% (on AC) for L74. A timing check (power source, power mode, busy processes) ran before each row and passed
+except before L63 and L69 (one busy process each), so those two times are provisional. Other processes used 45-151% of
+one core summed at the run starts. L62-L73 ran on 2026-11-15, 17:46-17:58 (row stamps). The k = 65,536 run started
+after them was stopped to free the machine and wrote no row; its rerun on 2026-11-17, 07:45-08:06 (the timing check's
+stamp and the row's), is L74. The rows record
+commit 11aa89f with `dirty` false; the harness's dirty flag looks only at `kmeans.py` and `bench.py`. Cold as before:
+each run built a new `faiss.Kmeans`.
+
+| Row | Shape | Seed | Time, s | Training loss | Ratio | Held-out MSE | Ratio | Recall@10 at nprobe 8, % | Rows used | Timing check | Other CPU, % |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| L62 | SIFT1M, k = 1,024 | 0 | 5.00 | 5.098748e10 | 1.01017 | 51,172.85 | 1.00832 | 84.170 | 262,144 | passed | 82.4 |
+| L63 | SIFT1M, k = 1,024 | 1 | 5.02 | 5.094654e10 | 1.00936 | 51,051.75 | 1.00594 | 84.215 | 262,144 | failed | 144.5 |
+| L64 | SIFT1M, k = 1,024 | 2 | 5.14 | 5.101262e10 | 1.01067 | 51,106.77 | 1.00702 | 84.149 | 262,144 | passed | 90.3 |
+| L65 | SIFT1M, k = 1,024 | 3 | 4.99 | 5.096363e10 | 1.00970 | 51,134.16 | 1.00756 | 84.009 | 262,144 | passed | 86.6 |
+| L66 | SIFT1M, k = 1,024 | 4 | 4.93 | 5.098852e10 | 1.01019 | 51,097.24 | 1.00683 | 84.163 | 262,144 | passed | 66.0 |
+| L67 | GIST1M, k = 1,024 | 0 | 11.07 | 1.118184e6 | 1.00523 | 1.1126 | 1.01172 | 66.14 | 262,144 | passed | 105.7 |
+| L68 | GIST1M, k = 1,024 | 1 | 11.04 | 1.118388e6 | 1.00541 | 1.1262 | 1.02406 | 66.58 | 262,144 | passed | 57.7 |
+| L69 | GIST1M, k = 1,024 | 2 | 11.12 | 1.118194e6 | 1.00524 | 1.1083 | 1.00779 | 66.45 | 262,144 | failed | 150.7 |
+| L70 | GIST1M, k = 1,024 | 3 | 11.26 | 1.118434e6 | 1.00545 | 1.1160 | 1.01480 | 66.11 | 262,144 | passed | 73.4 |
+| L71 | GIST1M, k = 1,024 | 4 | 11.11 | 1.118579e6 | 1.00558 | 1.1063 | 1.00593 | 65.93 | 262,144 | passed | 64.1 |
+| L72 | SIFT1M, k = 16,384 | 0 | 295.63 | 3.825568e10 | 1.00169 | 41,704.14 | 0.99775 | 61.415 | 1,000,000 | passed | 65.0 |
+| L73 | SIFT1M, k = 16,384 | 1 | 296.54 | 3.825589e10 | 1.00169 | 41,650.82 | 0.99647 | 61.475 | 1,000,000 | passed | 45.0 |
+| L74 | SIFT1M, k = 65,536 | 0 | 1,181.42 | 3.062667e10 | 1.00249 | 39,221.46 | 0.98876 | 54.473 | 1,000,000 | passed | 122.6 |
+
+- **Against the 2026-11-14 window.** Seed 0 gave the same training loss, held-out MSE and recall as that window's
+  FAISS rows (L20 = L62, L41 = L67, and L55 and L56 = L72, since the default is all rows at k = 16,384). The times
+  differ: 5.07, 12.11 and 294.19 / 294.52 s then, under that window's load, against 5.00, 11.07 and 295.63 s here.
+- **Seeds.** Over five seeds at k = 1,024: SIFT 4.93-5.14 s, training loss 1.00936-1.01067 of our k-means++ Lloyd,
+  recall 84.009-84.215%; GIST 11.04-11.26 s, 1.00523-1.00558, recall 65.93-66.58%. Two seeds at k = 16,384:
+  295.63-296.54 s, 1.00169, recall 61.415-61.475%. One at k = 65,536: 1,181.42 s, 1.00249, recall 54.473%.
+- **Against e-means at k = 65,536** (one run each): FAISS's training loss is above e-means' at T = 3 (1.00249 against
+  0.98928, L59) and its recall above e-means' at T = 2 and 3 (54.473% against 53.546% and 54.235%).
+
+**Claims checks (2026-11-17).** First check: the e-means numbers and statements in "e-means, first measurements
+(2026-11-14)" above, in docs/e-means.md and in the README's e-means paragraph (42 claims), and rows L62-L73 (12),
+were re-derived from the rows and logs by a separate check that had no part in writing them. It found eight wrong last
+digits (six from rounding twice), two loose wordings and three statements in docs/e-means.md with no stored run
+behind them; none changes a conclusion. Corrected in this file: SIFT
+k = 1,024 query MSE 0.9982-0.9994 -> 0.9982-0.9993; GIST held-out 1.0026-1.0343 -> 1.0026-1.0342; the GIST T = 10
+bracket 1.0045-1.0260 -> 1.0045-1.0259; GIST Lloyd steps 193 / 214 / 281 ms -> 193 / 213 / 281 ms and the median
+50.2 -> 50.1 ms (over all 31 steps); "294 s in both settings" -> 294.19 s and 294.52 s; "(seed 0)" added to e-means'
+initialisation times; and "the wall-time difference comes from T reads" reworded to include Lloyd's seeding and the
+per-batch cost. Corrected in docs/e-means.md: 1.0343 -> 1.0342, 53.6% -> 53.5%, 1.0260 -> 1.0259, the permutation
+wait 3.5% -> 3.4% (SIFT k = 1,024 only), the GPU test's `N` step 1.0e-7 -> 1.1e-7, the same wall-time rewording, and
+removed: a count over 192 tabulated shapes, the one-epoch per-case table, and a counting-sort speed comparison. In
+the README: "between a third and a ninth of that run's time" -> "1/3.7 to 1/9.5". Not from the check: the README's
+accuracy-suite count 22 -> 23 cases and its log pointer (a count left stale before this work).
+
+Second check: this section, the addendum, docs/e-means.md, the README's e-means paragraph and BENCHMARKS.md's
+e-means section, as prepared for publication (including L74 and the per-shape tables, which came after the first
+check), re-derived from the rows by another separate check. It found three more wrong statements, all present in
+the e-means commit (11aa89f): the dropped share at k = 1,024, T = 10, 8.3% -> 8.2% (82,496 of 1M); "held-out ratio
+within 0.2% of the training ratio" at SIFT k = 1,024 holds at T >= 2 only (0.27-0.33% at T = 1), a scope
+docs/e-means.md had dropped; and "query MSE below k-means++ Lloyd's from T = 2" holds at k = 16,384, while at
+k = 65,536 it was already below at T = 1 (0.9984). Loose wordings, now fixed: the SIFT k = 1,024 query-MSE bracket
+2-3 and the GIST training-loss bracket 3-5 hold on the seed median against our Lloyd@25 (one seed crossed an epoch
+earlier), which the docs did not say; 1.0061 -> 1.0061-1.0062; the per-batch ranges reproduce only with the
+permutation waits taken out, which is now stated; "compare.py" -> `emeans_bench.py`; a stale "HEAD"; and a
+pointer to an internal plan in docs/e-means.md (a second of the same kind was found while fixing it). Statements the rows do not carry now name their source or were
+dropped: High Power mode for L1-L61 (the session's run log, not in the repo), the window's end time and a
+load-average range (dropped; the row stamps and `other_cpu` stay), the stop time of the cut k = 65,536 FAISS run
+(dropped), the FAISS version for the 2026-11-14 rows (not recorded, now said), the test counts (from the test output,
+not stored here), and the T = 25 dropped shares (computed from the laws, not run); the paper's figures are quoted from the
+paper. Every other number it checked reproduces from the rows, including every cell of the per-shape tables and all 13 addendum rows.

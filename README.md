@@ -293,12 +293,12 @@ python3 -m venv --system-site-packages .venv
 .venv/bin/pip install . scikit-learn faiss-cpu torch fast-pytorch-kmeans
 python3 scripts/get_data.py sift gist      # public benchmark sets, no account needed
 .venv/bin/python bench.py --suite          # regenerates BENCHMARKS.md
-.venv/bin/python tests/accuracy.py         # 22 correctness cases against float64
+.venv/bin/python tests/accuracy.py         # 23 correctness cases against float64
 .venv/bin/python tests/reuse.py            # fit here, predict there: cached state, input checks
 ```
 
-Every table in `BENCHMARKS.md` is generated from `benchmarks/results.jsonl`, which records the machine, the git
-commit, sampled background CPU load, and median/minimum/maximum timings. A public library whose final inertia differs from ours
+Every table in `BENCHMARKS.md` except the e-means section (written by hand from `benchmarks/emeans_results.jsonl`) is
+generated from `benchmarks/results.jsonl`, which records the machine, the git commit, sampled background CPU load, and median/minimum/maximum timings. A public library whose final inertia differs from ours
 by more than 0.01% is marked *different work* and excluded, rather than quietly counted.
 
 ## Where the speed comes from
@@ -335,7 +335,7 @@ it also tests rows/atomic accumulation where supported. Labels must be optimal w
 tolerance; center and inertia errors must be within 1e-6 under the suite's metrics. Empty-cluster relocation is
 checked against an independent reference, with one case also checked against scikit-learn. The multi-buffer
 test's configuration wiring was repaired on September 19. These finite tests are evidence, not a proof for all inputs.
-The suite passes **22/22 cases** on the measured M5 Max, five of them through the between-iteration bounds path (multi-step sequences with a restart mid-sequence and empty-cluster relocations, a subnormal-scale column with the float16 screen forced off, and centre coordinates past float16's range); the verification directory contains the full log. A second suite, `tests/reuse.py`, checks the fit-here-predict-there pattern: a second array of the same shape, batched predictions with one batch rescaled, and sliced inputs sharing a first part must never be served the previous array's cached state, and bad input must raise rather than abort the process.
+The suite has 23 cases and passes **23/23** on the measured M5 Max, five of them through the between-iteration bounds path (multi-step sequences with a restart mid-sequence and empty-cluster relocations, a subnormal-scale column with the float16 screen forced off, and centre coordinates past float16's range); `benchmarks/NOTES.md` records the 23/23 runs ("The cascade at large k", 2026-10-06, and "e-means, first measurements", 2026-11-14). The September 19 verification directory holds that day's log, from when the suite had 16 cases. A second suite, `tests/reuse.py`, checks the fit-here-predict-there pattern: a second array of the same shape, batched predictions with one batch rescaled, and sliced inputs sharing a first part must never be served the previous array's cached state, and bad input must raise rather than abort the process.
 
 ## Demos on real public data
 
@@ -436,15 +436,25 @@ materialising it in NumPy first.
 ### e-means (approximate, opt-in)
 
 `KMeans(algorithm="emeans", epochs=3)` fits the centres with e-means (arXiv:2611.09501): mini-batch k-means with
-moving averages, for a fixed number of epochs, with the batch size and step taken from the paper's scaling laws. It is
-approximate: its centres are not a fixed point of Lloyd's iteration, and it is off unless you ask for it. Exact Lloyd
-stays the default and the reference. `labels_` and `inertia_` still come from the same final pass over the returned
-centres as Lloyd's (exact, or the matmul pass with `exact=False`). First measurements (2026-11-14, M5 Max, 1M rows, SIFT
-k = 1,024-65,536 and GIST k = 1,024): at three epochs its training loss was 0.04-1.1% below that of our exact Lloyd from
-k-means++ (the default) at its tolerance stop, in between a third and a ninth of that run's time (seeding included). On
-GIST its held-out error was higher than Lloyd's at every epoch count tried (`benchmarks/NOTES.md`, "e-means, first
-measurements"; harness `emeans_bench.py`). The method in our own words, the choices made where the paper is silent, the GPU design, and what is and is not tested are in
-[docs/e-means.md](docs/e-means.md).
+moving averages, for a fixed number of epochs, with the batch size and step taken from the paper's scaling laws. It was
+written from the paper's text alone, without reading any e-means source code. It is approximate: its centres are not a
+fixed point of Lloyd's iteration, and it is off unless you ask for it. Exact Lloyd stays the default and the reference.
+`labels_` and `inertia_` still come from the same final pass over the returned centres as Lloyd's (exact, or the
+matmul pass with `exact=False`).
+
+First measurements (M5 Max, 1M rows, SIFT1M at k = 1,024, 16,384 and 65,536 and GIST1M at k = 1,024; e-means and our
+Lloyd on 2026-11-14, FAISS's default k-means on 2026-11-15 and 2026-11-17): at three epochs e-means' training loss was
+0.04-1.1% below that of our exact Lloyd from k-means++ (the default) at its tolerance stop, in 1/3.7 to 1/9.5 of that
+run's time (seeding included). What it gains is training loss per unit of time. Held-out error and recall did not
+follow everywhere: on GIST1M its held-out error was higher than both of our Lloyd runs' at every epoch count tried and
+its recall lower than k-means++ Lloyd's, and at k = 65,536 its recall was lower than k-means++ Lloyd's. Conditions: our
+Lloyd stopped at a relative change of 1e-4 per step while still improving; e-means ran 3, 2 and 1 seeds at k = 1,024,
+16,384 and 65,536 and our Lloyd one run per starting method; recall is from e-means' seed 0 only; the 2026-11-14 times
+were taken with other processes busy and are provisional; FAISS ran on the CPU. FAISS's own e-means was not compared,
+and scikit-learn's MiniBatchKMeans was not run in this window. Per-shape tables with every condition are in
+[docs/e-means.md](docs/e-means.md) ("What is measured"), the headline rows in `BENCHMARKS.md`, and the run record in
+`benchmarks/NOTES.md` (harness `emeans_bench.py`). docs/e-means.md also has the method in our own words, the choices
+made where the paper is silent, the GPU design, and what is and is not tested.
 
 ## License
 
